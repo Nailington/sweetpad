@@ -10,7 +10,15 @@ use std::time::{Duration, Instant};
 
 use clap::Subcommand;
 
+#[cfg(target_os = "macos")]
 mod ax;
+#[cfg(not(target_os = "macos"))]
+#[path = "app/ax_stub.rs"]
+mod ax;
+#[cfg(target_os = "macos")]
+mod macwin;
+#[cfg(not(target_os = "macos"))]
+#[path = "app/macwin_stub.rs"]
 mod macwin;
 
 use crate::cli::inject::recompiler::{Mode, Recompiler};
@@ -1427,6 +1435,8 @@ fn spm_run(ctx: &Context, plan: &RunPlan, product: &str) -> CliResult {
 /// so a caller doesn't have to scrape them out of the human notes.
 struct RunReport {
     bundle_id: String,
+    /// Built executable on the Mac, allowing debuggers to locate its dSYM.
+    executable: Option<String>,
     /// The `-destination` specifier this ran on.
     destination: String,
     /// Present when the launcher reports one: simctl prints `<bundle>: <pid>`
@@ -1453,6 +1463,7 @@ impl Render for RunReport {
         serde_json::json!({
             "built": true,
             "bundleId": self.bundle_id,
+            "executable": self.executable,
             "destination": self.destination,
             "pid": self.pid,
             "detached": self.detached,
@@ -1485,6 +1496,7 @@ fn deploy_detached(ctx: &Context, plan: &RunPlan) -> Result<RunReport, CliError>
         notes: detached_mac_notes(&app.bundle_id, pid, log.as_deref()),
         destination: plan.destination.clone(),
         bundle_id: app.bundle_id,
+        executable: Some(app.executable.display().to_string()),
         pid: Some(pid),
         detached: true,
     })
@@ -1511,6 +1523,7 @@ fn deploy(ctx: &Context, plan: &RunPlan) -> Result<RunReport, CliError> {
             notes: Vec::new(),
             destination: plan.destination.clone(),
             bundle_id: product.clone(),
+            executable: None,
             pid: None,
             detached: false,
         });
@@ -1566,6 +1579,7 @@ fn deploy(ctx: &Context, plan: &RunPlan) -> Result<RunReport, CliError> {
         notes,
         destination: plan.destination.clone(),
         bundle_id: app.bundle_id,
+        executable: Some(app.executable.display().to_string()),
         pid,
         detached: false,
     })
@@ -3553,7 +3567,7 @@ fn simple(
     let plan = plan(ctx, &opts)?;
     let app = plan.app_bundle()?;
 
-    let report = match &plan.target {
+    let mut report = match &plan.target {
         Target::Simulator(udid) => simple_on_simulator(ctx, stage, &plan, &app, udid)?,
         Target::Device(id) => simple_on_device(ctx, stage, &plan, &app, id)?,
         // A macOS app needs no install step — it runs in place out of
@@ -3569,6 +3583,7 @@ fn simple(
             ));
         }
     };
+    report.executable = Some(app.executable.display().to_string());
     if matches!(stage, Stage::Launch) {
         record_last_launched(ctx, &plan);
     }
@@ -3631,6 +3646,7 @@ fn launch_mac(
 ) -> Result<AppStageReport, CliError> {
     let (pid, log) = spawn_detached_mac(ctx, plan, app)?;
     Ok(AppStageReport {
+        executable: None,
         action: "launched",
         note: format!("Launched {}", app.bundle_id),
         bundle_id: app.bundle_id.clone(),
@@ -3752,6 +3768,7 @@ fn stop_mac(ctx: &Context, executable: &Path, bundle_id: &str) -> Result<AppStag
         }
     });
     Ok(AppStageReport {
+        executable: None,
         action: "terminated",
         note: format!("Terminated {bundle_id}"),
         bundle_id: bundle_id.to_string(),
@@ -4068,6 +4085,7 @@ fn stage_report(
     detail: Option<String>,
 ) -> AppStageReport {
     AppStageReport {
+        executable: Some(app.executable.display().to_string()),
         action,
         note: note.to_string(),
         bundle_id: app.bundle_id.clone(),
@@ -4099,6 +4117,7 @@ fn simple_from_last_launched(ctx: &mut Context, stage: Stage) -> Option<CommandR
                     })
                     .map(|()| {
                         Rendered::data(AppStageReport {
+                            executable: None,
                             action: "terminated",
                             note: format!("Terminated {}", last.bundle_identifier),
                             bundle_id: last.bundle_identifier.clone(),
@@ -4126,6 +4145,7 @@ fn simple_from_last_launched(ctx: &mut Context, stage: Stage) -> Option<CommandR
                     .step("Terminating app", || devicectl::terminate(&id, &app_dir))
                     .map(|()| {
                         Rendered::data(AppStageReport {
+                            executable: None,
                             action: "terminated",
                             note: format!("Terminated {}", last.bundle_identifier),
                             bundle_id: last.bundle_identifier.clone(),
@@ -4742,6 +4762,7 @@ fn last_launched_sim(ctx: &Context) -> Option<(String, AppBundle)> {
 /// `udid` carries the simulator/device id; a macOS stage has none and reports
 /// the process `pid` instead.
 struct AppStageReport {
+    executable: Option<String>,
     action: &'static str,
     note: String,
     bundle_id: String,
@@ -4758,6 +4779,7 @@ impl Render for AppStageReport {
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "action": self.action,
+            "executable": self.executable,
             "bundleId": self.bundle_id,
             "udid": self.udid,
             "pid": self.pid,
@@ -5765,6 +5787,7 @@ mod tests {
         let out = |mode| {
             Output::new(&crate::cli::GlobalArgs {
                 chdir: None,
+                remote: None,
                 developer_dir: None,
                 output: mode,
                 json: false,

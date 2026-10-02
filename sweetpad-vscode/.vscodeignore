@@ -37,3 +37,5 @@ TODO.md
 .oxfmtrc.json
 .env.example
 scripts/
+native/**
+e2e/**

@@ -60,6 +60,14 @@ static FORWARD_PID: AtomicU32 = AtomicU32::new(0);
 /// Set when the handler forwarded a signal in forward-only mode, so the
 /// command knows its child ended because of a signal.
 static FORWARDED: AtomicBool = AtomicBool::new(false);
+static DEFERRED_INTERRUPT: AtomicBool = AtomicBool::new(false);
+
+/// Remote sessions handle cancellation through a second SSH connection so the
+/// first connection can drain the command's output and finalized artifacts.
+pub fn defer_interrupt(enabled: bool) {
+    FORWARDED.store(false, Ordering::Release);
+    DEFERRED_INTERRUPT.store(enabled, Ordering::Release);
+}
 
 /// Whether stdin is currently in raw (no-echo) mode, plus the termios pair:
 /// the original settings to restore on the way out, and the applied raw
@@ -216,6 +224,12 @@ const CLEAR_LINE: &[u8] = b"\r\x1b[K";
 /// children, and exit `128 + signo`. In forward-only mode, forward SIGINT to
 /// the registered child and return instead. Async-signal-safe calls only.
 extern "C" fn handle(sig: libc::c_int) {
+    if DEFERRED_INTERRUPT.load(Ordering::Acquire)
+        && matches!(sig, libc::SIGINT | libc::SIGTERM | libc::SIGHUP)
+    {
+        FORWARDED.store(true, Ordering::Release);
+        return;
+    }
     let forward = FORWARD_PID.load(Ordering::Acquire);
     if forward != 0
         && matches!(sig, libc::SIGINT | libc::SIGTERM | libc::SIGHUP)

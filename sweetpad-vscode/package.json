@@ -35,12 +35,14 @@
     "vadimcn.vscode-lldb"
   ],
   "scripts": {
-    "build": "npm run build:native:debug && rolldown -c rolldown.config.mjs",
+    "build": "node scripts/build-extension.mjs",
+    "build:remote": "rolldown -c rolldown.config.mjs",
     "watch": "npm run build:native:debug && rolldown -c rolldown.config.mjs --watch",
-    "vscode:prepublish": "npm run build:native:release && cross-env NODE_ENV=production rolldown -c rolldown.config.mjs",
+    "vscode:prepublish": "node scripts/build-extension.mjs --release",
     "build:native:debug": "npm run build:addon:debug -w @sweetpad/native",
     "build:native:release": "npm run build:addon:universal -w @sweetpad/native",
     "test": "vitest run",
+    "test:remote": "vitest run src/remote src/extension.spec.ts",
     "test:watch": "vitest",
     "compile:e2e": "tsc -p tsconfig.e2e.json",
     "pretest:e2e": "npm run build && npm run compile:e2e",
@@ -204,6 +206,14 @@
     ],
     "debuggers": [
       {
+        "type": "sweetpad-remote",
+        "label": "SweetPad Remote (LLDB)",
+        "configurationAttributes": {
+          "attach": { "type": "object", "properties": { "pid": {"type":"number"}, "program":{"type":"string"}, "stopOnEntry":{"type":"boolean","default":true} } },
+          "launch": { "type": "object", "required":["program"], "properties": { "program":{"type":"string"}, "args":{"type":"array","items":{"type":"string"}}, "stopOnEntry":{"type":"boolean","default":true} } }
+        }
+      },
+      {
         "type": "sweetpad-lldb",
         "label": "SweetPad (LLDB)",
         "configurationSnippets": [
@@ -295,7 +305,8 @@
         {
           "id": "sweetpad.tools.view",
           "name": "Tools",
-          "visibility": "collapsed"
+          "visibility": "collapsed",
+          "when": "!sweetpad.remoteMode"
         }
       ]
     },
@@ -317,6 +328,24 @@
       }
     ],
     "commands": [
+      {
+        "command": "sweetpad.remote.selectMac",
+        "title": "SweetPad: Select Remote Mac",
+        "icon": "$(remote)"
+      },
+      {
+        "command": "sweetpad.remote.addMac",
+        "title": "SweetPad: Add Remote Mac",
+        "icon": "$(add)"
+      },
+      {
+        "command": "sweetpad.remote.removeMac",
+        "title": "SweetPad: Remove Remote Mac"
+      },
+      {
+        "command": "sweetpad.remote.command",
+        "title": "SweetPad: Run Remote CLI Command"
+      },
       {
         "command": "sweetpad.format.run",
         "title": "SweetPad: Format",
@@ -716,6 +745,11 @@
       ],
       "view/title": [
         {
+          "command": "sweetpad.remote.selectMac",
+          "when": "sweetpad.remoteMode && view == sweetpad.build.view",
+          "group": "navigation@0"
+        },
+        {
           "command": "sweetpad.build.refreshSchemes",
           "when": "view == sweetpad.build.view"
         },
@@ -926,6 +960,43 @@
       "type": "object",
       "title": "SweetPad",
       "properties": {
+        "sweetpad.remote.mac": {
+          "type": "string",
+          "description": "Saved Mac name used by the SweetPad GUI. On Linux, select it with SweetPad: Select Remote Mac."
+        },
+        "sweetpad.remote.cliPath": {
+          "type": "string",
+          "default": "sweetpad",
+          "description": "Path to the updated SweetPad CLI on this computer."
+        },
+        "sweetpad.remote.developerDir": {
+          "type":"string",
+          "description":"Xcode Developer directory on the selected Mac."
+        },
+        "sweetpad.remote.xcodebuildArgs": {
+          "type":"array","items":{"type":"string"},"default":[],
+          "description":"Additional build arguments on the Mac, such as -derivedDataPath, -clonedSourcePackagesDirPath, or build settings."
+        },
+        "sweetpad.remote.languageServer.enabled": {
+          "type":"boolean","default":true,
+          "description":"Run SourceKit-LSP and SweetPad BSP on the selected Mac with local source path mapping."
+        },
+        "sweetpad.remote.streamCommand": {
+          "type":"string","default":"npx",
+          "description":"Program on the Mac used to start simulator streaming."
+        },
+        "sweetpad.remote.streamArgs": {
+          "type":"array","items":{"type":"string"},"default":["--yes","serve-sim@0.1.47"],
+          "description":"Arguments before the simulator UDID and port, for the remote streaming program."
+        },
+        "sweetpad.remote.scheme": {
+          "type": "string",
+          "description": "Scheme selected for remote GUI builds and runs."
+        },
+        "sweetpad.remote.destination": {
+          "type": "string",
+          "description": "Destination specifier selected for remote GUI builds and runs."
+        },
         "sweetpad.previews.codeLensEnabled": {
           "type": "boolean",
           "default": true,

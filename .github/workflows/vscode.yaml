@@ -22,6 +22,25 @@ on:
 # committed fixture project — so it needs macOS (Xcode for the build case) and a
 # network (VS Code + the CodeLLDB dependency are downloaded on first run).
 jobs:
+  remote-clients:
+    name: native remote extension (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm ci
+      - name: Typecheck and bundle remote extension
+        working-directory: sweetpad-vscode
+        run: |
+          npm run check:types
+          npm run build
+          npm run test:remote
+
   test:
     name: unit · e2e
     runs-on: macos-latest

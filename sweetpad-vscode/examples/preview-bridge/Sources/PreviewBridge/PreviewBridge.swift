@@ -119,13 +119,24 @@ private func registryView(_ registry: any PreviewRegistry.Type) -> (@MainActor (
 @available(macOS 14.0, iOS 17.0, *)
 @MainActor
 func invokeMakeBody(_ boxed: Any) -> (any View)? {
-  typealias Make = @MainActor () -> any View
+  if let make = boxed as? @MainActor () -> any View { return make() }
+  let metadata = unsafeBitCast(type(of: boxed), to: UnsafePointer<UInt>.self)
+  guard metadata[0] == 0x302, metadata[1] & 0xFFFF == 0 else { return nil }
+  let resultType = unsafeBitCast(metadata[2], to: Any.Type.self)
+  guard String(reflecting: resultType) == "SwiftUI.ViewPreviewBody" else { return nil }
+  func layout<T>(_ type: T.Type) -> (Int, Int) { (MemoryLayout<T>.size, MemoryLayout<T>.alignment) }
+  let actual = _openExistential(resultType, do: layout)
+  guard actual.0 == MemoryLayout<PreviewBodyProxy>.size,
+        actual.1 == MemoryLayout<PreviewBodyProxy>.alignment else { return nil }
+  typealias Make = @MainActor () -> PreviewBodyProxy
   guard MemoryLayout<Make>.size <= MemoryLayout<Any>.size else { return nil }
   let make = withUnsafeBytes(of: boxed) { raw -> Make in
     raw.baseAddress!.assumingMemoryBound(to: Make.self).pointee
   }
-  return make()
+  return make().body
 }
+
+private struct PreviewBodyProxy { let body: any View }
 
 /// Walk `source → structure → singlePreview → makeBody` and return the raw
 /// `makeBody` value (still type-erased). Exposed to tests so the reflection
@@ -136,7 +147,8 @@ func makeBodyChild(of preview: Any) -> Any? {
     mirror.children.first { $0.label == label }.map { Mirror(reflecting: $0.value) }
   }
   let root = Mirror(reflecting: preview)
-  guard let source = child(root, "source"),
+  let dataSource = child(root, "dataSource")
+  guard let source = child(root, "source") ?? dataSource.flatMap({ child($0, "preview") }),
         let structure = child(source, "structure"),
         let single = child(structure, "singlePreview"),
         let makeBody = single.children.first(where: { $0.label == "makeBody" })

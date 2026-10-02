@@ -1912,6 +1912,7 @@ mod tests {
     fn ctx() -> Context {
         let global = GlobalArgs {
             chdir: None,
+            remote: None,
             developer_dir: None,
             output: None,
             json: false,

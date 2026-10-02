@@ -18,6 +18,7 @@
 
 use std::process::ExitCode;
 
+#[cfg(not(windows))]
 fn main() -> ExitCode {
     // The Rust runtime ignores SIGPIPE, so a consumer closing the pipe early
     // (`sweetpad … | head`) surfaces as a "failed printing to stdout: Broken
@@ -30,8 +31,16 @@ fn main() -> ExitCode {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if sweetpad_cli::portable_remote::is_bridge(&args) {
+        return sweetpad_cli::portable_remote::run(&args);
+    }
     match args.first().map(String::as_str) {
         Some("vscode") => ExitCode::from(sweetpad_cli::vscode_cli::run(&args[1..])),
         _ => sweetpad_cli::cli::run(&args),
     }
+}
+
+#[cfg(windows)]
+fn main() -> ExitCode {
+    sweetpad_cli::portable_remote::run(&std::env::args().skip(1).collect::<Vec<_>>())
 }

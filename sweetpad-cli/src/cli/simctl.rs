@@ -506,7 +506,8 @@ pub fn clone(udid: &str, new_name: &str) -> Result<String, CliError> {
 
 /// Deliver an APNs push payload (JSON file) to an app on a booted simulator.
 pub fn push(udid: &str, bundle_id: &str, payload: &str) -> Result<(), CliError> {
-    process::stream("xcrun", &["simctl", "push", udid, bundle_id, payload], None)
+    process::capture("xcrun", &["simctl", "push", udid, bundle_id, payload], None)
+        .map(|_| ())
         .context("delivering the push payload")
 }
 

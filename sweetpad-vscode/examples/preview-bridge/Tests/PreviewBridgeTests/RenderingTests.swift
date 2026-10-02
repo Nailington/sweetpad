@@ -46,6 +46,13 @@ final class RenderingTests: XCTestCase {
     assertDominant(\.g, color, "legacy green")
   }
 
+  func testRejectsUnrelatedClosureReturnTypes() {
+    var invoked = false
+    let unrelated: @MainActor () -> Int = { invoked = true; return 7 }
+    XCTAssertNil(invokeMakeBody(unrelated))
+    XCTAssertFalse(invoked)
+  }
+
   /// Macro view extraction reflects into private SwiftUI `Preview` internals
   /// and reads a closure out of an existential buffer — the most fragile path.
   /// Gated so the core suite stays a clean gate; the CI runs these in a

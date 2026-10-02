@@ -5,5 +5,8 @@
 //! `CLI_DESIGN.md`) and the [`vscode_cli`] JSON-RPC client for the running
 //! SweetPad extension.
 
+#[cfg(not(windows))]
 pub mod cli;
+pub mod portable_remote;
+#[cfg(not(windows))]
 pub mod vscode_cli;

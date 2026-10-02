@@ -50,8 +50,13 @@ public enum SweetPadPreviewHost {
   @MainActor
   public static func rootView() -> AnyView? {
     guard let id = requestedPreviewId else { return nil }
-    let view: any View = SweetPadPreviewBridge.view(forId: id)
-      ?? SweetPadPreviewBridge.notFoundView(id: id)
+    let resolved = SweetPadPreviewBridge.view(forId: id)
+    if let request = ProcessInfo.processInfo.environment["SWEETPAD_PREVIEW_REQUEST"],
+       let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+       let data = try? JSONSerialization.data(withJSONObject: ["request": request, "id": id, "matched": resolved != nil]) {
+      try? data.write(to: directory.appendingPathComponent("SweetPadPreviewStatus.json"), options: .atomic)
+    }
+    let view: any View = resolved ?? SweetPadPreviewBridge.notFoundView(id: id)
     if let scheme = appearance {
       return AnyView(AnyView(view).preferredColorScheme(scheme))
     }
@@ -66,6 +71,13 @@ enum SweetPadPreviewBridge {
   @MainActor
   static func view(forId id: String) -> (any View)? {
     let target = parseId(id)
+    if let name = ProcessInfo.processInfo.environment["SWEETPAD_PREVIEW_TYPE"] {
+      for result in getPreviewTypes() where result.proto == "PreviewProvider" && result.name.hasSuffix("." + name) {
+        let metatype = unsafeBitCast(result.accessor(), to: Any.Type.self)
+        if let provider = metatype as? any PreviewProvider.Type { return provider.previews }
+      }
+      return nil
+    }
     if #available(iOS 17.0, macOS 14.0, tvOS 17.0, watchOS 10.0, *) {
       for result in getPreviewTypes() where result.proto == "PreviewRegistry" {
         let metatype = unsafeBitCast(result.accessor(), to: Any.Type.self)
@@ -103,12 +115,25 @@ enum SweetPadPreviewBridge {
   /// load avoids the unsafeBitCast(Any, …) size-mismatch trap.
   @MainActor
   static func invokeMakeBody(_ boxed: Any) -> (any View)? {
-    typealias Make = @MainActor () -> any View
+    if let make = boxed as? @MainActor () -> any View { return make() }
+    // Newer SDKs wrap the view in SwiftUI.ViewPreviewBody. Its single stored
+    // existential has the same indirect-result ABI as this local proxy. Check
+    // the runtime result type, size and alignment before reading the closure.
+    // FunctionTypeMetadata is defined in swift/include/swift/ABI/Metadata.h.
+    let metadata = unsafeBitCast(type(of: boxed), to: UnsafePointer<UInt>.self)
+    guard metadata[0] == 0x302, metadata[1] & 0xFFFF == 0 else { return nil }
+    let resultType = unsafeBitCast(metadata[2], to: Any.Type.self)
+    guard String(reflecting: resultType) == "SwiftUI.ViewPreviewBody" else { return nil }
+    func layout<T>(_ type: T.Type) -> (Int, Int) { (MemoryLayout<T>.size, MemoryLayout<T>.alignment) }
+    let actual = _openExistential(resultType, do: layout)
+    guard actual.0 == MemoryLayout<SPBViewPreviewBody>.size,
+          actual.1 == MemoryLayout<SPBViewPreviewBody>.alignment else { return nil }
+    typealias Make = @MainActor () -> SPBViewPreviewBody
     guard MemoryLayout<Make>.size <= MemoryLayout<Any>.size else { return nil }
     let make = withUnsafeBytes(of: boxed) { raw -> Make in
       raw.baseAddress!.assumingMemoryBound(to: Make.self).pointee
     }
-    return make()
+    return make().body
   }
 
   /// Reflect a DeveloperToolsSupport.Preview: source -> structure -> singlePreview -> makeBody.
@@ -117,7 +142,8 @@ enum SweetPadPreviewBridge {
       mirror.children.first { $0.label == label }.map { Mirror(reflecting: $0.value) }
     }
     let root = Mirror(reflecting: preview)
-    guard let source = child(root, "source"),
+    let dataSource = child(root, "dataSource")
+    guard let source = child(root, "source") ?? dataSource.flatMap({ child($0, "preview") }),
           let structure = child(source, "structure"),
           let single = child(structure, "singlePreview"),
           let makeBody = single.children.first(where: { $0.label == "makeBody" }) else {
@@ -126,6 +152,8 @@ enum SweetPadPreviewBridge {
     return makeBody.value
   }
 }
+
+private struct SPBViewPreviewBody { let body: any View }
 
 // MARK: Swift ABI metadata + __swift5_proto walk
 

@@ -39,6 +39,18 @@ sweetpad test  --on booted            # whichever simulator is already open
 
 Full walkthrough: **[Get started with the CLI](https://sweetpad.hyzyla.dev/docs/cli/getting-started)**.
 
+To edit on Windows, Linux, or another Mac and build on a Mac on your network, install this fork's
+CLI on both machines and enable SSH on the Mac. Then run `sweetpad build --remote mac-mini.local`,
+`sweetpad run --remote mac-mini.local --on device`, or
+`sweetpad simulator boot "iPhone 16 Pro" --remote mac-mini.local`. SweetPad syncs local edits
+without a Git push; the Mac handles Xcode, signing, simulators, and the connected iPhone. See the
+[remote Mac guide](./sweetpad-docs/docs/cli/remote.md).
+Windows runs `sweetpad.exe`; Linux and macOS run `sweetpad`. All three use OpenSSH and
+the same archive transfer code for file sync. The first project transfer is full; later commands
+send only changed files and deletions.
+Save multiple Macs with `sweetpad remote add "Studio Mac" user@mac-mini.local`, then use
+`sweetpad build --remote "Studio Mac"`. Use `sweetpad remote list` to see saved Macs.
+
 ## Why you'd stay
 
 - **[Hot reload](https://sweetpad.hyzyla.dev/docs/cli/hot-reload)**: `sweetpad run --hot` patches

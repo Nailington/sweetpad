@@ -79,8 +79,10 @@ pub enum Action {
     /// Set the simulated location.
     Location {
         /// Latitude (e.g. 50.4501).
+        #[arg(allow_negative_numbers = true)]
         latitude: f64,
         /// Longitude (e.g. 30.5234).
+        #[arg(allow_negative_numbers = true)]
         longitude: f64,
         /// Simulator name or UDID (defaults to the booted one).
         target: Option<String>,

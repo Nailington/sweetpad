@@ -10,6 +10,9 @@ without switching to Xcode. It installs from the
 [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=sweetpad.sweetpad) and works
 with Xcode workspaces and projects, [Tuist](./tuist.md), [XcodeGen](./xcodegen.md), and Swift Packages.
 
+This fork also has a [remote Mac mode](./remote.md) for building and running from a Windows or Linux VS Code
+workspace using the updated CLI and a Mac on your network.
+
 Everything here works in [Cursor](https://www.cursor.com/) too. It's a fork of VS Code, so the
 extension installs and behaves the same way.
 
@@ -55,10 +58,12 @@ When you need the exact name of something:
 
 ## Do I need the CLI too?
 
-No, with one exception. Building, running, debugging, testing, and formatting all happen inside the
-extension. The default autocomplete setup is the exception: it runs SweetPad's build server, which
-ships inside the `sweetpad` CLI binary, so that one feature asks you to install the CLI. The
+For local macOS use, no, with one exception. Building, running, debugging, testing, and formatting
+happen inside the extension. The default autocomplete setup is the exception: it runs SweetPad's
+build server, which ships inside the `sweetpad` CLI binary, so that one feature asks you to install the CLI. The
 [Autocomplete](./autocomplete.md) page covers it.
+
+[Remote Mac mode](./remote.md) also requires the updated CLI on your computer and the Mac.
 
 If you *want* the terminal tool as well, it's a separate product with its own docs:
 [SweetPad CLI](../cli/getting-started.md).

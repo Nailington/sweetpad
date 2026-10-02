@@ -151,7 +151,7 @@ fn plist_buddy(file: &Path, command: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 

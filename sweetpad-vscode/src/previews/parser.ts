@@ -42,23 +42,41 @@ const FIRST_STRING_RE = /"((?:[^"\\]|\\.)*)"/;
  * Return the byte offset of `//` that starts a line comment, ignoring `//`
  * inside string literals. Returns -1 when the line has no line comment.
  */
-function lineCommentIndex(line: string): number {
-  let inString = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === "\\") {
-      i++; // skip escaped char
-      continue;
+function declarationText(text: string): string {
+  const masked=text.split("");
+  const blank=(start:number,end:number)=>{for(let i=start;i<end;i++)if(masked[i]!=="\n")masked[i]=" ";};
+  let i=0;
+  while(i<text.length) {
+    const start=i;
+    if(text.startsWith("//",i)) {
+      const end=text.indexOf("\n",i);i=end<0?text.length:end;blank(start,i);continue;
     }
-    if (ch === '"') {
-      inString = !inString;
-      continue;
+    if(text.startsWith("/*",i)) {
+      i+=2;let depth=1;
+      while(i<text.length && depth) {
+        if(text.startsWith("/*",i)){depth++;i+=2;}
+        else if(text.startsWith("*/",i)){depth--;i+=2;}
+        else i++;
+      }
+      blank(start,i);continue;
     }
-    if (!inString && ch === "/" && line[i + 1] === "/") {
-      return i;
+    let quote=i;
+    while(text[quote]==="#")quote++;
+    if(text[quote]==='"') {
+      const hashes=text.slice(i,quote);
+      const quotes=text.startsWith('"""',quote)?'"""':'"';
+      const ending=quotes+hashes;
+      i=quote+quotes.length;
+      while(i<text.length) {
+        if(text.startsWith(ending,i)){i+=ending.length;break;}
+        if(text.startsWith("\\"+hashes,i)){i+=2+hashes.length;}
+        else i++;
+      }
+      blank(start,Math.min(i,text.length));continue;
     }
+    i++;
   }
-  return -1;
+  return masked.join("");
 }
 
 /**
@@ -67,16 +85,15 @@ function lineCommentIndex(line: string): number {
 export function parsePreviews(text: string): PreviewMatch[] {
   const matches: PreviewMatch[] = [];
   const lines = text.split("\n");
+  const codeLines=declarationText(text).split("\n");
 
   for (let lineNumber = 0; lineNumber < lines.length; lineNumber++) {
     const rawLine = lines[lineNumber];
-    const commentAt = lineCommentIndex(rawLine);
-    // Only consider the code portion of the line (before any `//`).
-    const line = commentAt === -1 ? rawLine : rawLine.slice(0, commentAt);
+    const line = codeLines[lineNumber];
 
     const macro = MACRO_RE.exec(line);
     if (macro) {
-      const args = macro[2] ?? "";
+      const args = MACRO_RE.exec(rawLine.slice(macro.index))?.[2] ?? "";
       const label = FIRST_STRING_RE.exec(args)?.[1];
       matches.push({
         kind: "macro",

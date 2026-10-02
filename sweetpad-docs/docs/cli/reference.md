@@ -205,6 +205,7 @@ These work on every command:
 | `--non-interactive`   | Never prompt; missing choices become errors. Auto-enabled when `CI` is set.                        |
 | `--gh-annotations`    | Emit GitHub Actions annotations for build/test errors. Not combinable with `-o json`/`ndjson`.     |
 | `--developer-dir <dir>` | Pin the Xcode to use (same as the `DEVELOPER_DIR` environment variable).                          |
+| `--remote <mac>`      | Run CLI commands on a saved Mac, SSH host, or alias, syncing files when needed. See [Remote Mac](./remote.md).    |
 | `--no-color`          | Disable colored output (also honors `NO_COLOR`).                                                   |
 | `-v, --verbose`       | Show raw tool output.                                                                              |
 | `-q, --quiet`         | Suppress progress chatter (wins over `--verbose`).                                                 |

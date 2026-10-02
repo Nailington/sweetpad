@@ -25,19 +25,19 @@ const sweetpadNativePlugin = {
     }
   },
   writeBundle(outputOptions) {
-    const outLibDir = path.join(path.dirname(outputOptions.file), "lib");
+    const outLibDir = path.join(outputOptions.dir, "lib");
     // Recreate from scratch so a stale binary from an earlier build never lingers.
     rmSync(outLibDir, { recursive: true, force: true });
     mkdirSync(outLibDir, { recursive: true });
     const nodeFiles = readdirSync(NATIVE_ADDON_DIR).filter((f) => f.endsWith(".node"));
-    if (nodeFiles.length === 0) {
+    if (nodeFiles.length === 0 && process.platform === "darwin") {
       this.error("No compiled .node addon found in native/ — run build:native:debug first.");
     }
     // The universal binary covers both Mac arches, so ship it alone when present
     // (release build); otherwise ship the single-arch addon (local debug build).
     const universal = nodeFiles.filter((f) => f.includes("universal"));
     const addons = universal.length > 0 ? universal : nodeFiles;
-    for (const file of ["index.js", ...addons]) {
+    for (const file of nodeFiles.length ? ["index.js", ...addons] : []) {
       copyFileSync(path.join(NATIVE_ADDON_DIR, file), path.join(outLibDir, file));
     }
   },
@@ -60,7 +60,9 @@ export default defineConfig([
   {
     input: "./src/extension.ts",
     output: {
-      file: "out/extension.js",
+      dir: "out",
+      entryFileNames: "extension.js",
+      chunkFileNames: "[name]-[hash].js",
       format: "cjs",
       sourcemap: isProduction ? "hidden" : true,
       minify: isProduction,

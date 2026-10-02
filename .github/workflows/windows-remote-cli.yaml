@@ -1,0 +1,78 @@
+name: windows-remote-cli
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "sweetpad-cli/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-remote-cli.yaml"
+  pull_request:
+    paths:
+      - "sweetpad-cli/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-remote-cli.yaml"
+  workflow_dispatch:
+
+jobs:
+  native-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Test native remote client
+        run: cargo test -p sweetpad-cli --lib
+      - name: Test concurrent registry updates
+        run: cargo test -p sweetpad-cli --test windows_registry
+      - name: Check native CLI warnings
+        run: cargo clippy -p sweetpad-cli -- -D warnings
+      - name: Build native executable
+        run: cargo build -p sweetpad-cli --release
+      - name: Smoke test Mac registry
+        shell: pwsh
+        run: |
+          $env:APPDATA = Join-Path $env:RUNNER_TEMP 'sweetpad-test'
+          function Invoke-SweetPad([string[]] $CliArgs) {
+            $output = & target/release/sweetpad.exe @CliArgs
+            if ($LASTEXITCODE -ne 0) { throw "SweetPad failed: $output" }
+            $result = $output | ConvertFrom-Json
+            if (-not $result.ok) { throw "SweetPad returned a failure: $output" }
+            return $result
+          }
+          $key = Join-Path $env:RUNNER_TEMP 'test key'
+          Set-Content $key 'registry path fixture'
+          $added = Invoke-SweetPad -CliArgs @('-o', 'json', 'remote', 'add', 'Studio Mac', 'dev@studio.local', '--identity-file', $key, '--port', '2222')
+          if ($added.data.macs[0].port -ne 2222) { throw 'Port was not saved' }
+          if (-not (Test-Path $added.data.macs[0].identityFile)) { throw 'Key path was not saved' }
+          Invoke-SweetPad -CliArgs @('remote', 'show', 'Studio Mac', '--json')
+          $replaced = Invoke-SweetPad -CliArgs @('remote', 'add', 'Studio Mac', 'dev@new-studio.local', '--replace', '--json')
+          if ($null -ne $replaced.data.macs[0].port) { throw 'Replace retained the old port' }
+          $listed = Invoke-SweetPad -CliArgs @('remote', 'list', '-o', 'ndjson')
+          if ($listed.event -ne 'result') { throw 'NDJSON result event is missing' }
+          Invoke-SweetPad -CliArgs @('remote', 'remove', 'Studio Mac', '--json')
+      - name: Upload native executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweetpad-windows-x64
+          path: target/release/sweetpad.exe
+
+  native-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Test Unix CLI and shared libraries
+        run: cargo test -p sweetpad-cli -p sweetpad-core -p sweetpad-lib
+      - name: Check native CLI warnings
+        run: cargo clippy -p sweetpad-cli -- -D warnings
+      - name: Build native executable
+        run: cargo build -p sweetpad-cli --release
+      - name: Upload native executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweetpad-linux-x64
+          path: target/release/sweetpad

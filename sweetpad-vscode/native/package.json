@@ -5,7 +5,7 @@
   "description": "Internal — N-API addon exposing sweetpad-core to the SweetPad VS Code extension. Do not use directly.",
   "license": "MIT OR Apache-2.0",
   "main": "index.js",
-  "types": "index.d.ts",
+  "types": "types.d.ts",
   "napi": {
     "binaryName": "sweetpad-native",
     "targets": [

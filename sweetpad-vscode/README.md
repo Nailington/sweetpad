@@ -59,8 +59,12 @@ this extension does not require it, and it does not require this extension.
 
 ## Requirements
 
-1. 🍏 MacOS — other platforms are currently not supported
-2. 📱 Xcode — required for building and running iOS apps via `xcodebuild`
+1. 🍏 macOS with Xcode for local development, or [Windows/Linux connected to a Mac over SSH](../sweetpad-docs/docs/vscode/remote.md).
+2. 📱 Xcode on the Mac that builds and runs iOS apps.
+
+The same extension supports remote build/run/test, simulator controls and streaming, LLDB debugging,
+SwiftUI previews, the VS Code Testing panel, and SourceKit through SweetPad's built-in build server.
+Remote mode uses the same `sweetpad` CLI (`sweetpad.exe` on Windows); no separate remote CLI or extension is needed.
 
 ## Changelog
 

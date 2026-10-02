@@ -36,6 +36,8 @@ pub mod process;
 pub mod progress;
 pub mod pymobiledevice3;
 pub mod rawmode;
+pub mod remote;
+pub mod remote_registry;
 pub mod render;
 pub mod resolve;
 pub mod scaffold;
@@ -82,6 +84,10 @@ pub struct GlobalArgs {
     /// Run as if started in DIR (chdir before anything else), like 'git -C'.
     #[arg(short = 'C', value_name = "DIR", global = true)]
     pub chdir: Option<std::path::PathBuf>,
+
+    /// Run on a saved Mac, SSH host, or SSH config alias.
+    #[arg(long, value_name = "MAC", global = true)]
+    pub remote: Option<String>,
 
     /// Xcode to use: sets DEVELOPER_DIR for every spawned tool (e.g.
     /// /Applications/Xcode-16.4.app/Contents/Developer). A project can pin one
@@ -519,6 +525,11 @@ pub enum Resource {
         #[command(subcommand)]
         action: commands::simulator::Action,
     },
+    /// Save and manage SSH connections to Macs.
+    Remote {
+        #[command(subcommand)]
+        action: Option<remote_registry::Action>,
+    },
     /// Build, install, launch, and follow logs (the flagship loop; same as
     /// 'app run').
     Run(commands::app::RunArgs),
@@ -830,6 +841,15 @@ pub fn run(argv: &[String]) -> ExitCode {
         render_early_error(&out, &err);
         return ExitCode::from(err.error_kind().exit_code());
     }
+    if let Some(host) = &cli.global.remote {
+        if remote::local_only(cli.resource.as_ref()) {
+            if !matches!(cli.resource.as_ref(), Some(Resource::Remote { .. })) {
+                out.note("this command edits the local project or Git checkout; running locally");
+            }
+        } else {
+            return remote::run(&cli, argv, host, &out);
+        }
+    }
     // `--developer-dir` pins the Xcode every spawned tool uses (xcrun,
     // xcodebuild, simctl all honor DEVELOPER_DIR).
     if let Some(dir) = &cli.global.developer_dir {
@@ -932,6 +952,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         }
         Resource::Settings { action } => commands::settings::run(&mut ctx, &action),
         Resource::Simulator { action } => commands::simulator::run(&mut ctx, &action),
+        Resource::Remote { action } => remote_registry::manage(&mut ctx, action.as_ref()),
         // `build`/`test` carry their flags as resource-level globals; the bare
         // `start`/`run` tokens are optional markers, so both spellings land here.
         Resource::Build { args, action } => commands::build::run(&mut ctx, &args, action.as_ref()),
