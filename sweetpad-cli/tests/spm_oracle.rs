@@ -15,6 +15,8 @@
 //!   `xcodebuild -list -json` against the sample package in real time and
 //!   compare. Requires macOS + Xcode + the Swift toolchain.
 
+#![cfg(unix)]
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;

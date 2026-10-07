@@ -6,6 +6,8 @@
 //! all break the single-value parse below — so this is the regression net for the
 //! "render once, centrally" design.
 
+#![cfg(unix)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};

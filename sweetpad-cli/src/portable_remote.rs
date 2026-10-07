@@ -1,7 +1,7 @@
 //! Portable SSH/archive transport, plus the remote-only Windows frontend.
 //! Xcode commands run in the ordinary SweetPad CLI on the receiving Mac.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::IsTerminal;
 use std::path::{Component, Path, PathBuf};
@@ -1273,15 +1273,75 @@ fn download_command(remote_dir: &str, baseline: &str) -> Result<String, String> 
         .ok_or("invalid download marker path")?;
     let marker = format!("../{marker_name}");
     let listing = format!("../{base}.pull-list-{}", std::process::id());
+    // A result bundle is replaced as a unit by Xcode. Send every member when
+    // any member changed, including objects whose timestamps were preserved.
+    let result_listing = shell_quote(
+        r#"if [ -n "$(find "$1" -type f \( -newer "$2" -o -cnewer "$2" \) -print)" ]; then find "$1" -type f -print0; fi"#,
+    );
     Ok(format!(
-        "umask 077; cd {} || exit; find . \\( -name .git -o -name .build -o -name target -o -name node_modules -o -name DerivedData -o -name .DS_Store -o -name .sweetpad-tools \\) -prune -o -type f \\( -newer {} -o -cnewer {} \\) -print0 > {} || exit; COPYFILE_DISABLE=1 tar --no-recursion -cf - --null -T {}; code=$?; rm -f {}; exit $code",
+        "umask 077; cd {} || exit; find . \\( -name .git -o -name .build -o -name target -o -name node_modules -o -name DerivedData -o -name .DS_Store -o -name .sweetpad-tools -o -name '*.xcresult' \\) -prune -o -type f \\( -newer {} -o -cnewer {} \\) -print0 > {} || exit; find . \\( -name .git -o -name .build -o -name target -o -name node_modules -o -name DerivedData -o -name .DS_Store -o -name .sweetpad-tools \\) -prune -o -type d -name '*.xcresult' -exec sh -c {result_listing} sh '{{}}' {} \\; >> {} || exit; COPYFILE_DISABLE=1 tar --no-recursion -cf - --null -T {}; code=$?; rm -f {}; exit $code",
         shell_quote(remote_dir),
         shell_quote(&marker),
+        shell_quote(&marker),
+        shell_quote(&listing),
         shell_quote(&marker),
         shell_quote(&listing),
         shell_quote(&listing),
         shell_quote(&listing)
     ))
+}
+
+fn result_bundle(relative: &Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for component in relative.components() {
+        if let Component::Normal(name) = component {
+            prefix.push(name);
+            if Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext == "xcresult")
+            {
+                return Some(prefix);
+            }
+        }
+    }
+    None
+}
+
+fn prune_stale_results(
+    root: &Path,
+    bundles: &BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+    started: SystemTime,
+) -> Result<(), String> {
+    for (bundle, expected) in bundles {
+        let mut ancestor = root.to_path_buf();
+        for component in bundle.components() {
+            ancestor.push(component);
+            if std::fs::symlink_metadata(&ancestor).is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                return Err(format!(
+                    "refusing to replace a result bundle through a symlink: {}",
+                    ancestor.display()
+                ));
+            }
+        }
+        for entry in WalkDir::new(root.join(bundle)).follow_links(false) {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = entry.path().strip_prefix(root).map_err(|e| e.to_string())?;
+            if !expected.contains(relative)
+                && entry
+                    .metadata()
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .is_some_and(|modified| modified <= started)
+            {
+                std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn receive_archive(
@@ -1302,6 +1362,7 @@ pub(crate) fn receive_archive(
     let result = (|| {
         let stdout = child.stdout.take().ok_or("cannot read SSH archive")?;
         let mut archive = tar::Archive::new(stdout);
+        let mut result_files: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
         for entry in archive.entries().map_err(|e| e.to_string())? {
             let mut entry = entry.map_err(|e| e.to_string())?;
             let relative = entry.path().map_err(|e| e.to_string())?.into_owned();
@@ -1316,6 +1377,13 @@ pub(crate) fn receive_archive(
             if entry.header().entry_type().is_dir() {
                 std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
             } else if entry.header().entry_type().is_file() {
+                if let Some(bundle) = result_bundle(&relative) {
+                    let normalized = relative
+                        .components()
+                        .filter(|part| matches!(part, Component::Normal(_)))
+                        .collect::<PathBuf>();
+                    result_files.entry(bundle).or_default().insert(normalized);
+                }
                 let local_modified = std::fs::metadata(&path)
                     .and_then(|meta| meta.modified())
                     .ok();
@@ -1332,7 +1400,7 @@ pub(crate) fn receive_archive(
         }
         let status = child.wait().map_err(|e| e.to_string())?;
         if status.success() {
-            Ok(())
+            prune_stale_results(root, &result_files, started)
         } else {
             Err(format!("download from {} failed ({status})", mac.host))
         }
@@ -1967,6 +2035,45 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn replacing_result_bundles_removes_old_objects_but_keeps_local_edits() {
+        let root = std::env::temp_dir().join(format!(
+            "sweetpad-replace-result-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bundle = Path::new("reports/Test ü.xcresult");
+        std::fs::create_dir_all(root.join(bundle).join("Data")).unwrap();
+        let expected = bundle.join("Data/current");
+        let obsolete = root.join(bundle).join("Data/obsolete");
+        let edited = root.join(bundle).join("Data/local-edit");
+        std::fs::write(root.join(&expected), "new result").unwrap();
+        std::fs::write(&obsolete, "previous result").unwrap();
+        std::fs::write(&edited, "user edit during remote test").unwrap();
+        let started = SystemTime::now();
+        File::options()
+            .write(true)
+            .open(&edited)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(started + Duration::from_secs(60)))
+            .unwrap();
+        let bundles = BTreeMap::from([(bundle.to_path_buf(), BTreeSet::from([expected.clone()]))]);
+        prune_stale_results(&root, &bundles, started).unwrap();
+        assert!(!obsolete.exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(expected)).unwrap(),
+            "new result"
+        );
+        assert_eq!(
+            std::fs::read_to_string(edited).unwrap(),
+            "user edit during remote test"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn download_archive_contains_only_files_changed_after_the_marker() {
@@ -1981,10 +2088,21 @@ mod tests {
         let root = base.join("project with spaces");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("old.swift"), "old").unwrap();
+        let bundle = root.join("Reports/Test ü.xcresult");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            bundle.join("preserved-object"),
+            "old object reused by Xcode",
+        )
+        .unwrap();
+        let unchanged = root.join("Reports/Unchanged.xcresult");
+        std::fs::create_dir_all(&unchanged).unwrap();
+        std::fs::write(unchanged.join("untouched-object"), "unchanged result").unwrap();
         std::thread::sleep(Duration::from_millis(30));
         std::fs::write(base.join("project with spaces.pull-stamp"), "").unwrap();
         std::thread::sleep(Duration::from_millis(30));
         std::fs::write(root.join("new.swift"), "new").unwrap();
+        std::fs::write(bundle.join("new-object"), "new result object").unwrap();
         let output = Command::new("sh")
             .arg("-c")
             .arg(
@@ -2022,6 +2140,18 @@ mod tests {
         );
         assert!(
             !names.iter().any(|name| name.ends_with("old.swift")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.ends_with("preserved-object")),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name.ends_with("new-object")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.ends_with("untouched-object")),
             "{names:?}"
         );
         std::fs::remove_dir_all(base).unwrap();

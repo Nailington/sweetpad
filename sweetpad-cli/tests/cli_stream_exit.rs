@@ -4,6 +4,8 @@
 //! EOF and hangs every human/ndjson build-family command forever — caught
 //! here with a stub xcodebuild and a hard deadline.
 
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

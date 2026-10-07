@@ -6,6 +6,8 @@
 //! error envelope, and the exit codes (0 ok / 1 RPC error / 2 client error)
 //! the JS CLI established.
 
+#![cfg(unix)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};

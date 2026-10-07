@@ -5,6 +5,29 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn unavailable_local_commands_and_missing_remotes_return_json_errors() {
+    for args in [
+        vec!["--json"],
+        vec!["doctor", "--json", "--non-interactive"],
+        vec!["remote", "show", "Missing fixture Mac", "--json"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sweetpad"))
+            .args(&args)
+            .env(
+                "APPDATA",
+                std::env::temp_dir().join(format!("sweetpad-no-remotes-{}", std::process::id())),
+            )
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["schema"], 1, "{args:?}");
+        assert_eq!(envelope["ok"], false, "{args:?}");
+        assert!(envelope["error"]["message"].as_str().is_some(), "{args:?}");
+    }
+}
+
+#[test]
 fn simultaneous_additions_are_not_lost_and_replacements_remain_readable() {
     let root = std::env::temp_dir().join(format!(
         "sweetpad-registry-{}-{}",

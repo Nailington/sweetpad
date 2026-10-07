@@ -24,11 +24,9 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - name: Test native remote client
-        run: cargo test -p sweetpad-cli --lib
-      - name: Test concurrent registry updates
-        run: cargo test -p sweetpad-cli --test windows_registry
+        run: cargo test -p sweetpad-cli
       - name: Check native CLI warnings
-        run: cargo clippy -p sweetpad-cli -- -D warnings
+        run: cargo clippy -p sweetpad-cli --all-targets -- -D warnings
       - name: Build native executable
         run: cargo build -p sweetpad-cli --release
       - name: Smoke test Mac registry
@@ -68,7 +66,7 @@ jobs:
       - name: Test Unix CLI and shared libraries
         run: cargo test -p sweetpad-cli -p sweetpad-core -p sweetpad-lib
       - name: Check native CLI warnings
-        run: cargo clippy -p sweetpad-cli -- -D warnings
+        run: cargo clippy -p sweetpad-cli --all-targets -- -D warnings
       - name: Build native executable
         run: cargo build -p sweetpad-cli --release
       - name: Upload native executable
