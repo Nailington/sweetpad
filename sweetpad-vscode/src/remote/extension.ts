@@ -377,6 +377,70 @@ class RefreshableTree implements vscode.TreeDataProvider<vscode.TreeItem> {
 type SchemeItem = vscode.TreeItem & { scheme?: string };
 type DestinationItem = vscode.TreeItem & { destination?: string; udid?: string };
 
+/** Register the Mac registry and ad-hoc command actions in either activation mode. */
+export function registerMacCommands(
+  register: (id: string, action: () => Promise<void>) => void,
+  client: RemoteClient,
+  refresh: () => Promise<void> | void,
+): void {
+  register("sweetpad.remote.selectMac", async () => {
+    const mac = await client.selectMac();
+    if (mac) await refresh();
+  });
+  register("sweetpad.remote.addMac", async () => {
+    const name = await vscode.window.showInputBox({ prompt: "Name for this Mac" });
+    if (!name) return;
+    const host = await vscode.window.showInputBox({
+      prompt: "SSH target (user@host or SSH config alias)",
+    });
+    if (!host) return;
+    const key = await vscode.window.showInputBox({
+      prompt: "Private key path (leave blank for your normal SSH config/agent)",
+    });
+    if (key === undefined) return;
+    const port = await vscode.window.showInputBox({
+      prompt: "SSH port (leave blank for SSH config/default)",
+    });
+    if (port === undefined) return;
+    if (port && (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535)) {
+      throw new Error("SSH port must be between 1 and 65535.");
+    }
+    const args = ["remote", "add", name, host];
+    if (key) args.push("--identity-file", key);
+    if (port) args.push("--port", port);
+    await client.query(args);
+    await config().update("remote.mac", name, macSettingTarget());
+    await refresh();
+  });
+  register("sweetpad.remote.removeMac", async () => {
+    const macs = await client.macs();
+    const picked = await vscode.window.showQuickPick(
+      macs.map((mac) => mac.name),
+      { placeHolder: "Remove saved Mac" },
+    );
+    if (!picked) return;
+    await client.query(["remote", "remove", picked]);
+    if (client.mac === picked) {
+      if (vscode.workspace.workspaceFolders?.length) {
+        await config().update("remote.mac", undefined, vscode.ConfigurationTarget.Workspace);
+      }
+      await config().update("remote.mac", undefined, vscode.ConfigurationTarget.Global);
+    }
+    await refresh();
+  });
+
+  register("sweetpad.remote.command", async () => {
+    const command = await vscode.window.showInputBox({
+      prompt: "SweetPad CLI arguments (for example: simulator list)",
+    });
+    if (!command) return;
+    const { parse } = await import("shell-quote");
+    const args = parse(command);
+    if (args.some((arg) => typeof arg !== "string")) throw new Error("Only command arguments are supported.");
+    await client.run(args as string[], "SweetPad Remote", projectRoot());
+  });
+}
+
 export async function activateRemote(context: vscode.ExtensionContext) {
   const client = new RemoteClient();
   const schemes = new RefreshableTree(client, "scheme");
@@ -420,51 +484,7 @@ export async function activateRemote(context: vscode.ExtensionContext) {
   updateStatus();
   status.show();
 
-  register("sweetpad.remote.selectMac", async () => {
-    await client.selectMac();
-    refresh();
-  });
-  register("sweetpad.remote.addMac", async () => {
-    const name = await vscode.window.showInputBox({ prompt: "Name for this Mac" });
-    if (!name) return;
-    const host = await vscode.window.showInputBox({
-      prompt: "SSH target (user@host or SSH config alias)",
-    });
-    if (!host) return;
-    const key = await vscode.window.showInputBox({
-      prompt: "Private key path (leave blank for your normal SSH config/agent)",
-    });
-    if (key === undefined) return;
-    const port = await vscode.window.showInputBox({
-      prompt: "SSH port (leave blank for SSH config/default)",
-    });
-    if (port === undefined) return;
-    if (port && (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535)) {
-      throw new Error("SSH port must be between 1 and 65535.");
-    }
-    const args = ["remote", "add", name, host];
-    if (key) args.push("--identity-file", key);
-    if (port) args.push("--port", port);
-    await client.query(args);
-    await config().update("remote.mac", name, macSettingTarget());
-    refresh();
-  });
-  register("sweetpad.remote.removeMac", async () => {
-    const macs = await client.macs();
-    const picked = await vscode.window.showQuickPick(
-      macs.map((mac) => mac.name),
-      { placeHolder: "Remove saved Mac" },
-    );
-    if (!picked) return;
-    await client.query(["remote", "remove", picked]);
-    if (client.mac === picked) {
-      if (vscode.workspace.workspaceFolders?.length) {
-        await config().update("remote.mac", undefined, vscode.ConfigurationTarget.Workspace);
-      }
-      await config().update("remote.mac", undefined, vscode.ConfigurationTarget.Global);
-    }
-    refresh();
-  });
+  registerMacCommands(register, client, refresh);
 
   const selectionArgs = (item?: SchemeItem, clean = false, testing = false) => {
     const args: string[] = [];
@@ -545,16 +565,6 @@ export async function activateRemote(context: vscode.ExtensionContext) {
   register("sweetpad.simulators.stop", async (item?: DestinationItem) => {
     await client.run(["simulator", "shutdown", ...(item?.udid ? [item.udid] : [])], "Shutdown Simulator");
     destinations.refresh();
-  });
-  register("sweetpad.remote.command", async () => {
-    const command = await vscode.window.showInputBox({
-      prompt: "SweetPad CLI arguments (for example: simulator list)",
-    });
-    if (!command) return;
-    const { parse } = await import("shell-quote");
-    const args = parse(command);
-    if (args.some((arg) => typeof arg !== "string")) throw new Error("Only command arguments are supported.");
-    await client.run(args as string[], "SweetPad Remote", projectRoot());
   });
 
   const { registerRemoteFeatures } = await import("./features.js");

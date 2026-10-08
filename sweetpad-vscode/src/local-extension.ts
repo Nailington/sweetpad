@@ -121,22 +121,31 @@ import { xcodgenGenerateCommand } from "./xcodegen/commands.js";
 import { XcodeGenWatcher } from "./xcodegen/watcher.js";
 
 export async function activate(context: vscode.ExtensionContext) {
-  context.subscriptions.push(
-    vscode.commands.registerCommand("sweetpad.remote.selectMac", async () => {
-      try {
-        const { RemoteClient } = await import("./remote/extension.js");
-        const mac = await new RemoteClient().selectMac();
-        if (mac) {
-          const choice = await vscode.window.showInformationMessage(
-            `SweetPad will use ${mac} after reloading this window.`,
-            "Reload Window",
-          );
-          if (choice === "Reload Window") await vscode.commands.executeCommand("workbench.action.reloadWindow");
-        }
-      } catch (error) {
-        void vscode.window.showErrorMessage(`SweetPad: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }),
+  const { RemoteClient, registerMacCommands } = await import("./remote/extension.js");
+  const remoteClient = new RemoteClient();
+  context.subscriptions.push(remoteClient);
+  registerMacCommands(
+    (id, action) => {
+      context.subscriptions.push(
+        vscode.commands.registerCommand(id, async () => {
+          try {
+            await action();
+          } catch (error) {
+            void vscode.window.showErrorMessage(`SweetPad: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }),
+      );
+    },
+    remoteClient,
+    async () => {
+      const mac = remoteClient.mac;
+      if (!mac) return;
+      const choice = await vscode.window.showInformationMessage(
+        `SweetPad will use ${mac} after reloading this window.`,
+        "Reload Window",
+      );
+      if (choice === "Reload Window") await vscode.commands.executeCommand("workbench.action.reloadWindow");
+    },
   );
   // Sentry 🚨
   errorReporting.logSetup();
