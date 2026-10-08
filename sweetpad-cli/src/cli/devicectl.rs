@@ -198,23 +198,41 @@ pub fn launch(
     env: &[(String, String)],
     wait_for_debugger: bool,
 ) -> Result<String, CliError> {
-    let mut cmd_args: Vec<&str> = vec![
+    let cmd_args = launch_args(device_id, bundle_id, args, wait_for_debugger, false);
+    // devicectl forwards `DEVICECTL_CHILD_*` from its own environment to the
+    // app, the same shape simctl uses for `SIMCTL_CHILD_*`.
+    process::capture_env("xcrun", &cmd_args, None, env).context("launching the app on the device")
+}
+
+/// Build one launch command for both detached and attached console paths. The
+/// separator keeps an app argument such as `--console` from becoming a
+/// devicectl option instead.
+fn launch_args<'a>(
+    device_id: &'a str,
+    bundle_id: &'a str,
+    args: &'a [String],
+    wait_for_debugger: bool,
+    console: bool,
+) -> Vec<&'a str> {
+    let mut cmd_args = vec![
         "devicectl",
         "device",
         "process",
         "launch",
         "--terminate-existing",
     ];
+    if console {
+        cmd_args.push("--console");
+    }
     if wait_for_debugger {
         cmd_args.push("--start-stopped");
     }
     cmd_args.extend_from_slice(&["--device", device_id, bundle_id]);
-    // Trailing arguments go to the app, exactly as `devicectl … <bundle-id>
-    // [<command-line-arguments> ...]` documents.
-    cmd_args.extend(args.iter().map(String::as_str));
-    // devicectl forwards `DEVICECTL_CHILD_*` from its own environment to the
-    // app, the same shape simctl uses for `SIMCTL_CHILD_*`.
-    process::capture_env("xcrun", &cmd_args, None, env).context("launching the app on the device")
+    if !args.is_empty() {
+        cmd_args.push("--");
+        cmd_args.extend(args.iter().map(String::as_str));
+    }
+    cmd_args
 }
 
 /// Launch with the console attached, streaming the app's stdout/stderr and
@@ -225,26 +243,10 @@ pub fn launch_console(
     bundle_id: &str,
     args: &[String],
     env: &[(String, String)],
+    wait_for_debugger: bool,
 ) -> Result<(), CliError> {
-    let mut cmd_args = console_args(device_id, bundle_id);
-    cmd_args.extend(args.iter().map(String::as_str));
+    let cmd_args = launch_args(device_id, bundle_id, args, wait_for_debugger, true);
     process::stream_env("xcrun", &cmd_args, None, env)
-}
-
-/// The shared `devicectl … launch --console` prefix; the app's own arguments
-/// are appended by the caller.
-fn console_args<'a>(device_id: &'a str, bundle_id: &'a str) -> Vec<&'a str> {
-    vec![
-        "devicectl",
-        "device",
-        "process",
-        "launch",
-        "--console",
-        "--terminate-existing",
-        "--device",
-        device_id,
-        bundle_id,
-    ]
 }
 
 /// Like [`launch_console`] but spawned in the background with stdout/stderr piped,
@@ -255,9 +257,9 @@ pub fn spawn_console(
     bundle_id: &str,
     args: &[String],
     env: &[(String, String)],
+    wait_for_debugger: bool,
 ) -> Result<std::process::Child, CliError> {
-    let mut cmd_args = console_args(device_id, bundle_id);
-    cmd_args.extend(args.iter().map(String::as_str));
+    let cmd_args = launch_args(device_id, bundle_id, args, wait_for_debugger, true);
     process::spawn_piped_both_env("xcrun", &cmd_args, None, env)
 }
 
@@ -383,14 +385,73 @@ fn app_pids(device_id: &str, app_dir_name: &str) -> Result<Vec<i64>, CliError> {
 fn parse_app_pids(raw: &str, app_dir_name: &str) -> Result<Vec<i64>, CliError> {
     let parsed: ProcessesOutput = serde_json::from_str(raw)
         .map_err(|e| CliError::new(format!("parsing devicectl output: {e}")))?;
-    let needle = format!("/{app_dir_name}/");
     Ok(parsed
         .result
         .running_processes
         .into_iter()
-        .filter(|p| p.process_identifier > 0 && p.executable.contains(&needle))
+        .filter(|p| p.process_identifier > 0 && executable_is_in_app(&p.executable, app_dir_name))
         .map(|p| p.process_identifier)
         .collect())
+}
+
+/// Match complete directory components, decoding file URLs exactly once. A
+/// literal `%20` in a bundle name is reported as `%2520`, while an unescaped
+/// filesystem path must retain its literal percent characters.
+fn executable_is_in_app(executable: &str, app_dir_name: &str) -> bool {
+    if app_dir_name.is_empty() {
+        return false;
+    }
+    let (path, is_url) = if let Some(url) = executable.strip_prefix("file://") {
+        // Skip the URL authority; query/fragment text is not part of the path.
+        let Some((_, path)) = url.split_once('/') else {
+            return false;
+        };
+        (path.split(['?', '#']).next().unwrap_or_default(), true)
+    } else {
+        (executable, false)
+    };
+    let mut components = path.split('/').peekable();
+    while let Some(component) = components.next() {
+        let matches = if is_url {
+            decode_url_component(component) == app_dir_name.as_bytes()
+        } else {
+            component == app_dir_name
+        };
+        if matches && components.peek().is_some_and(|next| !next.is_empty()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Decode a single URL component rather than the whole path, so an escaped
+/// slash cannot introduce a directory boundary and match another app.
+fn decode_url_component(component: &str) -> Vec<u8> {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(encoded) = bytes.get(index + 1..index + 3)
+            && let (Some(high), Some(low)) = (hex_digit(encoded[0]), hex_digit(encoded[1]))
+        {
+            decoded.push(high * 16 + low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    decoded
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +501,81 @@ mod tests {
     }
 
     #[test]
+    fn launch_separates_app_arguments_from_devicectl_options() {
+        let args = vec![
+            "--console".to_owned(),
+            "--start-stopped".to_owned(),
+            "--".to_owned(),
+            "value with spaces 猫".to_owned(),
+        ];
+        for console in [false, true] {
+            let actual = launch_args("UDID", "com.example.Game", &args, false, console);
+            let mut expected = vec![
+                "devicectl",
+                "device",
+                "process",
+                "launch",
+                "--terminate-existing",
+            ];
+            if console {
+                expected.push("--console");
+            }
+            expected.extend_from_slice(&[
+                "--device",
+                "UDID",
+                "com.example.Game",
+                "--",
+                "--console",
+                "--start-stopped",
+                "--",
+                "value with spaces 猫",
+            ]);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn launch_without_app_arguments_needs_no_separator() {
+        let actual = launch_args("UDID", "com.example.Game", &[], false, false);
+        assert_eq!(
+            actual,
+            vec![
+                "devicectl",
+                "device",
+                "process",
+                "launch",
+                "--terminate-existing",
+                "--device",
+                "UDID",
+                "com.example.Game",
+            ]
+        );
+        let console = launch_args("UDID", "com.example.Game", &[], false, true);
+        assert!(console.contains(&"--console"));
+        assert_eq!(console.last(), Some(&"com.example.Game"));
+        assert!(!console.contains(&"--"));
+    }
+
+    #[test]
+    fn launch_waits_for_debugger_with_and_without_console() {
+        for console in [false, true] {
+            let args = launch_args("UDID", "com.example.Game", &[], true, console);
+            assert_eq!(
+                args.iter().filter(|arg| **arg == "--start-stopped").count(),
+                1
+            );
+            assert!(
+                args.iter().position(|arg| *arg == "--start-stopped")
+                    < args.iter().position(|arg| *arg == "--device")
+            );
+            assert!(
+                !launch_args("UDID", "com.example.Game", &[], false, console)
+                    .contains(&"--start-stopped")
+            );
+        }
+    }
+
+    #[test]
     fn app_pids_match_the_bundle_directory() {
         let raw = r#"{
           "result": {
@@ -454,6 +590,52 @@ mod tests {
         assert_eq!(parse_app_pids(raw, "My.app").unwrap(), vec![1201]);
         assert_eq!(parse_app_pids(raw, "MyOther.app").unwrap(), vec![1300]);
         assert!(parse_app_pids(raw, "Absent.app").unwrap().is_empty());
+    }
+
+    #[test]
+    fn app_pids_decode_spaces_and_unicode_in_file_urls() {
+        let raw = r#"{"result":{"runningProcesses":[
+            {"processIdentifier": 101, "executable": "file:///private/var/Idle%20Game.app/Idle%20Game"},
+            {"processIdentifier": 102, "executable": "file:///private/var/Caf%C3%A9%20%E7%8C%AB.app/Caf%C3%A9"},
+            {"processIdentifier": 103, "executable": "file:///private/var/Caf%c3%a9%20%e7%8c%ab.app/Caf%c3%a9"},
+            {"processIdentifier": 104, "executable": "/private/var/Café 猫.app/Café"}
+        ]}}"#;
+        assert_eq!(parse_app_pids(raw, "Idle Game.app").unwrap(), vec![101]);
+        assert_eq!(
+            parse_app_pids(raw, "Café 猫.app").unwrap(),
+            vec![102, 103, 104]
+        );
+    }
+
+    #[test]
+    fn app_pids_preserve_literal_percent_characters() {
+        let raw = r#"{"result":{"runningProcesses":[
+            {"processIdentifier": 101, "executable": "file:///x/Game%2520.app/Game"},
+            {"processIdentifier": 102, "executable": "/x/Game%20.app/Game"},
+            {"processIdentifier": 103, "executable": "file:///x/Game%20.app/Game"},
+            {"processIdentifier": 104, "executable": "file:///x/100%25.app/Game"}
+        ]}}"#;
+        assert_eq!(parse_app_pids(raw, "Game%20.app").unwrap(), vec![101, 102]);
+        assert_eq!(parse_app_pids(raw, "Game .app").unwrap(), vec![103]);
+        assert_eq!(parse_app_pids(raw, "100%.app").unwrap(), vec![104]);
+    }
+
+    #[test]
+    fn app_pids_match_only_real_path_components() {
+        let raw = r#"{"result":{"runningProcesses":[
+            {"processIdentifier": 101, "executable": "file:///x/My.app/My"},
+            {"processIdentifier": 102, "executable": "file:///x/My.app.backup/My"},
+            {"processIdentifier": 103, "executable": "file:///x/OtherMy.app/My"},
+            {"processIdentifier": 104, "executable": "file:///x/Other.app/My?path=/My.app/My"},
+            {"processIdentifier": 105, "executable": "file:///x/Other.app/My#/My.app/My"},
+            {"processIdentifier": 106, "executable": "file://My.app/x/Other.app/My"},
+            {"processIdentifier": 107, "executable": "file:///x%2FMy.app%2FMy"},
+            {"processIdentifier": 108, "executable": "file:///x/My.app"},
+            {"processIdentifier": 109, "executable": "file:///x/My.app/"},
+            {"processIdentifier": -1, "executable": "file:///x/My.app/My"}
+        ]}}"#;
+        assert_eq!(parse_app_pids(raw, "My.app").unwrap(), vec![101]);
+        assert!(parse_app_pids(raw, "").unwrap().is_empty());
     }
 
     #[test]

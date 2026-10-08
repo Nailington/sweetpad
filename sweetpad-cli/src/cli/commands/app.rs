@@ -132,8 +132,8 @@ pub struct XcodebuildArgs {
 }
 
 /// Launch inputs shared by `run` and `launch`: process arguments,
-/// environment, and wait-for-debugger. Simulator and macOS targets honor all
-/// three; physical devices don't yet.
+/// environment, and wait-for-debugger. Simulator, macOS, and physical-device
+/// launches honor all three; physical-device attachment still needs a debugger.
 #[derive(Debug, Clone, Default, clap::Args)]
 pub struct LaunchArgs {
     /// Argument passed to the app process (repeatable).
@@ -2515,6 +2515,7 @@ fn start_app(ctx: &Context, plan: &RunPlan, filter: &Arc<AtomicU8>) -> Result<Ru
                 &app.bundle_id,
                 &plan.launch.args,
                 &plan.launch.env_pairs("DEVICECTL_CHILD_")?,
+                plan.launch.wait_for_debugger,
             )?;
             render_console(&mut child, ctx.out.use_color(), filter);
             let reap_slot = crate::cli::signals::register_child(child.id());
@@ -2786,6 +2787,7 @@ fn follow_once(ctx: &Context, plan: &RunPlan) -> CliResult {
                 &app.bundle_id,
                 &plan.launch.args,
                 &plan.launch.env_pairs("DEVICECTL_CHILD_")?,
+                plan.launch.wait_for_debugger,
             )
         }
         Target::Mac => {

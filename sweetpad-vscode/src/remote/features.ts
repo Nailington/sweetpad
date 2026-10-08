@@ -70,10 +70,11 @@ export function registerRemoteFeatures(
         const index = args.indexOf("test");
         if (index < 0) throw new Error("The remote test plan did not contain an Xcode test action.");
         args[index] = action;
-        if (action === "build-for-testing") {
-          const resultBundle = args.indexOf("-resultBundlePath");
-          if (resultBundle >= 0) args.splice(resultBundle, 2);
-        }
+        // The CLI finalizes its staging result bundle after a normal test.
+        // These direct Xcode actions use Xcode's own result locations instead,
+        // so repeated runs cannot collide with an unfinalized staging bundle.
+        const resultBundle = args.indexOf("-resultBundlePath");
+        if (resultBundle >= 0) args.splice(resultBundle, 2);
       }
       await client.run(["bridge", "exec", "--", ...args], action, projectRoot());
     });
