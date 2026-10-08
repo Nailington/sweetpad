@@ -8,7 +8,7 @@ import * as vscode from "vscode";
 function execFileAsync(
   file: string,
   args: string[],
-  options: { cwd?: string; maxBuffer: number },
+  options: { cwd: string | undefined; maxBuffer: number },
 ): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
     execFile(file, args, options, (error, stdout, stderr) => {
@@ -194,7 +194,7 @@ export class RemoteClient {
         try {
           envelope = JSON.parse(candidate) as Envelope<T>;
         } catch {
-          /* Fall back to the process error when stdout is not JSON. */
+          // Try the next candidate before falling back to the process error.
         }
         if (envelope?.error?.message) throw new Error(envelope.error.message, { cause: error });
       }

@@ -77,17 +77,17 @@ describe("parsePreviews", () => {
   it("does not crash on empty input", () => {
     expect(parsePreviews("")).toEqual([]);
   });
-  it("ignores declarations inside strings, multiline strings, raw strings and nested comments",()=>{
-    const src=[
+  it("ignores declarations inside strings, multiline strings, raw strings and nested comments", () => {
+    const src = [
       'Text("SweetPad: no #Preview matched")',
       'let text = """',
       '#Preview("Fake") { Wrong() }',
       '"""',
       'let raw = #"#Preview { Wrong() }"#',
-      '/* outer /* nested */ struct Fake: PreviewProvider {} */',
+      "/* outer /* nested */ struct Fake: PreviewProvider {} */",
       '#Preview("Real") { Right() }',
     ].join("\n");
-    expect(parsePreviews(src)).toEqual([{kind:"macro",label:"Real",line:6,character:0}]);
+    expect(parsePreviews(src)).toEqual([{ kind: "macro", label: "Real", line: 6, character: 0 }]);
   });
 });
 

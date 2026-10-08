@@ -2,8 +2,10 @@ import { Transform, type TransformCallback } from "node:stream";
 
 import type { RemotePaths } from "./paths";
 
-/** Content-Length framing shared by LSP and DAP. Handles arbitrary splits and
- * UTF-8 byte lengths, rather than treating a stream chunk as one message. */
+/**
+ * Content-Length framing shared by LSP and DAP. Handles arbitrary splits and
+ * UTF-8 byte lengths, rather than treating a stream chunk as one message.
+ */
 export class MappedProtocol extends Transform {
   private pending: Buffer = Buffer.alloc(0);
   constructor(
