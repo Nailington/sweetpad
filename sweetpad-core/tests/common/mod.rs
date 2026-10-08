@@ -328,6 +328,16 @@ pub fn pin_capture_host() {
     });
 }
 
+/// Keep the sweetpad state an in-process test reaches, like the
+/// package-members cache, in Cargo's scratch space for integration tests
+/// rather than the user's `~/.local/state/sweetpad`. Call at the top of every
+/// test that reaches it; idempotent.
+pub fn keep_state_in_target_tmpdir() {
+    sweetpad_core::paths::set_state_dir_override(
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("state"),
+    );
+}
+
 pub fn fixtures_root() -> PathBuf {
     PathBuf::from(env!("SWEETPAD_LIB_DIR")).join("fixtures")
 }
@@ -540,6 +550,39 @@ pub fn find_xcodeproj_between(oracle: &Path, marker: &str, project_name: &str) -
     }
     let target = format!("{project_name}.xcodeproj");
     find_dir_named(&root, &target)
+}
+
+/// The `.xcworkspace` a scheme capture was taken through, if any: the one at
+/// the top of the oracle's `raw/` sub-fixture, first by name, which is the
+/// container `02_capture_metadata.py` prefers over a project. `xcodebuild
+/// -workspace` keys DerivedData by it for every member project, so the
+/// resolver has to be told, as a `-workspace` build tells it.
+pub fn capture_workspace_for_oracle(oracle: &Path) -> Option<PathBuf> {
+    let comps: Vec<&OsStr> = oracle.iter().collect();
+    let metadata_idx = comps.iter().rposition(|c| *c == OsStr::new("metadata"))?;
+    let schemes_idx = comps.iter().rposition(|c| *c == OsStr::new("schemes"))?;
+    let mut root = PathBuf::new();
+    for (i, c) in comps.iter().enumerate() {
+        if i < metadata_idx {
+            root.push(c);
+        } else if i == metadata_idx {
+            root.push("raw");
+        } else if i < schemes_idx {
+            root.push(c);
+        }
+    }
+    let mut workspaces: Vec<PathBuf> = fs::read_dir(&root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.extension() == Some(OsStr::new("xcworkspace"))
+                && p.file_name() != Some(OsStr::new("project.xcworkspace"))
+        })
+        .collect();
+    workspaces.sort();
+    workspaces.into_iter().next()
 }
 
 pub fn find_file_named(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -1217,6 +1260,18 @@ fn canon_path_token(tok: &str) -> String {
     if let Some(inner) = tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
         return format!("\"{}\"", canon_path_token(inner));
     }
+    // A search-path flag carries the path in the same whitespace token, e.g.
+    // `-L/Applications/Xcode.app/Contents/Developer/Toolchains/...` in
+    // OTHER_LDFLAGS. Split the flag off, canonicalize the path, put it back —
+    // otherwise the Xcode-app-dir root never collapses and two hosts that
+    // install Xcode under different app names never agree.
+    for flag in ["-L", "-I", "-F", "-isystem"] {
+        if let Some(rest) = tok.strip_prefix(flag)
+            && rest.starts_with('/')
+        {
+            return format!("{flag}{}", canon_path_token(rest));
+        }
+    }
     // Only rewrite tokens that look like absolute paths (or already-
     // canonicalised `<HOME>/...`) and reach a known anchor segment.
     if !tok.starts_with('/') && !tok.starts_with("<HOME>") && !tok.starts_with("<DARWIN_CACHE>") {
@@ -1403,6 +1458,16 @@ mod canon_tests {
                 "/Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain"
             ),
             "<XCODE_DEV>/Toolchains/XcodeDefault.xctoolchain"
+        );
+        // A search-path flag glued to the path still collapses, so two hosts
+        // whose Xcode lives under different app names agree.
+        assert_eq!(
+            canonicalize_value(
+                "-L/Applications/Xcode-27.0.0.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos"
+            ),
+            canonicalize_value(
+                "-L/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/iphoneos"
+            )
         );
         // The fixture-resident xcspec-cache path also normalises so the
         // corpus test's resolver output lines up with oracle paths.

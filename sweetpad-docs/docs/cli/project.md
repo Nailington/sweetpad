@@ -36,7 +36,9 @@ See [Starting a project](./project-new.md).
 ## Build settings
 
 `sweetpad settings show` prints the fully resolved build settings for the scheme: the same values
-xcodebuild will use, after every xcconfig, target, and project layer has been folded together:
+xcodebuild will use, after every xcconfig, target, and project layer has been folded together. That
+includes the `KEY=VALUE` settings and the `-xcconfig` in `sweetpad.toml`'s `[xcodebuild] args`, which
+every build takes:
 
 ```bash
 sweetpad settings show
@@ -52,6 +54,15 @@ dev.sweetpad.ci.app
 
 ```bash
 BUNDLE_ID=$(sweetpad settings show --key PRODUCT_BUNDLE_IDENTIFIER)
+```
+
+To preview a one-off before you build with it, pass it after `--` the way you would to `build`. The
+`KEY=VALUE` settings, `-xcconfig`, and `-derivedDataPath` you type there layer on top of the file's
+arguments, and a typed `-xcconfig` replaces the file's:
+
+```bash
+sweetpad settings show --key PRODUCT_NAME -- PRODUCT_NAME=Beta
+sweetpad settings show -- -xcconfig Config/Staging.xcconfig
 ```
 
 That's the resolved value. To see what your project file actually *stores*, before Xcode's defaults
@@ -95,7 +106,8 @@ sweetpad dependency add https://github.com/apple/swift-collections \
   --from 1.1.0 --product Collections --target MyApp
 ```
 
-Both flags repeat, for a package whose products go into several targets.
+Both flags repeat, for a package whose products go into several targets. A package that declares no
+products has nothing to link, so `add` stops with an error and leaves the project as it was.
 
 The requirement flags mirror SwiftPM's own:
 
@@ -113,7 +125,8 @@ A local package works too: pass a directory containing a `Package.swift` instead
 ### Updating and removing
 
 `update` with no requirement flags re-resolves to the latest versions your requirements allow. With
-one, it rewrites the requirement (a bump, a pin, or a downgrade) and then re-resolves:
+one, it rewrites the requirement (a bump, a pin, or a downgrade) and then re-resolves. Either way it
+prints each locked version that changed:
 
 ```bash
 sweetpad dependency update                              # everything
@@ -166,6 +179,12 @@ Two distinctions the group names encode, and which trip people up in Xcode too:
 separate question from where it lives on disk or what builds it. `group` moves things in the sidebar
 and nothing else.
 
+**Edits keep the project's references whole.** The rest of the project names some files and groups:
+a configuration's xcconfig, a target's product, the Products group. SweetPad refuses to delete one of
+these, and the error says what still names it. A move updates those names, so the project still
+opens. A node can sit in only one group, because Xcode 27.2 won't open a project that lists it in
+two. So `group attach` only lists a node that no group lists yet, and `group move` handles the rest.
+
 `pbxproj settings show` is the counterpart to `settings show`: it prints what the project file stores,
 per configuration, rather than what those settings resolve to:
 
@@ -177,6 +196,10 @@ CLANG_ANALYZER_NONNULL = YES
 CLANG_CXX_LANGUAGE_STANDARD = gnu++14
 …
 ```
+
+After `set` or `unset`, the command prints what each edited key now resolves to, with the settings in
+`sweetpad.toml`'s `[xcodebuild] args` applied the way a build applies them. When the file also sets
+the key, directly or in its `-xcconfig`, the build keeps the file's value, and a warning says so.
 
 The same generated-project guard applies here: these commands refuse to edit an XcodeGen or Tuist
 project without `--force`. See [Tuist and XcodeGen](./generated-projects.md).

@@ -44,8 +44,8 @@ pub fn run(ctx: &mut Context, what: What) -> CommandResult {
         }
         What::Sim => simctl::open_app()?,
         What::Dd => {
-            let paths = super::derived_data::project_paths(ctx)?;
-            let Some(first) = paths.first() else {
+            let scope = super::derived_data::project_scope(ctx)?;
+            let Some(first) = scope.own.first() else {
                 return Err(CliError::new(
                     "no DerivedData folder exists for this project yet (build once first)",
                 ));
@@ -66,7 +66,7 @@ pub fn run(ctx: &mut Context, what: What) -> CommandResult {
                 }
                 std::fs::write(
                     &path,
-                    "# sweetpad configuration — see `sweetpad help config`\n",
+                    "# sweetpad configuration — see 'sweetpad help config'\n",
                 )
                 .map_err(|e| CliError::new(format!("failed to create {}: {e}", path.display())))?;
             }

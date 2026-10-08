@@ -23,10 +23,12 @@
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
+use sweetpad_core::xcodebuild_args;
 
 pub mod buildlog;
 pub mod config;
 pub mod devicectl;
+pub mod exits;
 pub mod inject;
 pub mod merge;
 pub mod oslog;
@@ -45,6 +47,9 @@ pub mod signals;
 pub mod simctl;
 pub mod state;
 pub mod swiftpm;
+#[cfg(test)]
+#[path = "../../../sweetpad-lib/src/testdir.rs"]
+pub(crate) mod testdir;
 pub mod xcodebuild;
 
 pub mod commands;
@@ -119,12 +124,14 @@ pub struct GlobalArgs {
     #[arg(long, global = true)]
     pub no_color: bool,
 
-    /// Print verbose diagnostics (raw tool output, extra detail).
+    /// Print verbose diagnostics (raw tool output, extra detail). For
+    /// xcodebuild's own '-verbose', pass '-- -verbose'.
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
     /// Suppress progress chatter (notes, spinners, step labels). Errors and
-    /// primary data/JSON are still emitted; wins over '--verbose'.
+    /// primary data/JSON are still emitted; wins over '--verbose'. For
+    /// xcodebuild's own '-quiet', pass '-- -quiet'.
     #[arg(short, long, global = true)]
     pub quiet: bool,
 
@@ -149,33 +156,56 @@ pub enum OutputMode {
     Quiet,
 }
 
+/// The help heading for the flags that pick what a command acts on: the
+/// [`ContainerArgs`]/[`SchemeArgs`]/[`BuildTargetArgs`] tiers, plus the
+/// '--mac'/'--device'/'--device-id' spellings of a destination.
+///
+/// Each of those args names this heading itself. A struct-level
+/// `next_help_heading` would not end with the struct: clap keeps it as the
+/// command's current heading, so every arg declared after the flatten (a
+/// command's own '--clean', '--failed', …) would be listed under it too.
+pub(crate) const TARGET_SELECTION: &str = "Target selection";
+
 /// Tier 1 — which project container to act on. Flattened into every command
 /// that locates a workspace/project — either at the resource level (when every
 /// action consumes it, the flags being `global` within that resource so they
 /// parse on either side of the action token) or directly on the consuming
 /// action (so a sibling like `project new` never advertises flags it ignores).
 #[derive(Debug, Clone, Default, clap::Args)]
-#[command(next_help_heading = "Target selection")]
 pub struct ContainerArgs {
     /// Path to the '.xcworkspace' to operate on (overrides auto-discovery).
-    #[arg(long, env = "SWEETPAD_WORKSPACE", global = true)]
+    #[arg(
+        long,
+        env = "SWEETPAD_WORKSPACE",
+        global = true,
+        help_heading = TARGET_SELECTION
+    )]
     pub workspace: Option<std::path::PathBuf>,
 
     /// Path to the '.xcodeproj' to operate on (overrides auto-discovery).
-    #[arg(long, env = "SWEETPAD_PROJECT", global = true)]
+    #[arg(
+        long,
+        env = "SWEETPAD_PROJECT",
+        global = true,
+        help_heading = TARGET_SELECTION
+    )]
     pub project: Option<std::path::PathBuf>,
 }
 
 /// Tier 2 — container plus a scheme. For commands that need to know *which*
 /// scheme but not a full build target.
 #[derive(Debug, Clone, Default, clap::Args)]
-#[command(next_help_heading = "Target selection")]
 pub struct SchemeArgs {
     #[command(flatten)]
     pub container: ContainerArgs,
 
     /// Scheme to use (overrides config and remembered selection).
-    #[arg(long, env = "SWEETPAD_SCHEME", global = true)]
+    #[arg(
+        long,
+        env = "SWEETPAD_SCHEME",
+        global = true,
+        help_heading = TARGET_SELECTION
+    )]
     pub scheme: Option<String>,
 }
 
@@ -183,29 +213,38 @@ pub struct SchemeArgs {
 /// and destination. For the build-ish commands (`build`, `test`, `settings`,
 /// `app`).
 #[derive(Debug, Clone, Default, clap::Args)]
-#[command(next_help_heading = "Target selection")]
 pub struct BuildTargetArgs {
     #[command(flatten)]
     pub scheme: SchemeArgs,
 
     /// Build configuration to use (e.g. Debug, Release).
-    #[arg(long, env = "SWEETPAD_CONFIGURATION", global = true)]
+    #[arg(
+        long,
+        env = "SWEETPAD_CONFIGURATION",
+        global = true,
+        help_heading = TARGET_SELECTION
+    )]
     pub configuration: Option<String>,
 
     /// Destination specifier (e.g. "platform=iOS Simulator,name=iPhone 15").
-    #[arg(long, env = "SWEETPAD_DESTINATION", global = true)]
+    #[arg(
+        long,
+        env = "SWEETPAD_DESTINATION",
+        global = true,
+        help_heading = TARGET_SELECTION
+    )]
     pub destination: Option<String>,
 
     /// Where to build/run, as a human reference: a fuzzy simulator/device name
     /// ("iPhone 16 Pro"), 'booted', 'mac', 'device', a platform word ('ios',
     /// 'watchos', …), or a UDID. Resolved against the live device list;
     /// --destination stays the raw escape hatch.
-    #[arg(long, env = "SWEETPAD_ON", global = true)]
+    #[arg(long, env = "SWEETPAD_ON", global = true, help_heading = TARGET_SELECTION)]
     pub on: Option<String>,
 
     /// SDK to build against (e.g. iphonesimulator, macosx). Rarely needed —
     /// the destination usually implies it.
-    #[arg(long, env = "SWEETPAD_SDK", global = true)]
+    #[arg(long, env = "SWEETPAD_SDK", global = true, help_heading = TARGET_SELECTION)]
     pub sdk: Option<String>,
 }
 
@@ -452,29 +491,121 @@ fn disambiguate_on_destination(
     }
 }
 
-/// Apply flag > env between `--on` and the mode flags (`--mac`, `--device`,
-/// `--device-id`): an env-sourced `SWEETPAD_ON` yields to a typed mode flag
-/// instead of turning it into an error about a flag the user never typed;
-/// `--on` *typed* alongside a mode flag is a real conflict.
-pub(crate) fn settle_on_vs_mode(
+/// Apply flag > env between a typed mode flag (`--mac`, `--device`,
+/// `--device-id`, named by `mode`) and the other two ways to name a
+/// destination, `--on` and `--destination`: an env-sourced `SWEETPAD_ON` or
+/// `SWEETPAD_DESTINATION` yields to the mode flag instead of turning it into
+/// an error about a flag the user never typed, and either one *typed*
+/// alongside it is a usage error.
+pub(crate) fn settle_mode_flag(
     targeting: &mut Targeting,
-    mode_typed: bool,
+    mode: Option<&str>,
 ) -> Result<(), CliError> {
-    if targeting.on.is_none() || !mode_typed {
+    let Some(mode) = mode else {
         return Ok(());
-    }
-    if flag_typed("--on") {
-        return Err(CliError::new(
-            "--on and --mac/--device/--device-id are mutually exclusive; pass one",
-        )
-        .kind(ErrorKind::TargetResolution));
+    };
+    for (flag, given) in [
+        ("--on", targeting.on.is_some()),
+        ("--destination", targeting.destination.is_some()),
+    ] {
+        if given && flag_typed(flag) {
+            return Err(CliError::new(format!(
+                "{flag} and {mode} are mutually exclusive; pass one"
+            ))
+            .kind(ErrorKind::Usage));
+        }
     }
     targeting.on = None;
+    targeting.destination = None;
     Ok(())
+}
+
+/// `--mac` on `build` and `test`, which take it as a spelling of `--on mac`
+/// so the Mac is named the same way as on the `app` verbs, settled against
+/// `--on` and `--destination` by [`settle_mode_flag`].
+pub(crate) fn mac_as_on(targeting: &mut Targeting, mac: bool) -> Result<(), CliError> {
+    if !mac {
+        return Ok(());
+    }
+    settle_mode_flag(targeting, Some("--mac"))?;
+    targeting.on = Some("mac".to_string());
+    Ok(())
+}
+
+/// The targeting flags past the container, redeclared hidden under the same
+/// ids on the verbs that read back what the project's last build or run
+/// recorded: `build diagnostics`, `test attachments` and `test output`. The
+/// project keeps one record, whatever scheme, configuration, destination or
+/// SDK produced it, so none of them picks anything there; `--workspace` and
+/// `--project` stay listed, since they pick the project. A subcommand's own
+/// arg keeps the resource's global one from propagating into it, so its help
+/// leaves them out; a stray one still parses, and its value reaches the
+/// resource's args for [`typed_target_flags`] to name.
+#[derive(Debug, clap::Args)]
+pub struct HiddenTargetArgs {
+    #[arg(long, hide = true)]
+    pub scheme: Option<String>,
+    #[arg(long, hide = true)]
+    pub configuration: Option<String>,
+    #[arg(long, hide = true)]
+    pub mac: bool,
+    #[arg(long, hide = true)]
+    pub on: Option<String>,
+    #[arg(long, hide = true)]
+    pub destination: Option<String>,
+    #[arg(long, hide = true)]
+    pub sdk: Option<String>,
+}
+
+/// The [`HiddenTargetArgs`] flags given, read off the resource's `target` and
+/// `mac`. All but `--mac` count only when `typed` says they were typed, since
+/// a 'SWEETPAD_*' variable can set each of them for every command.
+pub(crate) fn typed_target_flags(
+    target: &BuildTargetArgs,
+    mac: bool,
+    typed: impl Fn(&str) -> bool,
+) -> Vec<&'static str> {
+    let given = |flag: &str, value: Option<&str>| value.is_some() && typed(flag);
+    [
+        (
+            "--scheme",
+            given("--scheme", target.scheme.scheme.as_deref()),
+        ),
+        (
+            "--configuration",
+            given("--configuration", target.configuration.as_deref()),
+        ),
+        ("--mac", mac),
+        ("--on", given("--on", target.on.as_deref())),
+        (
+            "--destination",
+            given("--destination", target.destination.as_deref()),
+        ),
+        ("--sdk", given("--sdk", target.sdk.as_deref())),
+    ]
+    .into_iter()
+    .filter_map(|(flag, given)| given.then_some(flag))
+    .collect()
+}
+
+/// Refuse the flags in `given` by name, as a usage error: each one parsed on a
+/// verb it means nothing to, and dropping it would not do what was asked. The
+/// message reads "<flags> apply to <what><why>".
+pub(crate) fn refuse_flags(given: &[&str], what: &str, why: &str) -> Result<(), CliError> {
+    let Some((last, rest)) = given.split_last() else {
+        return Ok(());
+    };
+    let (flags, verb) = if rest.is_empty() {
+        ((*last).to_string(), "applies")
+    } else {
+        (format!("{} and {last}", rest.join(", ")), "apply")
+    };
+    Err(CliError::new(format!("{flags} {verb} to {what}{why}")).kind(ErrorKind::Usage))
 }
 
 /// Top-level resources. Each is a noun; actions are its subcommands.
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once per process, never stored in bulk
 pub enum Resource {
     /// Inspect schemes.
     Scheme {
@@ -534,6 +665,9 @@ pub enum Resource {
     /// 'app run').
     Run(commands::app::RunArgs),
     /// Compile the project ('build' alone runs 'build start').
+    ///
+    /// Builds the scheme's Run targets only; 'sweetpad test build' compiles its
+    /// test targets.
     Build {
         #[command(flatten)]
         args: commands::build::StartArgs,
@@ -550,6 +684,8 @@ pub enum Resource {
     /// Archive the app and export an .ipa (xcodebuild archive + -exportArchive).
     Archive(commands::archive::ArchiveArgs),
     /// Clean build artifacts (xcodebuild clean; --purge adds DerivedData).
+    /// Takes sweetpad.toml's '[xcodebuild] args', so it cleans where the
+    /// build wrote.
     Clean(commands::clean::CleanArgs),
     /// Run, install, and manage the built app's lifecycle ('app' alone runs
     /// 'app run').
@@ -557,8 +693,8 @@ pub enum Resource {
         #[command(subcommand)]
         action: Option<commands::app::Action>,
     },
-    /// Inspect connected physical devices (hidden alias — see 'devices').
-    #[command(hide = true)]
+    /// Physical devices: list the paired ones, or check that one is ready to
+    /// build to ('device info').
     Device {
         #[command(subcommand)]
         action: commands::device::Action,
@@ -572,7 +708,8 @@ pub enum Resource {
         action: Option<commands::format::Action>,
     },
     /// Low-level 'project.pbxproj' editing: stored settings, synchronized
-    /// folders, per-file membership, merge resolution (plumbing; §9g).
+    /// folders, per-file membership, merge resolution.
+    // The namespace's design: CLI_DESIGN §9g.
     Pbxproj {
         #[command(subcommand)]
         action: commands::pbxproj::Action,
@@ -595,6 +732,12 @@ pub enum Resource {
         target: ContainerArgs,
         #[command(subcommand)]
         action: commands::bsp::Action,
+    },
+    /// Debug Adapter Protocol server for editors ('dap' alone serves on
+    /// stdio; editors start it, 'dap init' writes their adapter entry).
+    Dap {
+        #[command(subcommand)]
+        action: Option<commands::dap::Action>,
     },
     /// Inspect and purge Xcode's DerivedData.
     #[command(visible_alias = "dd")]
@@ -629,7 +772,14 @@ pub enum Resource {
     },
     /// Update sweetpad (Homebrew installs run 'brew upgrade sweetpad').
     SelfUpdate,
-    /// Explain a topic: config, environment, exit-codes, destinations, hot-reload.
+    /// Send the maintainer a problem report about sweetpad, after the user
+    /// approves it, or turn that off ('sweetpad help feedback' explains it).
+    Feedback {
+        #[command(subcommand)]
+        action: commands::feedback::Action,
+    },
+    /// Explain a topic: config, environment, exit-codes, destinations,
+    /// hot-reload, feedback.
     Help {
         /// The topic to explain (omit to list the topics).
         topic: Option<String>,
@@ -665,18 +815,15 @@ pub struct Context {
 }
 
 impl Context {
-    /// Warn when this project is generated from a spec that has been edited
-    /// since — see [`pbxedit::stale_generated`] for why that is worth saying
-    /// out loud. Fires at most once per process; a `.xcworkspace` or Swift
-    /// package has no single generated `.xcodeproj` to compare against.
+    /// Warn when this project, or a workspace member, is generated from a spec
+    /// that has been edited since — see [`pbxedit::stale_generated`] for why
+    /// that is worth saying out loud. Runs at most once per process, so a
+    /// workspace is read once however often the command re-resolves.
     pub fn warn_if_project_stale(&self, container: &resolve::Container) {
-        let resolve::Container::Project(xcodeproj) = container else {
-            return;
-        };
         if self.stale_checked.set(()).is_err() {
             return;
         }
-        if let Some(warning) = pbxedit::stale_generated(self.project_file(container), xcodeproj) {
+        for warning in pbxedit::stale_generated_projects(self.project_file(container), container) {
             self.out.warn(&warning);
         }
     }
@@ -744,24 +891,59 @@ impl Context {
     /// invocation. Every verb that spawns `xcodebuild` resolves its
     /// passthrough through here, so a committed argument reaches the builds
     /// inside `app run`/`install`/`debug`/`diagnose` as well as
-    /// `build`/`test`/`archive`.
-    pub fn xcodebuild_args(&self, tail: &[String]) -> Result<Vec<String>, CliError> {
+    /// `build`/`test`/`archive`. The `app` verbs that find an already-built
+    /// product (`launch`, `stop`, `logs`, `container`, …) read it too, with an
+    /// empty tail, so they look where the build put the `.app`. A file
+    /// argument the tail replaces (a flag `xcodebuild` takes once) is named
+    /// under `-v`.
+    ///
+    /// `action` is the `xcodebuild` action the arguments go to. A tail that
+    /// names what sweetpad passes itself for it (`-scheme`, `test`'s
+    /// `-resultBundlePath`, …), or ends with a flag still waiting for its
+    /// value, is refused here, before the command resolves anything else.
+    /// A Swift package's tail goes to `swift build` or `swift test` instead,
+    /// so it skips both checks. The file's flags that action fails on (a
+    /// test-only '-enableCodeCoverage' on a build) are left out, and `-v`
+    /// names them too.
+    pub fn xcodebuild_args(
+        &self,
+        action: xcodebuild::Action,
+        tail: &[String],
+    ) -> Result<Vec<String>, CliError> {
         // Silent resolution: this runs *before* the command resolves for real,
         // and `container` narrates its discovery ("using X (found below …)") —
         // saying it twice per build would be the whole visible effect of a peek
         // at a config table. No container found is not an error here either;
         // resolution is about to fail on its own terms, and the typed tail is
         // still the caller's.
-        let Some(container) = resolve::container_silently(self) else {
-            return Ok(tail.to_vec());
-        };
-        // `swift build`/`swift run` take the tail directly and know none of
-        // xcodebuild's flags, so a package's file contributes nothing here.
-        if matches!(container, resolve::Container::SwiftPackage(_)) {
+        let container = resolve::container_silently(self);
+        // `swift build`/`swift test` take the tail directly and know none of
+        // xcodebuild's flags, so a package's file contributes nothing here,
+        // and its tail may forward a compiler flag xcodebuild would read as
+        // its own ('-Xswiftc -sdk').
+        if matches!(container, Some(resolve::Container::SwiftPackage(_))) {
             return Ok(tail.to_vec());
         }
-        let configured = self.project_file(&container).xcodebuild.args.clone();
-        config::effective_xcodebuild_args(&configured, tail).map_err(CliError::new)
+        xcodebuild::refuse_owned_flags(action, tail)?;
+        xcodebuild::refuse_dangling_flag(tail)?;
+        let Some(container) = container else {
+            return Ok(tail.to_vec());
+        };
+        let (configured, left_out) =
+            xcodebuild::for_action(action, &self.project_file(&container).xcodebuild.args, tail);
+        let merged = config::effective_xcodebuild_args(&configured, tail).map_err(CliError::new)?;
+        if self.out.is_verbose() {
+            for note in &left_out {
+                self.out.note(note);
+            }
+            for [flag, value] in &merged.replaced {
+                self.out.note(&format!(
+                    "leaving out sweetpad.toml's '{flag} {value}': the '{flag}' typed after '--' \
+                     replaces it, and xcodebuild takes '{flag}' only once"
+                ));
+            }
+        }
+        Ok(merged.args)
     }
 }
 
@@ -826,7 +1008,7 @@ pub fn run(argv: &[String]) -> ExitCode {
                 render_root_help(stdout_wants_color(argv), long);
                 return ExitCode::SUCCESS;
             }
-            let err = hint_output_file(err, argv);
+            let err = hint_tail_flag(hint_output_file(err, argv), argv);
             let _ = err.print();
             return ExitCode::from(if err.use_stderr() { 2 } else { 0 });
         }
@@ -860,7 +1042,8 @@ pub fn run(argv: &[String]) -> ExitCode {
         let err = CliError::new(
             "--gh-annotations writes ::error workflow commands to stdout, which -o json/ndjson \
              reserve for the envelope/event stream; use --gh-annotations with human output",
-        );
+        )
+        .kind(ErrorKind::Usage);
         render_early_error(&out, &err);
         return ExitCode::from(err.error_kind().exit_code());
     }
@@ -869,7 +1052,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         Err(e) => {
             out.warn(&format!(
                 "failed to load config: {e} — continuing with defaults \
-                 (`sweetpad open config` to fix it)"
+                 ('sweetpad open config' to fix it)"
             ));
             config::Config::default()
         }
@@ -981,6 +1164,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             ctx.targeting = target.into();
             commands::bsp::run(&mut ctx, &action)
         }
+        Resource::Dap { action } => commands::dap::run(&mut ctx, action.as_ref()),
         Resource::DerivedData { target, action } => {
             ctx.targeting = target.into();
             commands::derived_data::run(&mut ctx, &action)
@@ -996,12 +1180,17 @@ pub fn run(argv: &[String]) -> ExitCode {
             commands::status::run(&mut ctx)
         }
         Resource::SelfUpdate => commands::self_update::run(&mut ctx),
+        Resource::Feedback { action } => commands::feedback::run(&mut ctx, &action),
         Resource::Help { topic } => commands::help_topics::run(&mut ctx, topic.as_deref()),
         Resource::Completions { .. } => unreachable!("handled above"),
     };
 
     let code = render_result(&ctx, result);
-    first_run_hint(&ctx.out);
+    // A failure's own message is the last thing it prints; the tip waits for
+    // the first invocation that succeeds.
+    if code == ExitCode::SUCCESS {
+        first_run_hint(&ctx.out);
+    }
     code
 }
 
@@ -1032,7 +1221,7 @@ const GROUP_EVERYDAY: HelpGroup = HelpGroup {
 const GROUP_PLUMBING: HelpGroup = HelpGroup {
     heading: "Plumbing (scripting & agents)",
     everyday: false,
-    names: &["pbxproj", "spm", "merge", "bsp", "vscode"],
+    names: &["pbxproj", "spm", "merge", "bsp", "dap", "vscode"],
 };
 
 /// Commands `main` peels off before the clap resource tree parses, so they have
@@ -1286,12 +1475,12 @@ fn looks_like_path(value: &str) -> bool {
             .is_some_and(|e| !e.is_empty())
 }
 
-/// Whether the subcommand this command line names declares an `--output-file`
-/// argument. The scan descends the clap tree through the bare words in `argv`;
-/// a word that names no subcommand at the current level (an option's value, a
-/// positional) is skipped, and `--` ends the scan since passthrough tokens
-/// belong to the spawned tool.
-fn takes_output_file(argv: &[String]) -> bool {
+/// Answer `f` about the subcommand this command line names. The scan descends
+/// the clap tree through the bare words in `argv`; a word that names no
+/// subcommand at the current level (an option's value, a positional) is
+/// skipped, and `--` ends the scan since passthrough tokens belong to the
+/// spawned tool.
+fn with_invoked<R>(argv: &[String], f: impl FnOnce(&clap::Command) -> R) -> R {
     let mut root = Cli::command();
     root.build();
     let mut cmd = &root;
@@ -1303,8 +1492,301 @@ fn takes_output_file(argv: &[String]) -> bool {
             cmd = sub;
         }
     }
-    cmd.get_arguments()
-        .any(|a| a.get_long() == Some("output-file"))
+    f(cmd)
+}
+
+/// Whether the subcommand this command line names declares an `--output-file`
+/// argument.
+fn takes_output_file(argv: &[String]) -> bool {
+    with_invoked(argv, |cmd| {
+        cmd.get_arguments()
+            .any(|a| a.get_long() == Some("output-file"))
+    })
+}
+
+/// Rework clap's tip for an unknown flag on a verb with an xcodebuild `--`
+/// tail. clap's stock tip there ("to pass '--bogus' as a value, use '--
+/// --bogus'") hands the flag to xcodebuild, which spells no flag with two
+/// dashes and refuses it. So that tip goes, and the flag gets one of these in
+/// its place, or none:
+///
+/// - `--batch`, `--cmd` and `--on-crash` on `app diagnose` point at `app
+///   debug`, the verb that has them.
+/// - A flag sweetpad passes xcodebuild itself (`-scheme`, `test`'s
+///   `-resultBundlePath`) names the sweetpad flag that sets it, as the tail's
+///   own refusal does. So does an xcodebuild flag with a value that the verb
+///   has a flag of the same name for (`-destination`, `settings show`'s
+///   `-target`).
+/// - Any other flag xcodebuild takes ([`xcodebuild_args::is_flag`]), typed with
+///   one dash or two, is shown after the `--` with one.
+///
+/// A verb whose tail is hidden refuses one, so it gets none of these. clap
+/// splits a one-dash word such as `-quiet` into short flags and names the
+/// first one the verb lacks (`-u`), so the error names the word instead when
+/// it is an xcodebuild flag.
+///
+/// clap can also read such a word as a short flag that takes the rest of it:
+/// `-only-testing:App/Tests` as `-o nly-testing:App/Tests`, an invalid output
+/// format, and `-hideShellScriptEnvironment` as `-h`, which prints the verb's
+/// help. When the whole word is an xcodebuild flag, that error or help gives
+/// way to the unknown-flag error naming the word, with its tip. `-h`, `-help`
+/// and `--help` still print the help. Every other usage error renders as
+/// clap wrote it.
+fn hint_tail_flag(err: clap::Error, argv: &[String]) -> clap::Error {
+    use clap::error::ErrorKind;
+
+    match err.kind() {
+        ErrorKind::UnknownArgument => hint_unknown_flag(err, argv),
+        ErrorKind::InvalidValue | ErrorKind::DisplayHelp => hint_taken_word(err, argv),
+        _ => err,
+    }
+}
+
+/// [`hint_tail_flag`] for a flag clap doesn't know.
+fn hint_unknown_flag(mut err: clap::Error, argv: &[String]) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue};
+
+    let Some(ContextValue::String(arg)) = err.get(ContextKind::InvalidArg) else {
+        return err;
+    };
+    let arg = arg.clone();
+    let Some(verb) = with_invoked(argv, |cmd| TailVerb::of(cmd, argv, &arg)) else {
+        return err;
+    };
+    // clap's own tips stay, but for the one that starts "to pass".
+    if let Some(ContextValue::StyledStrs(tips)) = err.remove(ContextKind::Suggested) {
+        let tips: Vec<_> = tips
+            .into_iter()
+            .filter(|tip| !tip.to_string().starts_with("to pass '"))
+            .collect();
+        if !tips.is_empty() {
+            err.insert(ContextKind::Suggested, ContextValue::StyledStrs(tips));
+        }
+    }
+    let Some(tip) = verb.tip() else {
+        return err;
+    };
+    if tip.replaces_suggestion {
+        err.remove(ContextKind::SuggestedArg);
+    }
+    if verb.word != arg {
+        err.insert(ContextKind::InvalidArg, ContextValue::String(verb.word));
+    }
+    err.insert(
+        ContextKind::Suggested,
+        ContextValue::StyledStrs(vec![tip.text.into()]),
+    );
+    err
+}
+
+/// [`hint_tail_flag`] for a one-dash word clap read as a short flag that
+/// takes the rest of it: as its value, or as `-h`.
+fn hint_taken_word(err: clap::Error, argv: &[String]) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+    let value = match err.get(ContextKind::InvalidValue) {
+        Some(ContextValue::String(value)) => Some(value.clone()),
+        _ if err.kind() == ErrorKind::DisplayHelp => None,
+        _ => return err,
+    };
+    with_invoked(argv, |cmd| {
+        let word = match &value {
+            Some(value) => taken_word(cmd, argv, value),
+            None => help_word(cmd, argv),
+        };
+        let Some(word) = word else {
+            return err;
+        };
+        let Some(verb) = TailVerb::typed(cmd, word) else {
+            return err;
+        };
+        let Some(tip) = verb.tip() else {
+            return err;
+        };
+        let mut unknown = clap::Error::new(ErrorKind::UnknownArgument).with_cmd(cmd);
+        unknown.insert(ContextKind::InvalidArg, ContextValue::String(verb.word));
+        unknown.insert(
+            ContextKind::Suggested,
+            ContextValue::StyledStrs(vec![tip.text.into()]),
+        );
+        unknown.insert(
+            ContextKind::Usage,
+            ContextValue::StyledStr(cmd.clone().render_usage()),
+        );
+        unknown
+    })
+}
+
+/// The one-dash word in `argv`, ahead of any `--`, that clap read as short
+/// switches ending in a flag that took `value`, the rest of the word, as its
+/// value (`-only` read as `-o nly`).
+fn taken_word<'a>(cmd: &clap::Command, argv: &'a [String], value: &str) -> Option<&'a str> {
+    argv.iter()
+        .take_while(|a| *a != "--")
+        .map(String::as_str)
+        .find(|word| {
+            split_short(cmd, word).is_some_and(|(arg, rest)| {
+                arg.get_action().takes_values()
+                    && !rest.is_empty()
+                    && rest.strip_prefix('=').unwrap_or(rest) == value
+            })
+        })
+}
+
+/// The one-dash word in `argv`, ahead of any `--`, that clap read as short
+/// switches ending in `-h` (`-hide…`), when it is the only word that asks for
+/// help. A typed `-h` or `--help` beside it still shows the help, and so does
+/// an `-h` after `--arg -hide…`, where clap took the word as the value.
+fn help_word<'a>(cmd: &clap::Command, argv: &'a [String]) -> Option<&'a str> {
+    use clap::ArgAction;
+
+    let mut asking = argv
+        .iter()
+        .take_while(|a| *a != "--")
+        .map(String::as_str)
+        .filter(|word| {
+            *word == "--help"
+                || split_short(cmd, word).is_some_and(|(arg, _)| {
+                    matches!(arg.get_action(), ArgAction::Help | ArgAction::HelpShort)
+                })
+        });
+    let word = asking.next()?;
+    let (_, rest) = split_short(cmd, word)?;
+    (asking.next().is_none() && !rest.is_empty()).then_some(word)
+}
+
+/// The short flag clap stops at in the one-dash `word`, past the switches
+/// that lead it, and the rest of the word after that flag.
+fn split_short<'c, 'w>(cmd: &'c clap::Command, word: &'w str) -> Option<(&'c clap::Arg, &'w str)> {
+    use clap::ArgAction;
+
+    let short = |c: char| cmd.get_arguments().find(|a| a.get_short() == Some(c));
+    let switch = |c: char| {
+        short(c).is_some_and(|a| {
+            matches!(
+                a.get_action(),
+                ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count
+            )
+        })
+    };
+    let letters = word.strip_prefix('-').filter(|l| !l.starts_with('-'))?;
+    let (at, c) = letters.char_indices().find(|&(_, c)| !switch(c))?;
+    Some((short(c)?, &letters[at + c.len_utf8()..]))
+}
+
+/// The subcommand an unknown flag was typed on, when it has a `--` tail, for
+/// [`hint_tail_flag`].
+struct TailVerb {
+    /// The command line that names it, such as 'sweetpad app run'.
+    bin: String,
+    /// Whether its help shows the tail. The verbs that refuse one hide it.
+    tail_shown: bool,
+    /// The flag as typed: clap's `arg`, or for a short flag clap split out of
+    /// a one-dash word, that word.
+    word: String,
+    /// The word as xcodebuild spells a flag, with one dash.
+    flag: String,
+    /// Whether `flag` takes a value and the verb has a flag of the same name,
+    /// which sets the same thing.
+    named_alike: bool,
+}
+
+/// What [`TailVerb::tip`] suggests in place of a flag.
+struct TailTip {
+    text: String,
+    /// Whether it replaces clap's nearest-flag suggestion, which names the
+    /// wrong flag.
+    replaces_suggestion: bool,
+}
+
+impl TailVerb {
+    /// The verb, for the flag clap names as `arg`.
+    fn of(cmd: &clap::Command, argv: &[String], arg: &str) -> Option<Self> {
+        if arg.starts_with("--") {
+            return Self::typed(cmd, arg.split('=').next().unwrap_or_default());
+        }
+        let short = arg.strip_prefix('-')?.chars().next()?;
+        Self::typed(cmd, clustered_word(cmd, argv, short).unwrap_or(arg))
+    }
+
+    /// The verb, for the flag typed as `word`.
+    fn typed(cmd: &clap::Command, word: &str) -> Option<Self> {
+        let tail = cmd.get_arguments().find(|a| a.is_last_set())?;
+        let flag = word
+            .strip_prefix('-')
+            .filter(|w| w.starts_with('-'))
+            .unwrap_or(word);
+        let named_alike = xcodebuild_args::takes_value(flag)
+            && cmd
+                .get_arguments()
+                .any(|a| a.get_long() == flag.strip_prefix('-'));
+        Some(Self {
+            bin: cmd.get_bin_name()?.to_string(),
+            tail_shown: !tail.is_hide_set(),
+            flag: flag.to_string(),
+            named_alike,
+            word: word.to_string(),
+        })
+    }
+
+    /// The tip [`hint_tail_flag`] gives for the flag, if any.
+    fn tip(&self) -> Option<TailTip> {
+        let flag = self.flag.as_str();
+        let action = match self.bin.as_str() {
+            "sweetpad test" | "sweetpad test run" => xcodebuild::Action::Test,
+            "sweetpad archive" => xcodebuild::Action::Archive,
+            _ => xcodebuild::Action::Build,
+        };
+        let replacing = |text: String| {
+            Some(TailTip {
+                text,
+                replaces_suggestion: true,
+            })
+        };
+        if self.bin == "sweetpad app diagnose"
+            && matches!(self.word.as_str(), "--batch" | "--cmd" | "--on-crash")
+        {
+            replacing(format!(
+                "'{}' belongs to 'app debug': 'sweetpad app debug --batch --cmd <LLDB_CMD>' runs \
+                 your own lldb commands",
+                self.word
+            ))
+        } else if !self.tail_shown {
+            None
+        } else if let Some(owned) = xcodebuild::owned_flag(action, flag) {
+            replacing(xcodebuild::instead_of_owned(owned))
+        } else if self.named_alike {
+            replacing(format!("pass '-{flag}' instead of '{flag}'"))
+        } else if xcodebuild_args::is_flag(flag) {
+            Some(TailTip {
+                text: format!("xcodebuild flags go after '--': '{} -- {flag}'", self.bin),
+                replaces_suggestion: false,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// The one-dash word in `argv`, ahead of any `--`, that clap would reject as
+/// the short flag `short`: the first letter of it `cmd` has no switch for.
+fn clustered_word<'a>(cmd: &clap::Command, argv: &'a [String], short: char) -> Option<&'a str> {
+    let switch = |c: char| {
+        cmd.get_arguments()
+            .any(|a| a.get_short() == Some(c) && !a.get_action().takes_values())
+    };
+    argv.iter()
+        .take_while(|a| *a != "--")
+        .map(String::as_str)
+        .find(|word| {
+            let Some(letters) = word.strip_prefix('-').filter(|l| !l.starts_with('-')) else {
+                return false;
+            };
+            letters.len() > 1
+                && letters
+                    .find(short)
+                    .is_some_and(|at| letters[..at].chars().all(switch))
+        })
 }
 
 /// Point a path at `--output-file`, from either way of guessing at it.
@@ -1444,9 +1926,10 @@ fn early_error(out: &output::Output, e: &CliError) -> ExitCode {
     ExitCode::from(e.error_kind().exit_code())
 }
 
-/// A one-time tip after the very first invocation, pointing at the setup
-/// commands. A marker file in the state dir suppresses every later showing;
-/// interactive-only, so scripts, CI, and `--json` consumers never see it.
+/// A one-time tip after the first invocation that exits 0, pointing at the
+/// setup commands. A marker file in the state dir suppresses every later
+/// showing; interactive-only, so scripts, CI, and `--json` consumers never see
+/// it.
 fn first_run_hint(out: &output::Output) {
     if !out.is_interactive() || out.is_quiet() {
         return;
@@ -1461,19 +1944,25 @@ fn first_run_hint(out: &output::Output) {
     let _ = std::fs::create_dir_all(&dir);
     if std::fs::write(&marker, b"shown\n").is_ok() {
         out.note(
-            "tip: `sweetpad doctor` checks your toolchain, `sweetpad completions <shell>` \
-             sets up tab-completion, and `sweetpad help config` explains configuration \
+            "tip: 'sweetpad doctor' checks your toolchain, 'sweetpad completions <shell>' \
+             sets up tab-completion, and 'sweetpad help config' explains configuration \
              (this tip shows once)",
         );
     }
 }
 
 /// The class of a failure. Drives both the process exit code and the `--json`
-/// error envelope's `code`, from one taxonomy. Exit code 2 is owned by clap
-/// (usage errors) and 0 is success, so neither is an `ErrorKind`.
+/// error envelope's `code`, from one taxonomy. 0 is success, so it is not an
+/// `ErrorKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     Generic,
+    /// A command line clap parsed but the command refuses on its own: a flag
+    /// on a verb it means nothing to, two flags that can't go together, a
+    /// flag value out of range. Exit 2, the code of clap's own usage errors.
+    /// A flag refused because of what the project or destination turned out
+    /// to be is not one of these; that depends on more than the command line.
+    Usage,
     BuildFailure,
     TargetResolution,
     ToolMissing,
@@ -1481,11 +1970,12 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
-    /// The process exit code for this class (never 0 or 2).
+    /// The process exit code for this class (never 0).
     #[must_use]
     pub fn exit_code(self) -> u8 {
         match self {
             ErrorKind::Generic => 1,
+            ErrorKind::Usage => 2,
             ErrorKind::BuildFailure => 3,
             ErrorKind::TargetResolution => 4,
             ErrorKind::ToolMissing => 5,
@@ -1499,6 +1989,7 @@ impl ErrorKind {
     pub fn code_str(self) -> &'static str {
         match self {
             ErrorKind::Generic => "generic",
+            ErrorKind::Usage => "usage_error",
             ErrorKind::BuildFailure => "build_failure",
             ErrorKind::TargetResolution => "target_resolution",
             ErrorKind::ToolMissing => "tool_missing",
@@ -1523,6 +2014,16 @@ pub struct CliError {
     /// object so a caller reads `error.diagnostics` instead of scraping a log
     /// out of `error.message`.
     diagnostics: Vec<serde_json::Value>,
+    /// The terminal already shows this failure: the streamed build log printed
+    /// the errors behind it and closed on its `✗` banner. Human output then
+    /// prints nothing more; the exit code and the machine-readable error
+    /// object are unaffected.
+    shown: bool,
+    /// The command to run next, when the failure points at one its message
+    /// does not name. Human output closes on it as a `tip:` line, even when
+    /// the failure is [`shown`](CliError::shown); the error object carries it
+    /// as `tip`.
+    tip: Option<String>,
 }
 
 impl std::fmt::Display for CliError {
@@ -1543,6 +2044,8 @@ impl CliError {
             message: msg.into(),
             kind: ErrorKind::Generic,
             diagnostics: Vec::new(),
+            shown: false,
+            tip: None,
         }
     }
 
@@ -1587,6 +2090,8 @@ impl CliError {
             context: Some(context.to_string()),
             kind: self.kind,
             diagnostics: self.diagnostics,
+            shown: self.shown,
+            tip: self.tip,
         }
     }
 
@@ -1599,19 +2104,54 @@ impl CliError {
         self
     }
 
+    /// Mark this failure as already on the terminal, so human output leaves
+    /// the streamed log's `✗` banner as its last word. Set by the runner that
+    /// rendered the errors; it survives [`context`](CliError::context).
+    #[must_use]
+    pub fn shown(mut self) -> Self {
+        self.shown = true;
+        self
+    }
+
+    /// Whether the terminal already shows this failure (see
+    /// [`shown`](CliError::shown)).
+    #[must_use]
+    pub fn is_shown(&self) -> bool {
+        self.shown
+    }
+
+    /// Point this failure at the command to run next; `None` leaves it
+    /// without one. It survives [`context`](CliError::context).
+    #[must_use]
+    pub fn tip(mut self, tip: Option<String>) -> Self {
+        self.tip = tip;
+        self
+    }
+
+    /// The command this failure points at, if any (see
+    /// [`tip`](CliError::tip)).
+    #[must_use]
+    pub fn tip_text(&self) -> Option<&str> {
+        self.tip.as_deref()
+    }
+
     /// The machine-readable error object: the taxonomy code, the flattened
-    /// message, and — when the failure carried any — the parsed diagnostics.
-    /// The single shape every `--json`/`-o ndjson` error surface renders.
+    /// message, and — when the failure carried them — the parsed diagnostics
+    /// and the tip. The single shape every `--json`/`-o ndjson` error surface
+    /// renders.
     #[must_use]
     pub fn json(&self) -> serde_json::Value {
         let mut value = serde_json::json!({
             "code": self.kind.code_str(),
             "message": self.to_string(),
         });
-        if !self.diagnostics.is_empty()
-            && let Some(map) = value.as_object_mut()
-        {
-            map.insert("diagnostics".into(), self.diagnostics.clone().into());
+        if let Some(map) = value.as_object_mut() {
+            if !self.diagnostics.is_empty() {
+                map.insert("diagnostics".into(), self.diagnostics.clone().into());
+            }
+            if let Some(tip) = &self.tip {
+                map.insert("tip".into(), tip.clone().into());
+            }
         }
         value
     }
@@ -1702,6 +2242,155 @@ mod cli_definition_tests {
         }
     }
 
+    /// Each help heading lists only the flags of the struct that owns it, and
+    /// every flag of the targeting tiers sits under Target selection. clap
+    /// files an arg under whatever heading is current when it is added, so a
+    /// heading set for one flattened struct and not closed again takes over
+    /// the command's own flags declared after it.
+    #[test]
+    fn help_headings_hold_only_their_own_flags() {
+        use clap::{Args, CommandFactory};
+        use std::collections::HashSet;
+
+        fn ids(cmd: &clap::Command) -> HashSet<String> {
+            cmd.get_arguments()
+                .map(|a| a.get_id().to_string())
+                .collect()
+        }
+
+        fn walk(
+            cmd: &clap::Command,
+            path: &str,
+            owners: &[(&str, HashSet<String>)],
+            found: &mut Vec<String>,
+        ) {
+            let (targeting_heading, targeting) = &owners[0];
+            for arg in cmd.get_arguments() {
+                let id = arg.get_id().as_str();
+                let heading = arg.get_help_heading();
+                let owner = owners.iter().find(|(name, _)| Some(*name) == heading);
+                let problem = match (heading, owner) {
+                    (Some(_), Some((name, members))) => {
+                        (!members.contains(id)).then(|| format!("under {name:?}"))
+                    }
+                    (Some(unknown), None) => Some(format!("under unknown {unknown:?}")),
+                    (None, _) => {
+                        (targeting.contains(id) && arg.get_long().is_some() && !arg.is_hide_set())
+                            .then(|| format!("not under {targeting_heading:?}"))
+                    }
+                };
+                if let Some(problem) = problem {
+                    found.push(format!("{path} [{id}]: {problem}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), owners, found);
+            }
+        }
+
+        let probe = || clap::Command::new("probe");
+        let targeting_tier = super::BuildTargetArgs::augment_args(probe());
+        let modes = crate::cli::commands::app::StageTargetArgs::augment_args(probe());
+        for arg in targeting_tier.get_arguments().chain(modes.get_arguments()) {
+            assert_eq!(
+                arg.get_help_heading(),
+                Some(super::TARGET_SELECTION),
+                "[{}]",
+                arg.get_id()
+            );
+        }
+        let mut targeting = ids(&targeting_tier);
+        targeting.extend(ids(&modes));
+        let owners = [
+            (super::TARGET_SELECTION, targeting),
+            ("Global", ids(&super::GlobalArgs::augment_args(probe()))),
+        ];
+
+        let mut root = super::Cli::command();
+        root.build();
+        let mut found = Vec::new();
+        walk(&root, "sweetpad", &owners, &mut found);
+        assert!(
+            found.is_empty(),
+            "flags under the wrong heading:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// Every text clap can print as help, each with the command (and arg)
+    /// it belongs to: a command's about and before/after help, an arg's help,
+    /// and a possible value's help. Doc comments on the clap types are this
+    /// text.
+    fn help_texts() -> Vec<(String, String)> {
+        use clap::CommandFactory;
+
+        fn walk(cmd: &clap::Command, path: &str, texts: &mut Vec<(String, String)>) {
+            let own = [
+                cmd.get_about(),
+                cmd.get_long_about(),
+                cmd.get_before_help(),
+                cmd.get_before_long_help(),
+                cmd.get_after_help(),
+                cmd.get_after_long_help(),
+            ];
+            for text in own.into_iter().flatten() {
+                texts.push((path.to_string(), text.to_string()));
+            }
+            for arg in cmd.get_arguments() {
+                let values = arg.get_possible_values();
+                let value_help = values
+                    .iter()
+                    .filter_map(clap::builder::PossibleValue::get_help);
+                for text in [arg.get_help(), arg.get_long_help()]
+                    .into_iter()
+                    .flatten()
+                    .chain(value_help)
+                {
+                    texts.push((format!("{path} [{}]", arg.get_id()), text.to_string()));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), texts);
+            }
+        }
+
+        let mut root = super::Cli::command();
+        root.build();
+        let mut texts = Vec::new();
+        walk(&root, "sweetpad", &mut texts);
+        texts
+    }
+
+    /// The help texts that contain any of `needles`, one line each, saying
+    /// where they appear.
+    fn help_texts_containing(needles: &[&str]) -> Vec<String> {
+        help_texts()
+            .into_iter()
+            .filter(|(_, text)| needles.iter().any(|n| text.contains(n)))
+            .map(|(at, text)| format!("{at}: {text}"))
+            .collect()
+    }
+
+    /// A terminal prints backticks literally, so help text quotes with
+    /// 'single quotes', as clap's own text does.
+    #[test]
+    fn help_text_quotes_without_backticks() {
+        let found = help_texts_containing(&["`"]);
+        assert!(found.is_empty(), "backticks in help:\n{}", found.join("\n"));
+    }
+
+    /// Help is read without the design doc at hand, so it cites none of its
+    /// sections. Those references belong in comments clap doesn't show.
+    #[test]
+    fn help_text_cites_no_design_doc() {
+        let found = help_texts_containing(&["§", "CLI_DESIGN"]);
+        assert!(
+            found.is_empty(),
+            "design-doc references in help:\n{}",
+            found.join("\n")
+        );
+    }
+
     /// The `-- XCODEBUILD_ARGS` tail follows the build: every `app` verb that
     /// spawns xcodebuild takes it, and the verbs that only act on an installed
     /// app refuse it rather than accept args that reach nothing.
@@ -1730,6 +2419,546 @@ mod cli_definition_tests {
         for verb in ["launch", "uninstall", "stop", "logs"] {
             assert!(parse(verb).is_err(), "app {verb} accepted a `--` tail");
         }
+    }
+
+    /// `app launch` builds nothing, so where a `-- -derivedDataPath` build put
+    /// the product arrives as its own flag rather than as a `--` tail.
+    #[test]
+    fn app_launch_takes_the_derived_data_path_as_a_flag() {
+        use crate::cli::commands::app;
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from([
+            "sweetpad",
+            "app",
+            "launch",
+            "--mac",
+            "--derived-data-path",
+            "build/dd",
+        ])
+        .expect("--derived-data-path rejected");
+        match cli.resource {
+            Some(super::Resource::App {
+                action:
+                    Some(app::Action::Launch {
+                        derived_data_path, ..
+                    }),
+            }) => assert_eq!(
+                derived_data_path.as_deref(),
+                Some(std::path::Path::new("build/dd"))
+            ),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// `--arg` takes a value that starts with `-` (user-defaults arguments
+    /// like `-AppleLanguages` do) on every verb that launches the app, while
+    /// the flag after it and a `--` tail keep their own meaning.
+    #[test]
+    fn launch_args_take_values_starting_with_a_hyphen() {
+        use crate::cli::commands::app;
+        use clap::Parser;
+
+        let parse = |argv: &[&str]| -> (app::LaunchArgs, Vec<String>) {
+            let cli = super::Cli::try_parse_from(argv)
+                .unwrap_or_else(|e| panic!("{argv:?} rejected: {e}"));
+            let action = match cli.resource {
+                Some(super::Resource::Run(args)) => app::Action::Run(args),
+                Some(super::Resource::App { action }) => action.expect("no action parsed"),
+                other => panic!("{argv:?} parsed as {other:?}"),
+            };
+            match action {
+                app::Action::Run(args) => (args.launch, args.xcodebuild.passthrough),
+                app::Action::Launch { launch, .. } => (launch, Vec::new()),
+                app::Action::Debug {
+                    launch, xcodebuild, ..
+                }
+                | app::Action::Diagnose {
+                    launch, xcodebuild, ..
+                } => (launch, xcodebuild.passthrough),
+                other => panic!("{argv:?} parsed as {other:?}"),
+            }
+        };
+
+        for verb in [
+            &["run"][..],
+            &["app", "run"],
+            &["app", "launch"],
+            &["app", "debug"],
+            &["app", "diagnose"],
+        ] {
+            let argv = |rest: &[&'static str]| -> Vec<&str> {
+                ["sweetpad"]
+                    .iter()
+                    .chain(verb)
+                    .chain(rest)
+                    .copied()
+                    .collect()
+            };
+
+            let (launch, _) = parse(&argv(&["--arg", "-Foo"]));
+            assert_eq!(launch.args, ["-Foo"], "{verb:?}");
+
+            // One value per `--arg`: the flag that follows is a flag.
+            let (launch, _) = parse(&argv(&[
+                "--arg", "-MyFlag", "--arg", "YES", "--env", "X=1", "--mac",
+            ]));
+            assert_eq!(launch.args, ["-MyFlag", "YES"], "{verb:?}");
+            assert_eq!(launch.env, ["X=1"], "{verb:?}");
+
+            let (launch, _) = parse(&argv(&["--arg", "-Foo", "--wait-for-debugger"]));
+            assert!(launch.wait_for_debugger, "{verb:?}");
+
+            if verb != ["app", "launch"] {
+                let (launch, tail) = parse(&argv(&["--arg", "-Foo", "--", "-quiet"]));
+                assert_eq!(launch.args, ["-Foo"], "{verb:?}");
+                assert_eq!(tail, ["-quiet"], "{verb:?}");
+            }
+
+            // A valueless `--arg` must not take the `--` that starts the tail.
+            let err = super::Cli::try_parse_from(argv(&["--arg", "--", "-quiet"]))
+                .expect_err("`--arg --` accepted");
+            assert!(err.to_string().contains("needs a value"), "{verb:?}: {err}");
+        }
+    }
+
+    /// `build diagnostics` re-reads a record, so its help leaves out the
+    /// start-only and targeting flags that `build` and `build start` list,
+    /// while a stray one still parses onto the resource's args for the refusal
+    /// to catch.
+    #[test]
+    fn build_diagnostics_help_lists_no_start_flags() {
+        use clap::{CommandFactory, Parser};
+
+        let mut root = super::Cli::command();
+        root.build();
+        let build = root.find_subcommand_mut("build").expect("no build");
+        let help = |cmd: &mut clap::Command| cmd.render_long_help().to_string();
+        let start_flags = ["--clean", "--watch", "--show-command", "XCODEBUILD_ARGS"];
+
+        let resource = help(build);
+        let start = help(build.find_subcommand_mut("start").expect("no start"));
+        let diagnostics = help(
+            build
+                .find_subcommand_mut("diagnostics")
+                .expect("no diagnostics"),
+        );
+        for flag in start_flags {
+            assert!(resource.contains(flag), "build --help lacks {flag}");
+            assert!(start.contains(flag), "build start --help lacks {flag}");
+            assert!(
+                !diagnostics.contains(flag),
+                "build diagnostics --help lists {flag}"
+            );
+        }
+        // Listed as '--on <ON>', or alone on its line for '--mac'. The
+        // container flags stay: they pick the project whose record is read.
+        for flag in [
+            "--scheme <",
+            "--configuration <",
+            "--mac\n",
+            "--on <",
+            "--destination <",
+            "--sdk <",
+        ] {
+            assert!(resource.contains(flag), "build --help lacks {flag}");
+            assert!(start.contains(flag), "build start --help lacks {flag}");
+            assert!(
+                !diagnostics.contains(flag),
+                "build diagnostics --help lists {flag}"
+            );
+        }
+        assert!(diagnostics.contains("--project <"), "{diagnostics}");
+
+        for argv in [
+            &["sweetpad", "build", "diagnostics", "--clean"][..],
+            &["sweetpad", "build", "--clean", "diagnostics"],
+        ] {
+            match super::Cli::try_parse_from(argv).expect("rejected").resource {
+                Some(super::Resource::Build { args, .. }) => assert!(args.clean, "{argv:?}"),
+                other => panic!("{argv:?} parsed as {other:?}"),
+            }
+        }
+        match super::Cli::try_parse_from(["sweetpad", "build", "diagnostics", "--", "-quiet"])
+            .expect("rejected")
+            .resource
+        {
+            Some(super::Resource::Build { args, .. }) => assert_eq!(args.passthrough, ["-quiet"]),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    /// `test attachments` and `test output` read the last run back and `test
+    /// build` compiles, so each one's help leaves out the `test run` flags it
+    /// refuses, while `test` and `test run` still list them all.
+    #[test]
+    fn test_verbs_help_lists_only_the_run_flags_they_take() {
+        use clap::CommandFactory;
+
+        let mut root = super::Cli::command();
+        root.build();
+        let test = root.find_subcommand_mut("test").expect("no test");
+        let help = |cmd: &mut clap::Command| cmd.render_long_help().to_string();
+        let mut verb = |name: &str| help(test.find_subcommand_mut(name).expect(name));
+        let (run, attachments, output, build) = (
+            verb("run"),
+            verb("attachments"),
+            verb("output"),
+            verb("build"),
+        );
+        let resource = help(test);
+
+        let chooses_what_to_read = ["--only-testing", "--result-bundle"];
+        let shapes_a_build = ["--watch", "--show-command", "XCODEBUILD_ARGS"];
+        let run_only = [
+            "--skip-testing",
+            "--failed",
+            "--junit",
+            "--retry-flaky",
+            "--coverage",
+        ];
+        for flag in chooses_what_to_read
+            .iter()
+            .chain(&shapes_a_build)
+            .chain(&run_only)
+        {
+            assert!(resource.contains(flag), "test --help lacks {flag}");
+            assert!(run.contains(flag), "test run --help lacks {flag}");
+        }
+        for (name, text) in [("attachments", &attachments), ("output", &output)] {
+            for flag in chooses_what_to_read {
+                assert!(text.contains(flag), "test {name} --help lacks {flag}");
+            }
+            for flag in shapes_a_build.iter().chain(&run_only) {
+                assert!(!text.contains(flag), "test {name} --help lists {flag}");
+            }
+        }
+        for flag in shapes_a_build {
+            assert!(build.contains(flag), "test build --help lacks {flag}");
+        }
+        for flag in chooses_what_to_read.iter().chain(&run_only) {
+            assert!(!build.contains(flag), "test build --help lists {flag}");
+        }
+    }
+}
+
+/// Errors, warnings and notes are built in code rather than in the clap tree,
+/// so the help tests can't see them. These read the string literals out of the
+/// sources instead: every crate whose text the CLI prints, since the libraries'
+/// `String` errors reach the terminal verbatim through `CliError::new`.
+#[cfg(test)]
+mod message_source_tests {
+    use std::path::{Path, PathBuf};
+
+    const SOURCES: [&str; 3] = ["sweetpad-cli/src", "sweetpad-core/src", "sweetpad-lib/src"];
+
+    /// A string literal found in the sources: `path:line` and its text as
+    /// written, escapes included.
+    struct Literal {
+        at: String,
+        text: String,
+    }
+
+    /// One file's string literals outside comments and `#[cfg(test)]` items,
+    /// and the modules a `#[cfg(test)] mod name;` pulls in from other files.
+    #[derive(Default)]
+    struct Lexed {
+        literals: Vec<(usize, String)>,
+        test_modules: Vec<String>,
+    }
+
+    /// A small Rust lexer, enough to tell a string literal from a comment, a
+    /// char literal, or a lifetime, and to track braces so a `#[cfg(test)]`
+    /// item can be skipped whole.
+    fn lex(src: &str) -> Lexed {
+        const CFG_TEST: &str = "#[cfg(test)]";
+        let bytes = src.as_bytes();
+        let mut lexed = Lexed::default();
+        let (mut i, mut line, mut depth) = (0, 1, 0usize);
+        // A `#[cfg(test)]` waits at its brace depth, with where its item
+        // starts, until the item opens a block or ends at a `;`. An opened
+        // block is skipped until its brace closes.
+        let mut pending: Option<(usize, usize)> = None;
+        let mut skipping: Option<usize> = None;
+        while i < bytes.len() {
+            let in_test = pending.is_some() || skipping.is_some();
+            if let Some(end) = comment_end(src, i) {
+                line += src[i..end].matches('\n').count();
+                i = end;
+                continue;
+            }
+            if src[i..].starts_with(CFG_TEST) {
+                if !in_test {
+                    pending = Some((depth, i + CFG_TEST.len()));
+                }
+                i += CFG_TEST.len();
+                continue;
+            }
+            if let Some((body, end)) = string_at(src, i) {
+                let literal = &src[body];
+                if !in_test {
+                    lexed.literals.push((line, literal.to_string()));
+                }
+                line += literal.matches('\n').count();
+                i = end;
+                continue;
+            }
+            if let Some(end) = char_literal_end(src, i) {
+                i = end;
+                continue;
+            }
+            match bytes[i] {
+                b'{' => {
+                    if skipping.is_none()
+                        && let Some((at, _)) = pending
+                        && at == depth
+                    {
+                        skipping = Some(depth);
+                        pending = None;
+                    }
+                    depth += 1;
+                }
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if skipping == Some(depth) {
+                        skipping = None;
+                    }
+                }
+                b';' => {
+                    if let Some((at, start)) = pending
+                        && at == depth
+                    {
+                        let item = src[start..i].split_whitespace().collect::<Vec<_>>();
+                        if let [.., "mod", name] = item.as_slice() {
+                            lexed.test_modules.push((*name).to_string());
+                        }
+                        pending = None;
+                    }
+                }
+                b'\n' => line += 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        lexed
+    }
+
+    /// Where the comment starting at `i` ends, if one does: a line comment
+    /// (rustdoc included) at its newline, a block comment past its nested
+    /// closing `*/`.
+    fn comment_end(src: &str, i: usize) -> Option<usize> {
+        let rest = &src[i..];
+        if rest.starts_with("//") {
+            return Some(i + rest.find('\n').unwrap_or(rest.len()));
+        }
+        if !rest.starts_with("/*") {
+            return None;
+        }
+        let (mut nested, mut j) = (0usize, i);
+        while j < src.len() {
+            if src[j..].starts_with("/*") {
+                nested += 1;
+                j += 2;
+            } else if src[j..].starts_with("*/") {
+                nested -= 1;
+                j += 2;
+                if nested == 0 {
+                    break;
+                }
+            } else {
+                j += 1;
+            }
+        }
+        Some(j)
+    }
+
+    /// The string literal starting at `i`, plain or raw: the range of its
+    /// text between the quotes, and where the literal ends. A byte string's
+    /// `b` reads as code, and its quote as the start of a plain one.
+    fn string_at(src: &str, i: usize) -> Option<(std::ops::Range<usize>, usize)> {
+        let bytes = src.as_bytes();
+        let rest = &src[i..];
+        if rest.starts_with('"') {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            return Some((i + 1..j, j + 1));
+        }
+        if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+            return None;
+        }
+        let prefixed = rest.strip_prefix("br").or_else(|| rest.strip_prefix('r'))?;
+        let hashes = prefixed.len() - prefixed.trim_start_matches('#').len();
+        if !prefixed[hashes..].starts_with('"') {
+            return None;
+        }
+        let open = i + (rest.len() - prefixed.len()) + hashes + 1;
+        let close = format!("\"{}", "#".repeat(hashes));
+        let len = src[open..].find(&close).unwrap_or(src.len() - open);
+        Some((open..open + len, open + len + close.len()))
+    }
+
+    /// Where the char literal starting at `i` ends, if it is one rather than
+    /// a lifetime or a label, which have no closing quote.
+    fn char_literal_end(src: &str, i: usize) -> Option<usize> {
+        let bytes = src.as_bytes();
+        if bytes[i] != b'\'' {
+            return None;
+        }
+        if bytes.get(i + 1) == Some(&b'\\') {
+            return Some(i + 3 + src[i + 3..].find('\'')? + 1);
+        }
+        let width = src[i + 1..].chars().next()?.len_utf8();
+        (bytes.get(i + 1 + width) == Some(&b'\'')).then_some(i + width + 2)
+    }
+
+    fn rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, files);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    /// Every string literal outside test code under `SOURCES`.
+    fn literals() -> Vec<Literal> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        for dir in SOURCES {
+            rust_files(&workspace.join(dir), &mut files);
+        }
+        let lexed: Vec<(PathBuf, Lexed)> = files
+            .into_iter()
+            .map(|path| {
+                let src = std::fs::read_to_string(&path).unwrap();
+                let lexed = lex(&src);
+                (path, lexed)
+            })
+            .collect();
+        // A test module's file sits beside a `mod.rs`/`lib.rs`, or in the
+        // directory named after any other file that declares it.
+        let mut test_paths = Vec::new();
+        for (path, lexed) in &lexed {
+            let stem = path.file_stem().unwrap_or_default();
+            let dir = path.parent().unwrap_or(Path::new(""));
+            let dir = if ["mod", "lib", "main"].iter().any(|s| stem == *s) {
+                dir.to_path_buf()
+            } else {
+                dir.join(stem)
+            };
+            for name in &lexed.test_modules {
+                test_paths.push(dir.join(name));
+            }
+        }
+        let is_test = |path: &Path| {
+            test_paths
+                .iter()
+                .any(|t| path.starts_with(t) || path == t.with_extension("rs"))
+        };
+        let mut found = Vec::new();
+        for (path, lexed) in lexed {
+            if is_test(&path) {
+                continue;
+            }
+            let shown = path
+                .strip_prefix(&workspace)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            for (line, text) in lexed.literals {
+                found.push(Literal {
+                    at: format!("{shown}:{line}"),
+                    text,
+                });
+            }
+        }
+        found
+    }
+
+    /// The literals that contain any of `needles`, one line each, saying
+    /// where they are. A scan that found none of the messages it is meant
+    /// to read fails rather than passing on nothing.
+    fn literals_containing(needles: &[&str]) -> Vec<String> {
+        let literals = literals();
+        assert!(
+            literals
+                .iter()
+                .any(|l| l.text.contains("name at least one file")),
+            "the scan missed a message it should read"
+        );
+        literals
+            .into_iter()
+            .filter(|l| needles.iter().any(|n| l.text.contains(n)))
+            .map(|l| format!("{}: {}", l.at, l.text))
+            .collect()
+    }
+
+    /// A terminal prints backticks literally, so messages quote a command or
+    /// value with 'single quotes', as the help does.
+    #[test]
+    fn messages_quote_without_backticks() {
+        let found = literals_containing(&["`"]);
+        assert!(
+            found.is_empty(),
+            "backticks in messages:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// Someone reading an error has no design doc to look a section up in.
+    #[test]
+    fn messages_cite_no_design_doc() {
+        let found = literals_containing(&["§", "CLI_DESIGN"]);
+        assert!(
+            found.is_empty(),
+            "design-doc references in messages:\n{}",
+            found.join("\n")
+        );
+    }
+
+    /// The lexer finds the literals a message is made of, and none of the
+    /// backticks around them: not in comments or rustdoc, not in a char
+    /// literal or after a lifetime, and not in test code.
+    #[test]
+    fn the_lexer_reads_only_the_literals_outside_test_code() {
+        let src = r##"
+//! Module docs with `code`.
+/// Rustdoc with `code`.
+fn f<'a>(s: &'a str) -> char {
+    let tick = '`';
+    let quote = '\'';
+    let arrow = '→';
+    /* block `comment` /* nested `one` */ still */
+    let raw = r#"raw "quoted" text"#;
+    let escaped = "say \"hi\" \\";
+    message("run 'sweetpad build'")
+}
+#[cfg(test)]
+mod tests {
+    fn g() { panic!("`test`"); }
+}
+#[cfg(test)]
+mod testdir;
+fn after() { let _ = "{after}"; }
+"##;
+        let lexed = lex(src);
+        let texts: Vec<&str> = lexed.literals.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "raw \"quoted\" text",
+                r#"say \"hi\" \\"#,
+                "run 'sweetpad build'",
+                "{after}"
+            ]
+        );
+        assert_eq!(lexed.literals[2].0, 11, "the line a literal starts on");
+        assert_eq!(lexed.test_modules, ["testdir"]);
     }
 }
 
@@ -2010,6 +3239,311 @@ mod output_file_hint_tests {
 }
 
 #[cfg(test)]
+mod tail_flag_hint_tests {
+    use super::{Cli, hint_tail_flag};
+    use clap::Parser;
+
+    /// The error for a command line clap rejects, after the hint pass.
+    fn rejected(args: &[&str]) -> clap::Error {
+        let tokens: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let err = Cli::try_parse_from(
+            std::iter::once("sweetpad".to_string()).chain(tokens.iter().cloned()),
+        )
+        .expect_err("expected a usage error");
+        hint_tail_flag(err, &tokens)
+    }
+
+    /// The rendered error, which stays a usage error on stderr.
+    fn rendered(args: &[&str]) -> String {
+        let err = rejected(args);
+        assert!(err.use_stderr(), "{args:?}");
+        let text = err.render().to_string();
+        assert!(!text.contains('`'), "{args:?}:\n{text}");
+        text
+    }
+
+    /// `app diagnose --batch` names the verb that has the flag, in place of
+    /// clap's tip to pass it through to xcodebuild.
+    #[test]
+    fn a_batch_flag_on_diagnose_points_at_app_debug() {
+        for (args, flag) in [
+            (vec!["app", "diagnose", "--batch"], "--batch"),
+            (vec!["app", "diagnose", "--cmd", "bt"], "--cmd"),
+            (vec!["app", "diagnose", "--cmd=bt"], "--cmd"),
+            (vec!["app", "diagnose", "--on-crash", "bt"], "--on-crash"),
+            (
+                vec!["-C", "/tmp", "app", "diagnose", "--mac", "--batch"],
+                "--batch",
+            ),
+        ] {
+            let text = rendered(&args);
+            assert!(
+                text.contains(&format!(
+                    "tip: '{flag}' belongs to 'app debug': 'sweetpad app debug --batch --cmd \
+                     <LLDB_CMD>' runs your own lldb commands"
+                )),
+                "{args:?}:\n{text}"
+            );
+            assert!(!text.contains(&format!("-- {flag}")), "{args:?}:\n{text}");
+        }
+        let text = rendered(&["app", "run", "--batch"]);
+        assert!(!text.contains("belongs to 'app debug'"), "{text}");
+    }
+
+    /// A flag nothing takes gets no tip to pass it after '--' on any verb
+    /// with a tail, while clap's nearest-flag tip stays.
+    #[test]
+    fn a_flag_nothing_takes_is_not_sent_after_the_tail() {
+        for verb in [
+            &["build"][..],
+            &["build", "start"],
+            &["build", "diagnostics"],
+            &["test"],
+            &["test", "build"],
+            &["test", "output"],
+            &["archive"],
+            &["settings", "show"],
+            &["app", "run"],
+            &["app", "install"],
+            &["app", "debug"],
+            &["app", "diagnose"],
+        ] {
+            for flag in ["--bogus", "-bogus"] {
+                let args = [verb, &[flag]].concat();
+                let text = rendered(&args);
+                assert!(text.contains("unexpected argument"), "{args:?}:\n{text}");
+                assert!(!text.contains("to pass"), "{args:?}:\n{text}");
+                assert!(!text.contains("go after '--'"), "{args:?}:\n{text}");
+            }
+        }
+        let text = rendered(&["build", "--scheem", "App"]);
+        assert!(
+            text.contains("tip: a similar argument exists: '--scheme'"),
+            "{text}"
+        );
+        assert!(!text.contains("to pass"), "{text}");
+    }
+
+    /// A flag xcodebuild takes, typed ahead of the '--' with one dash or
+    /// two, is shown after it with one. The error names the word, not the
+    /// letter clap split out of it.
+    #[test]
+    fn an_xcodebuild_flag_is_shown_after_the_tail() {
+        for (args, word, shown) in [
+            (
+                &["build", "--allowProvisioningUpdates"][..],
+                "--allowProvisioningUpdates",
+                "sweetpad build -- -allowProvisioningUpdates",
+            ),
+            (
+                &["build", "-allowProvisioningUpdates"],
+                "-allowProvisioningUpdates",
+                "sweetpad build -- -allowProvisioningUpdates",
+            ),
+            (
+                &["app", "run", "-quiet"],
+                "-quiet",
+                "sweetpad app run -- -quiet",
+            ),
+            (
+                &["app", "run", "--arg", "-Dark", "-allowProvisioningUpdates"],
+                "-allowProvisioningUpdates",
+                "sweetpad app run -- -allowProvisioningUpdates",
+            ),
+            (
+                &["app", "install", "--mac", "-q", "-verbose"],
+                "-verbose",
+                "sweetpad app install -- -verbose",
+            ),
+            (
+                &["test", "-skip-testing:AppTests/Slow"],
+                "-skip-testing:AppTests/Slow",
+                "sweetpad test -- -skip-testing:AppTests/Slow",
+            ),
+            (
+                &["test", "--enableCodeCoverage", "YES"],
+                "--enableCodeCoverage",
+                "sweetpad test -- -enableCodeCoverage",
+            ),
+            (
+                &["settings", "show", "-xcconfig", "ci.xcconfig"],
+                "-xcconfig",
+                "sweetpad settings show -- -xcconfig",
+            ),
+            (
+                &["build", "-resultBundlePath", "r.xcresult"],
+                "-resultBundlePath",
+                "sweetpad build -- -resultBundlePath",
+            ),
+        ] {
+            let text = rendered(args);
+            assert!(
+                text.contains(&format!("error: unexpected argument '{word}' found")),
+                "{args:?}:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("tip: xcodebuild flags go after '--': '{shown}'")),
+                "{args:?}:\n{text}"
+            );
+        }
+        // A verb that refuses a tail gets no tip to pass one.
+        let text = rendered(&["build", "diagnostics", "-allowProvisioningUpdates"]);
+        assert!(!text.contains("tip:"), "{text}");
+    }
+
+    /// A flag sweetpad passes xcodebuild itself names the sweetpad flag that
+    /// sets it, since the tail refuses it. So does a value flag the verb has
+    /// a flag of the same name for.
+    #[test]
+    fn a_flag_sweetpad_passes_itself_names_sweetpads() {
+        for (args, tip) in [
+            (
+                &["build", "-scheme", "App"][..],
+                "sweetpad sets the scheme itself; pass '--scheme' instead of '-scheme'",
+            ),
+            (
+                &["app", "run", "-configuration", "Release"],
+                "sweetpad sets the configuration itself; pass '--configuration' instead of \
+                 '-configuration'",
+            ),
+            (
+                &["test", "run", "-resultBundlePath", "r.xcresult"],
+                "'sweetpad test' sets the result bundle itself; pass '--result-bundle' instead \
+                 of '-resultBundlePath'",
+            ),
+            (
+                &["test", "--resultBundlePath", "r.xcresult"],
+                "'sweetpad test' sets the result bundle itself; pass '--result-bundle' instead \
+                 of '-resultBundlePath'",
+            ),
+            (
+                &["archive", "-archivePath", "App.xcarchive"],
+                "'sweetpad archive' sets the archive path itself; pass '--output-file' instead \
+                 of '-archivePath'",
+            ),
+            // A value flag the verb has a flag of the same name for.
+            (
+                &["build", "-destination", "platform=macOS"],
+                "pass '--destination' instead of '-destination'",
+            ),
+            (
+                &["settings", "show", "-target", "App"],
+                "pass '--target' instead of '-target'",
+            ),
+            (
+                &["test", "-skip-testing", "AppTests/Slow"],
+                "pass '--skip-testing' instead of '-skip-testing'",
+            ),
+        ] {
+            let text = rendered(args);
+            assert!(text.contains(&format!("tip: {tip}")), "{args:?}:\n{text}");
+            assert!(!text.contains("go after '--'"), "{args:?}:\n{text}");
+        }
+    }
+
+    /// A verb with no tail keeps clap's error as it is.
+    #[test]
+    fn a_verb_without_a_tail_keeps_claps_text() {
+        let text = rendered(&["simulator", "screenshot", "--bogus"]);
+        assert!(text.contains("to pass '--bogus' as a value"), "{text}");
+        let text = rendered(&["app", "launch", "-allowProvisioningUpdates"]);
+        assert!(text.contains("unexpected argument '-a' found"), "{text}");
+    }
+
+    /// clap reads a one-dash word as a short flag that takes the rest of it:
+    /// `-only-testing:…` as an invalid '-o' format, `-hide…` as '-h'. An
+    /// xcodebuild word gets the error and tip an unknown one does.
+    #[test]
+    fn an_xcodebuild_word_read_as_a_short_flag_is_shown_after_the_tail() {
+        for (args, word, shown) in [
+            (
+                &["test", "-only-testing:App/Tests"][..],
+                "-only-testing:App/Tests",
+                "sweetpad test -- -only-testing:App/Tests",
+            ),
+            (
+                &["build", "-onlyUsePackageVersionsFromResolvedFile"],
+                "-onlyUsePackageVersionsFromResolvedFile",
+                "sweetpad build -- -onlyUsePackageVersionsFromResolvedFile",
+            ),
+            (
+                &["test", "run", "-q", "-only-test-configuration", "Fast"],
+                "-only-test-configuration",
+                "sweetpad test run -- -only-test-configuration",
+            ),
+            (
+                &["build", "-hideShellScriptEnvironment"],
+                "-hideShellScriptEnvironment",
+                "sweetpad build -- -hideShellScriptEnvironment",
+            ),
+            (
+                &[
+                    "app",
+                    "run",
+                    "--arg",
+                    "-Dark",
+                    "-hideShellScriptEnvironment",
+                ],
+                "-hideShellScriptEnvironment",
+                "sweetpad app run -- -hideShellScriptEnvironment",
+            ),
+        ] {
+            let text = rendered(args);
+            assert!(
+                text.contains(&format!("error: unexpected argument '{word}' found")),
+                "{args:?}:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("tip: xcodebuild flags go after '--': '{shown}'")),
+                "{args:?}:\n{text}"
+            );
+            assert!(!text.contains("possible values"), "{args:?}:\n{text}");
+        }
+        // The usage and the pointer to '--help' read as clap's own do.
+        let tail = |text: String| text.lines().skip(3).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            tail(rendered(&[
+                "build",
+                "-onlyUsePackageVersionsFromResolvedFile"
+            ])),
+            tail(rendered(&["build", "-quiet"]))
+        );
+        assert_eq!(
+            tail(rendered(&["build", "-hideShellScriptEnvironment"])),
+            tail(rendered(&["build", "-quiet"]))
+        );
+    }
+
+    /// '-h', '--help' and '-help' still print the verb's help, as does an
+    /// xcodebuild word beside a typed help flag, or taken as '--arg''s
+    /// value. So does a word on a verb that refuses a tail. A word that is
+    /// no xcodebuild flag keeps clap's error.
+    #[test]
+    fn help_and_other_words_stay_as_clap_reads_them() {
+        for args in [
+            &["build", "-h"][..],
+            &["build", "--help"],
+            &["build", "-help"],
+            &["build", "-qh"],
+            &["build", "-hideShellScriptEnvironment", "--help"],
+            &["build", "-h", "-hideShellScriptEnvironment"],
+            &["app", "run", "--arg", "-hideShellScriptEnvironment", "-h"],
+            &["build", "diagnostics", "-hideShellScriptEnvironment"],
+            &["devices", "-hideShellScriptEnvironment"],
+        ] {
+            let err = rejected(args);
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp, "{args:?}");
+        }
+        let text = rendered(&["test", "-oops"]);
+        assert!(
+            text.contains("invalid value 'ops' for '--output <OUTPUT>'"),
+            "{text}"
+        );
+        assert!(!text.contains("go after '--'"), "{text}");
+    }
+}
+
+#[cfg(test)]
 mod error_tests {
     use super::{CliError, ErrorContext, ErrorKind};
 
@@ -2019,11 +3553,22 @@ mod error_tests {
         assert_eq!(ErrorKind::Generic.exit_code(), 1);
     }
 
+    /// A usage error the command raises itself exits 2, the code clap gives
+    /// its own, and names the class in the error object.
+    #[test]
+    fn a_usage_error_shares_claps_exit_code() {
+        let e = CliError::new("--failed applies to a test run")
+            .kind(ErrorKind::Usage)
+            .context("running the tests");
+        assert_eq!(e.error_kind().exit_code(), 2);
+        assert_eq!(e.json()["code"], "usage_error");
+    }
+
     #[test]
     fn context_preserves_the_error_kind() {
         // Nearly every surfaced error is `.context`-wrapped through `?`; the
         // classification (and thus the exit code) must survive every layer.
-        let e = CliError::new("`xcrun` not found on PATH")
+        let e = CliError::new("'xcrun' not found on PATH")
             .kind(ErrorKind::ToolMissing)
             .context("installing the app on the simulator")
             .context("running the app");
@@ -2101,5 +3646,33 @@ mod error_tests {
         let wrapped = r.context("doing the thing").unwrap_err();
         assert_eq!(wrapped.headline(), Some("doing the thing"));
         assert_eq!(wrapped.detail(), "boom");
+    }
+
+    #[test]
+    fn a_shown_failure_stays_shown_through_context_and_keeps_its_exit_code() {
+        let e = CliError::new("xcodebuild exited with a non-zero status")
+            .kind(ErrorKind::BuildFailure)
+            .shown()
+            .context("building the project");
+        assert!(e.is_shown());
+        assert_eq!(e.error_kind().exit_code(), 3);
+        assert_eq!(
+            e.json()["message"],
+            "building the project: xcodebuild exited with a non-zero status"
+        );
+        assert!(!CliError::new("boom").is_shown());
+    }
+
+    #[test]
+    fn a_tip_rides_through_context_into_the_error_object() {
+        let e = CliError::new("xcodebuild exited with a non-zero status")
+            .tip(Some("run 'sweetpad device info X'".into()))
+            .context("building the project");
+        assert_eq!(e.tip_text(), Some("run 'sweetpad device info X'"));
+        assert_eq!(e.json()["tip"], "run 'sweetpad device info X'");
+        // No tip, no key: the object keeps its old shape.
+        let plain = CliError::new("boom").tip(None);
+        assert_eq!(plain.tip_text(), None);
+        assert!(plain.json().get("tip").is_none());
     }
 }

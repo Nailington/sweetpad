@@ -12,7 +12,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use sweetpad_core::build_settings::{BuildSettingsOptions, resolve_build_settings};
+use sweetpad_core::build_settings::{self, BuildSettingsOptions, TargetSettings};
+use sweetpad_core::scratch::ScratchDir;
 use sweetpad_lib::destination::parse_destination_arg;
 
 fn fixtures_root() -> PathBuf {
@@ -33,9 +34,20 @@ fn xcconfig_fixture(name: &str) -> PathBuf {
     ))
 }
 
+/// [`build_settings::resolve_build_settings`] with the catalog cached in
+/// Cargo's scratch space for integration tests. These resolve against the
+/// active Xcode, whose parsed catalog would otherwise be cached in the user's
+/// `~/.cache/sweetpad`.
+fn resolve_build_settings(mut opts: BuildSettingsOptions) -> Result<Vec<TargetSettings>, String> {
+    opts.catalog_cache.get_or_insert_with(|| {
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sweetpad-catalog.bin")
+    });
+    build_settings::resolve_build_settings(&opts)
+}
+
 /// Resolve a single target and return its settings map.
 fn resolve_one(opts: BuildSettingsOptions) -> BTreeMap<String, String> {
-    let mut out = resolve_build_settings(&opts).unwrap();
+    let mut out = resolve_build_settings(opts).unwrap();
     assert_eq!(out.len(), 1, "expected exactly one resolved target");
     out.remove(0).settings
 }
@@ -87,6 +99,33 @@ fn scratch_debug_resolves_against_active_xcode() {
 }
 
 #[test]
+fn command_line_overrides_win_over_the_project_in_order() {
+    // `xcodebuild … PRODUCT_NAME=A PRODUCT_NAME=B` builds `B`, and what
+    // derives from the setting follows it.
+    let opts = BuildSettingsOptions {
+        overrides: vec![
+            ("PRODUCT_NAME".to_string(), "First".to_string()),
+            ("PRODUCT_NAME".to_string(), "Renamed".to_string()),
+            (
+                "PRODUCT_BUNDLE_IDENTIFIER".to_string(),
+                "com.example.x".to_string(),
+            ),
+        ],
+        ..scratch_opts()
+    };
+    let s = resolve_one(opts);
+    assert_eq!(s.get("PRODUCT_NAME").map(String::as_str), Some("Renamed"));
+    assert_eq!(
+        s.get("PRODUCT_BUNDLE_IDENTIFIER").map(String::as_str),
+        Some("com.example.x")
+    );
+    let full = s
+        .get("FULL_PRODUCT_NAME")
+        .expect("FULL_PRODUCT_NAME present");
+    assert!(full.starts_with("Renamed"), "FULL_PRODUCT_NAME = {full}");
+}
+
+#[test]
 fn layers_extra_xcconfig_macos() {
     let opts = BuildSettingsOptions {
         xcconfig: Some(xcconfig_fixture("conditional-sdk")),
@@ -109,14 +148,42 @@ fn layers_extra_xcconfig_iphoneos() {
 }
 
 #[test]
+fn the_extra_xcconfig_overrides_the_command_line_settings_it_shares() {
+    // `xcodebuild -xcconfig Over.xcconfig FX_C=cli SWIFT_VERSION=5.9 FX_D=only`
+    // on Xcode 27, with the file holding the two assignments below, resolves
+    // `FX_C = cli fromxc`, `SWIFT_VERSION = 6.0` and `FX_D = only`: the file
+    // sits above the command line, and its `$(inherited)` reads the
+    // command-line value.
+    let dir = ScratchDir::new("sweetpad-overlay").unwrap();
+    let xcconfig = dir.join("Over.xcconfig");
+    std::fs::write(
+        &xcconfig,
+        "FX_C = $(inherited) fromxc\nSWIFT_VERSION = 6.0\n",
+    )
+    .unwrap();
+    let opts = BuildSettingsOptions {
+        xcconfig: Some(xcconfig),
+        overrides: vec![
+            ("FX_C".to_string(), "cli".to_string()),
+            ("SWIFT_VERSION".to_string(), "5.9".to_string()),
+            ("FX_D".to_string(), "only".to_string()),
+        ],
+        ..scratch_opts()
+    };
+    let s = resolve_one(opts);
+    assert_eq!(s.get("FX_C").map(String::as_str), Some("cli fromxc"));
+    assert_eq!(s.get("SWIFT_VERSION").map(String::as_str), Some("6.0"));
+    assert_eq!(s.get("FX_D").map(String::as_str), Some("only"));
+}
+
+#[test]
 fn sdk_conditions_match_the_versioned_canonical_name() {
     // xcodebuild binds `[sdk=...]` conditionals against the resolved SDK's
     // canonical name (e.g. `macosx26.0`), so the ubiquitous trailing-star
     // form matches while a bare unversioned pattern does not — CocoaPods
     // writes `[sdk=iphoneos*]` precisely because `[sdk=iphoneos]` wouldn't
     // match a real (versioned) SDK.
-    let dir = std::env::temp_dir().join(format!("sweetpad-sdkcond-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = ScratchDir::new("sweetpad-sdkcond").unwrap();
     let xcconfig = dir.join("sdk-cond.xcconfig");
     std::fs::write(
         &xcconfig,
@@ -130,7 +197,6 @@ fn sdk_conditions_match_the_versioned_canonical_name() {
     let s = resolve_one(opts);
     assert_eq!(s.get("STAR_SDK_COND").map(String::as_str), Some("star"));
     assert_eq!(s.get("BARE_SDK_COND"), None);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -188,7 +254,7 @@ fn unknown_target_errors() {
         target: Some("Nonexistent".to_string()),
         ..scratch_opts()
     };
-    let err = resolve_build_settings(&opts).unwrap_err();
+    let err = resolve_build_settings(opts).unwrap_err();
     assert!(err.contains("no target named"), "err: {err}");
 }
 
@@ -238,6 +304,51 @@ fn destination_supplies_platform() {
 }
 
 #[test]
+fn a_macos_app_without_a_team_signs_ad_hoc() {
+    // `xcodebuild -showBuildSettings -scheme SweetpadCIMac` on Xcode 27, for
+    // the CI fixture's macOS app, which sets no team and no identity and has
+    // `CODE_SIGNING_ALLOWED = NO`: `CODE_SIGN_IDENTITY = -`, with or without
+    // `-destination platform=macOS`, and the same with
+    // `CODE_SIGNING_ALLOWED=YES` or `CODE_SIGN_STYLE=Manual`. A team is what
+    // moves it: `DEVELOPMENT_TEAM=ABCDE12345` gives `Apple Development`.
+    let project =
+        fixtures_root().join("_synthetic-objectversion-110/project/SweetpadCIApp.xcodeproj");
+    let set = |k: &str, v: &str| (k.to_string(), v.to_string());
+    let cases = [
+        (vec![], None, "-"),
+        (vec![], Some("platform=macOS"), "-"),
+        (vec![set("CODE_SIGNING_ALLOWED", "YES")], None, "-"),
+        (vec![set("CODE_SIGN_STYLE", "Manual")], None, "-"),
+        (
+            vec![set("DEVELOPMENT_TEAM", "ABCDE12345")],
+            None,
+            "Apple Development",
+        ),
+        (
+            vec![set("DEVELOPMENT_TEAM", "ABCDE12345")],
+            Some("platform=macOS"),
+            "Apple Development",
+        ),
+    ];
+    for (overrides, destination, identity) in cases {
+        let opts = BuildSettingsOptions {
+            project: Some(project.clone()),
+            scheme: Some("SweetpadCIMac".to_string()),
+            configuration: "Debug".to_string(),
+            destination: destination.and_then(parse_destination_arg),
+            overrides: overrides.clone(),
+            ..Default::default()
+        };
+        let s = resolve_one(opts);
+        assert_eq!(
+            s.get("CODE_SIGN_IDENTITY").map(String::as_str),
+            Some(identity),
+            "{overrides:?} {destination:?}"
+        );
+    }
+}
+
+#[test]
 fn invalid_destination_is_rejected_at_parse() {
     // Each caller parses the destination string; an unknown platform yields
     // `None` (the CLI surfaced this as "invalid --destination").
@@ -284,7 +395,7 @@ fn scheme_build_excludes_test_only_entries() {
         destination: parse_destination_arg("platform=macOS"),
         ..Default::default()
     };
-    let out = resolve_build_settings(&opts).unwrap();
+    let out = resolve_build_settings(opts).unwrap();
     let targets: Vec<&str> = out.iter().map(|t| t.target.as_str()).collect();
     assert_eq!(targets, vec!["Alamofire macOS"]);
 }
@@ -293,11 +404,9 @@ fn scheme_build_excludes_test_only_entries() {
 
 /// A unique scratch dir under the OS temp dir containing a copy of the
 /// synthetic `Scratch.xcodeproj` (one `Scratch` tool target, no scheme files).
-fn scratch_copy(tag: &str) -> (PathBuf, PathBuf) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("sweetpad-bs-{tag}-{}-{n}", std::process::id()));
+/// The directory goes when the returned guard drops.
+fn scratch_copy(tag: &str) -> (ScratchDir, PathBuf) {
+    let root = ScratchDir::new(&format!("sweetpad-bs-{tag}")).unwrap();
     let proj = root.join("Scratch.xcodeproj");
     std::fs::create_dir_all(&proj).unwrap();
     std::fs::copy(
@@ -332,6 +441,28 @@ fn write_scheme(dir: &PathBuf, name: &str) {
     std::fs::write(dir.join(format!("{name}.xcscheme")), SCRATCH_SCHEME_XML).unwrap();
 }
 
+/// [`SCRATCH_SCHEME_XML`] with a Launch action that runs the `Scratch` target.
+fn write_running_scheme(dir: &PathBuf, name: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let launch = r#"   <LaunchAction buildConfiguration="Debug">
+      <BuildableProductRunnable runnableDebuggingMode="0">
+         <BuildableReference
+            BuildableIdentifier="primary"
+            BlueprintIdentifier="14A71A1C6762522AADB33EF1"
+            BuildableName="Scratch"
+            BlueprintName="Scratch"
+            ReferencedContainer="container:Scratch.xcodeproj">
+         </BuildableReference>
+      </BuildableProductRunnable>
+   </LaunchAction>
+</Scheme>"#;
+    std::fs::write(
+        dir.join(format!("{name}.xcscheme")),
+        SCRATCH_SCHEME_XML.replace("</Scheme>", launch),
+    )
+    .unwrap();
+}
+
 #[test]
 fn scheme_without_file_resolves_the_same_named_target() {
     // No `.xcscheme` exists anywhere — Xcode's autocreated per-target scheme.
@@ -349,25 +480,100 @@ fn scheme_without_file_resolves_the_same_named_target() {
     assert_eq!(s.get("PRODUCT_NAME").map(String::as_str), Some("Scratch"));
 }
 
+/// Autocreation is per target. On Xcode 27.0 this project, with a `Custom`
+/// scheme that only builds `Scratch`, lists both `Custom` and `Scratch`, and
+/// `xcodebuild -showBuildSettings -scheme Scratch` resolves.
 #[test]
-fn unknown_scheme_errors_when_other_scheme_files_exist() {
-    // Xcode's autocreated per-target schemes only exist in containers with
-    // NO scheme files at all. Once any scheme file exists, xcodebuild
-    // refuses an unknown scheme name even if a target with that name exists.
+fn a_target_another_scheme_only_builds_keeps_its_autocreated_scheme() {
     let (_root, proj) = scratch_copy("schemes-exist");
     write_scheme(&proj.join("xcshareddata/xcschemes"), "Custom");
     let opts = BuildSettingsOptions {
         project: Some(proj),
-        scheme: Some("Scratch".to_string()), // a target, but not a scheme
+        scheme: Some("Scratch".to_string()),
         configuration: "Debug".to_string(),
         sdk: "macosx".to_string(),
         arch: "arm64".to_string(),
         ..Default::default()
     };
-    let err = resolve_build_settings(&opts).unwrap_err();
+    let s = resolve_one(opts);
+    assert_eq!(s.get("PRODUCT_NAME").map(String::as_str), Some("Scratch"));
+}
+
+/// Once `Custom` runs `Scratch` in its Launch action, Xcode 27.0 lists
+/// `Custom` alone and refuses `-scheme Scratch`.
+#[test]
+fn a_target_another_scheme_runs_has_no_autocreated_scheme() {
+    let (_root, proj) = scratch_copy("scheme-runs");
+    write_running_scheme(&proj.join("xcshareddata/xcschemes"), "Custom");
+    let opts = BuildSettingsOptions {
+        project: Some(proj),
+        scheme: Some("Scratch".to_string()),
+        configuration: "Debug".to_string(),
+        sdk: "macosx".to_string(),
+        arch: "arm64".to_string(),
+        ..Default::default()
+    };
+    let err = resolve_build_settings(opts).unwrap_err();
     assert!(err.contains("does not contain a scheme"), "err: {err}");
 }
 
+/// A workspace listing the scratch project, with `scheme` written into the
+/// workspace's own shared schemes by `write`.
+fn scratch_workspace(tag: &str, write: fn(&PathBuf, &str)) -> (ScratchDir, PathBuf) {
+    let (root, _proj) = scratch_copy(tag);
+    let ws = root.join("W.xcworkspace");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(
+        ws.join("contents.xcworkspacedata"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version = \"1.0\">\n   \
+         <FileRef location = \"group:Scratch.xcodeproj\"></FileRef>\n</Workspace>\n",
+    )
+    .unwrap();
+    write(&ws.join("xcshareddata/xcschemes"), "Custom");
+    (root, ws)
+}
+
+fn workspace_scheme(ws: PathBuf, scheme: &str) -> BuildSettingsOptions {
+    BuildSettingsOptions {
+        workspace: Some(ws),
+        scheme: Some(scheme.to_string()),
+        configuration: "Debug".to_string(),
+        sdk: "macosx".to_string(),
+        arch: "arm64".to_string(),
+        ..Default::default()
+    }
+}
+
+/// A member's autocreated scheme survives a workspace scheme that only builds
+/// its target, as in `xcodebuild -list -workspace` on Xcode 27.0, and
+/// resolves.
+#[test]
+fn a_workspace_scheme_that_only_builds_a_member_target_keeps_its_scheme() {
+    let (_root, ws) = scratch_workspace("ws-builds", write_scheme);
+    assert_eq!(
+        sweetpad_lib::workspace::open(&ws).unwrap().merged_schemes(),
+        ["Custom", "Scratch"]
+    );
+    let s = resolve_one(workspace_scheme(ws, "Scratch"));
+    assert_eq!(s.get("PRODUCT_NAME").map(String::as_str), Some("Scratch"));
+}
+
+/// A workspace scheme that runs a member target takes the place of the
+/// target's autocreated scheme, in the listing and in resolution.
+#[test]
+fn a_workspace_scheme_that_runs_a_member_target_replaces_its_scheme() {
+    let (_root, ws) = scratch_workspace("ws-runs", write_running_scheme);
+    assert_eq!(
+        sweetpad_lib::workspace::open(&ws).unwrap().merged_schemes(),
+        ["Custom"]
+    );
+    let err = resolve_build_settings(workspace_scheme(ws, "Scratch")).unwrap_err();
+    assert!(err.contains("does not contain a scheme"), "err: {err}");
+}
+
+/// A name the project doesn't list is refused as a scheme, the way
+/// `xcodebuild -scheme Nonexistent` refuses it, even where every target
+/// autocreates one.
 #[test]
 fn unknown_scheme_with_no_matching_target_errors() {
     let (_root, proj) = scratch_copy("unknown-scheme");
@@ -379,18 +585,15 @@ fn unknown_scheme_with_no_matching_target_errors() {
         arch: "arm64".to_string(),
         ..Default::default()
     };
-    let err = resolve_build_settings(&opts).unwrap_err();
-    assert!(err.contains("no target named"), "err: {err}");
+    let err = resolve_build_settings(opts).unwrap_err();
+    assert!(err.contains("does not contain a scheme"), "err: {err}");
 }
 
 /// A username whose `xcuserdata` is visible to scheme discovery on this host:
-/// the detected `$USER` when set (discovery scopes to the current user), any
-/// fixed name otherwise (no identity → every user dir is scanned).
+/// the account's name when there is one (discovery scopes to it), any fixed
+/// name otherwise (no identity → every user dir is scanned).
 fn visible_user() -> String {
-    std::env::var("USER")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| "tester".into())
+    sweetpad_lib::host::user().unwrap_or_else(|| "tester".into())
 }
 
 #[test]
@@ -420,12 +623,10 @@ fn user_scheme_in_xcuserdata_resolves() {
 /// A two-member workspace where `Broken.xcodeproj` owns the `Scratch` target
 /// but attaches a malformed (present, unparseable) xcconfig to it, and
 /// `Other.xcodeproj` is a healthy minimal project with an `Other` target.
-/// Returns the `.xcworkspace` path; members are listed broken-last so the
-/// healthy member is visited first.
-fn workspace_with_broken_member(tag: &str) -> PathBuf {
-    let root =
-        std::env::temp_dir().join(format!("sweetpad-bs-broken-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+/// Returns the scratch dir's guard and the `.xcworkspace` path; members are
+/// listed broken-last so the healthy member is visited first.
+fn workspace_with_broken_member(tag: &str) -> (ScratchDir, PathBuf) {
+    let root = ScratchDir::new(&format!("sweetpad-bs-broken-{tag}")).unwrap();
 
     // Healthy member: one `Other` tool target, Debug-only.
     let other = root.join("Other.xcodeproj");
@@ -467,7 +668,7 @@ fn workspace_with_broken_member(tag: &str) -> PathBuf {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version=\"1.0\">\n  <FileRef location=\"group:Other.xcodeproj\"/>\n  <FileRef location=\"group:Broken.xcodeproj\"/>\n</Workspace>\n",
     )
     .unwrap();
-    ws
+    (root, ws)
 }
 
 #[test]
@@ -475,7 +676,7 @@ fn workspace_member_with_malformed_xcconfig_surfaces_the_real_error() {
     // The target lives in the broken member: the parse failure must surface,
     // tagged with the member project's path — not be swallowed into a
     // misleading "no target matched".
-    let ws = workspace_with_broken_member("hit");
+    let (_root, ws) = workspace_with_broken_member("hit");
     let opts = BuildSettingsOptions {
         workspace: Some(ws),
         target: Some("Scratch".to_string()),
@@ -484,7 +685,7 @@ fn workspace_member_with_malformed_xcconfig_surfaces_the_real_error() {
         arch: "arm64".to_string(),
         ..Default::default()
     };
-    let err = resolve_build_settings(&opts).unwrap_err();
+    let err = resolve_build_settings(opts).unwrap_err();
     assert!(
         err.contains("Broken.xcodeproj") && err.contains("xcconfig"),
         "the error must name the broken member and the xcconfig: {err}"
@@ -501,7 +702,7 @@ fn workspace_broken_member_without_the_target_is_still_skipped() {
     // lookup miss for it (the malformed xcconfig is never even loaded), so
     // resolution succeeds. And a target that exists nowhere keeps the
     // "no target matched" wording.
-    let ws = workspace_with_broken_member("skip");
+    let (_root, ws) = workspace_with_broken_member("skip");
     let opts = BuildSettingsOptions {
         workspace: Some(ws.clone()),
         target: Some("Other".to_string()),
@@ -521,7 +722,7 @@ fn workspace_broken_member_without_the_target_is_still_skipped() {
         arch: "arm64".to_string(),
         ..Default::default()
     };
-    let err = resolve_build_settings(&opts).unwrap_err();
+    let err = resolve_build_settings(opts).unwrap_err();
     assert!(err.contains("no target matched"), "err: {err}");
 }
 
@@ -556,14 +757,9 @@ fn workspace_level_scheme_resolves() {
 /// (`<root>/Modules/App/Scratch.xcodeproj`) — the layout that defeats
 /// `find_derived_data_container`'s parent/grandparent search. Named `Apps`,
 /// distinct from the member `Scratch`, so the keyed container is unambiguous.
-fn nested_member_workspace(tag: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
-        "sweetpad-bs-nested-{tag}-{}-{n}",
-        std::process::id()
-    ));
+/// Returns the scratch dir's guard with the workspace.
+fn nested_member_workspace(tag: &str) -> (ScratchDir, PathBuf) {
+    let root = ScratchDir::new(&format!("sweetpad-bs-nested-{tag}")).unwrap();
     let proj = root.join("Modules/App/Scratch.xcodeproj");
     std::fs::create_dir_all(&proj).unwrap();
     std::fs::copy(
@@ -578,7 +774,7 @@ fn nested_member_workspace(tag: &str) -> PathBuf {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version=\"1.0\">\n  <FileRef location=\"group:Modules/App/Scratch.xcodeproj\"/>\n</Workspace>\n",
     )
     .unwrap();
-    ws
+    (root, ws)
 }
 
 #[test]
@@ -590,7 +786,7 @@ fn workspace_keys_derived_data_by_the_workspace_not_a_nested_member() {
     // container Xcode opened — the workspace (`Apps-<hash>`) — not the member
     // project (`Scratch-<hash>`), so the path matches where xcodebuild writes
     // the .app.
-    let ws = nested_member_workspace("derived-data");
+    let (_root, ws) = nested_member_workspace("derived-data");
     let opts = BuildSettingsOptions {
         workspace: Some(ws.clone()),
         target: Some("Scratch".to_string()),
@@ -602,10 +798,9 @@ fn workspace_keys_derived_data_by_the_workspace_not_a_nested_member() {
     let s = resolve_one(opts);
     let build_dir = s.get("BUILD_DIR").expect("BUILD_DIR present");
 
-    // Xcode hashes the container path *as opened* — absolute, symlinks intact —
-    // which is exactly what `absolutize` preserves.
-    let ws_abs = sweetpad_lib::project::absolutize(&ws);
-    let hash = sweetpad_lib::xcode_hash::derived_data_hash(&ws_abs.display().to_string());
+    // Keyed the way xcodebuild keys it: by the hash of the container's
+    // standardized path.
+    let hash = sweetpad_lib::derived_data::container_hash(&ws);
     let expected = format!("/DerivedData/Apps-{hash}/Build/Products");
     assert!(
         build_dir.ends_with(&expected),
@@ -620,15 +815,10 @@ fn workspace_keys_derived_data_by_the_workspace_not_a_nested_member() {
 /// A bare `.xcodeproj` nested one directory below an UNRELATED project's
 /// `.xcworkspace` that does not reference it (`<root>/foreign.xcworkspace` +
 /// `<root>/app/Scratch.xcodeproj`). The workspace's basename differs from the
-/// project so a wrongly-adopted container is unambiguous.
-fn foreign_workspace_over_bare_project(tag: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!(
-        "sweetpad-bs-foreign-{tag}-{}-{n}",
-        std::process::id()
-    ));
+/// project so a wrongly-adopted container is unambiguous. Returns the scratch
+/// dir's guard with the project.
+fn foreign_workspace_over_bare_project(tag: &str) -> (ScratchDir, PathBuf) {
+    let root = ScratchDir::new(&format!("sweetpad-bs-foreign-{tag}")).unwrap();
     // An unrelated workspace one directory above, referencing some OTHER
     // project — never this one.
     let ws = root.join("foreign.xcworkspace");
@@ -645,7 +835,7 @@ fn foreign_workspace_over_bare_project(tag: &str) -> PathBuf {
         proj.join("project.pbxproj"),
     )
     .unwrap();
-    proj
+    (root, proj)
 }
 
 #[test]
@@ -655,7 +845,7 @@ fn bare_project_under_foreign_workspace_keys_derived_data_by_itself() {
     // folder, so the build (keyed `-project`, by the project) and the install
     // (keyed by the resolver) disagreed and the .app was "not found".
     // `find_derived_data_container` must require workspace membership.
-    let proj = foreign_workspace_over_bare_project("derived-data");
+    let (_root, proj) = foreign_workspace_over_bare_project("derived-data");
     let opts = BuildSettingsOptions {
         project: Some(proj.clone()),
         target: Some("Scratch".to_string()),
@@ -667,10 +857,9 @@ fn bare_project_under_foreign_workspace_keys_derived_data_by_itself() {
     let s = resolve_one(opts);
     let build_dir = s.get("BUILD_DIR").expect("BUILD_DIR present");
 
-    // Keyed by the project itself (its absolutized path), exactly as xcodebuild
-    // keys a bare `-project` build.
-    let proj_abs = sweetpad_lib::project::absolutize(&proj);
-    let hash = sweetpad_lib::xcode_hash::derived_data_hash(&proj_abs.display().to_string());
+    // Keyed by the project itself (the hash of its standardized path), exactly
+    // as xcodebuild keys a bare `-project` build.
+    let hash = sweetpad_lib::derived_data::container_hash(&proj);
     let expected = format!("/DerivedData/Scratch-{hash}/Build/Products");
     assert!(
         build_dir.ends_with(&expected),
@@ -690,8 +879,7 @@ fn bare_project_under_foreign_workspace_keys_derived_data_by_itself() {
 /// wrongly yield a `-maccatalyst` build dir Xcode never writes).
 #[test]
 fn native_macos_target_opting_out_of_catalyst_is_not_catalyst() {
-    let dir = std::env::temp_dir().join(format!("sweetpad-catalyst-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = ScratchDir::new("sweetpad-catalyst").unwrap();
     // The report's shape: a project-wide iOS-family Base SDK, but the target is
     // a native macOS app that does NOT support Mac Catalyst.
     let xcconfig = dir.join("catalyst.xcconfig");
@@ -714,5 +902,4 @@ fn native_macos_target_opting_out_of_catalyst_is_not_catalyst() {
         Some("-maccatalyst"),
         "a native macOS target must not get the -maccatalyst build dir"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

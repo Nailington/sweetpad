@@ -32,7 +32,8 @@ Each pool has its own narrower list when that's what you want:
 
 ```bash
 sweetpad simulator list   # simulators only, with UDIDs
-sweetpad device list      # connected physical devices, with their connection state
+sweetpad device list      # paired physical devices, with how each one connects
+sweetpad device info      # connect to a physical device and check that it's ready
 ```
 
 [Simulators](./simulators.md) covers the rest of that group: booting, screenshots, push payloads,
@@ -48,7 +49,7 @@ permissions, and managing the pool.
 | `--on booted`               | Whatever simulator is already running.              |
 | `--on mac`                  | Your Mac, for macOS schemes.                        |
 | `--on device`               | Your connected physical device.                     |
-| `--on ios` / `--on watchos` | Any destination of that platform.                   |
+| `--on ios` / `--on visionos` | The newest simulator of that platform. `watchos` and `tvos` work too. |
 | `--on work-phone`           | An alias you created yourself (see below).          |
 | `--on <UDID>`               | That exact simulator or device.                     |
 
@@ -98,6 +99,10 @@ One-off destinations aren't remembered. A `--destination` you typed, and the `--
 shortcuts, apply to that command only, so a quick check on your Mac doesn't quietly become the
 default for the next week.
 
+A `--scheme` you type isn't remembered either. When the next command has no scheme and can't ask,
+its error names the scheme your last build used, or lists the project's schemes, so you can pass
+`--scheme` again or keep one with `sweetpad context set scheme`.
+
 :::
 
 ## Changing what's remembered
@@ -139,14 +144,18 @@ sweetpad context alias work-phone --remove
 
 ## Physical devices
 
-A connected iPhone or iPad shows up in `sweetpad devices` and in `sweetpad device list`, which also
-reports whether it's currently reachable:
+A paired iPhone or iPad shows up in `sweetpad devices` and in `sweetpad device list`. Both show how
+it connects to your Mac: `usb` or `wifi`, and `not paired` if it hasn't trusted this Mac yet.
 
 ```console
 $ sweetpad device list
-Iphone 13 (iPhone 13, iOS 26.6)  [disconnected]
+Iphone 13 (iPhone 13, iOS 26.6)  [wifi]
     00008110-000559182E90401E
 ```
+
+In JSON, a device entry also has devicectl's own `connection`, `transport`, and `pairing` values. An
+idle device reads `connection: "disconnected"` even when it works fine, because xcodebuild opens the
+connection when it needs one.
 
 Target it by name, by UDID, or with the `device` shorthand when there's only one:
 
@@ -166,13 +175,31 @@ sweetpad app install --on device -- -allowProvisioningUpdates DEVELOPMENT_TEAM=A
 If your project always needs them, put them in `sweetpad.toml` once instead. See
 [Extra xcodebuild arguments](./reference.md#extra-xcodebuild-arguments).
 
-:::tip
+### Checking that a device is ready
 
-A device that's plugged in isn't necessarily ready. It also has to be unlocked, trusted, and in
-Developer Mode before xcodebuild can reach it. When a device build stalls looking for a destination,
-that's the first thing to check.
+A listed device isn't necessarily ready. It also has to be unlocked, trusted, and in Developer Mode
+before xcodebuild can reach it. `sweetpad device info` connects to the device and checks each of
+those:
 
-:::
+```console
+$ sweetpad device info "Iphone 13"
+Iphone 13 (iPhone 13, iOS 26.6)
+    00008110-000559182E90401E
+  pairing         paired
+  connection      connected (wifi)
+  developer mode  enabled
+  developer disk  not mounted
+  lock            locked
+  boot            booted
+  devicectl       The developer disk image could not be mounted on this device.
+not ready: Iphone 13 is locked; unlock it so Xcode can start its development services
+```
+
+The last line is the verdict: `ready to build and run`, or the first thing to fix. The command exits 1
+when the device isn't ready, and `-o json` reports the same facts plus `ready` and `reason` fields.
+
+With no argument, it checks the only paired device. It waits up to 10 seconds for the device to
+answer, and `--timeout` changes that.
 
 ## macOS
 
@@ -183,8 +210,25 @@ sweetpad run --on mac
 sweetpad run --mac      # the same thing
 ```
 
+`build`, `test`, and `test build` also take `--mac`, which means the same as `--on mac`:
+
+```bash
+sweetpad test --mac
+sweetpad build --mac
+```
+
 The macOS destination is also where the CLI's Mac-only verbs apply: `app screenshot` captures the
 app's window, and `app ui` reads and drives it through accessibility.
+
+For an iOS app, `--on mac` builds what `xcodebuild -destination platform=macOS` builds. An app that
+sets `SUPPORTS_MACCATALYST = YES` builds for Mac Catalyst, into `Debug-maccatalyst`. Any other iOS
+app builds "Designed for iPad" with the iOS device SDK (`iphoneos`), into `Debug-iphoneos`, and so do
+the frameworks its scheme builds. `settings show --on mac` reports the same settings, and the `app`
+commands look for the bundle there.
+
+A scheme can build targets for more than one platform, such as an iOS app and a macOS helper. Each
+target that can't run on the destination builds for its own platform, as it does in `xcodebuild`:
+under an iPhone simulator, the macOS helper still builds for macOS, into `Debug`.
 
 ## The raw escape hatch
 
@@ -196,7 +240,13 @@ sweetpad build --destination 'platform=iOS,id=00008110-000559182E90401E'
 sweetpad build --destination 'platform=macOS'
 ```
 
-`--on` and `--destination` are mutually exclusive, so pick one per command.
+When `run` or another `app` command installs from a `name=` specifier, it picks the simulator the
+way xcodebuild does. The name must match exactly, and so must the platform and the `OS=` when the
+specifier gives one. If several simulators still match, a booted one wins. Xcode keeps an
+`iPhone 16 Pro` for every iOS runtime you install, so add `OS=` when you have more than one.
+
+`--on` and `--destination` are mutually exclusive, so pick one per command. Each of them is also
+exclusive with `--mac`, and on the `app` commands with `--device` and `--device-id` too.
 
 Prefer `--destination` in CI. Fuzzy matching against whatever simulators a runner happens to have
 installed is a liability, and a pinned specifier fails loudly instead of quietly building for the

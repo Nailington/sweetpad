@@ -43,7 +43,7 @@ impl ResolveContext {
 /// character-class syntax. Iterative two-pointer matching with backtracking
 /// to the most recent star; byte-wise comparison is exact for UTF-8 since
 /// `*` is ASCII.
-fn glob_match(pattern: &str, s: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, s: &str) -> bool {
     let p = pattern.as_bytes();
     let t = s.as_bytes();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -693,8 +693,10 @@ fn split_ext(file: &str) -> (&str, &str) {
 /// `:standardizepath` — lexically resolve `.` and `..` segments and collapse
 /// `//`. The lexical subset of NSString's `standardizingPath` (no symlink
 /// resolution; `..` at an absolute root drops out, leading `..` on a
-/// relative path is kept).
-fn standardize_path(raw: &str) -> String {
+/// relative path is kept). `xcodebuild` folds its build-location settings
+/// the same way.
+#[must_use]
+pub fn standardize_path(raw: &str) -> String {
     let absolute = raw.starts_with('/');
     let mut parts: Vec<&str> = Vec::new();
     for seg in raw.split('/') {

@@ -4,9 +4,11 @@
 //! Mirrors the VS Code extension's renderer (`src/run/utils.ts`): each ndjson
 //! entry becomes a bold, color-coded `HH:MM:SS.sss L [category] message` line —
 //! the level as a single letter (D/I/N/E/F), the prefix tinted by severity, the
-//! message left in the terminal's default color. Lines that aren't JSON (the
-//! `Filtering the log data …` banner the stream prints first, say) are shown as
-//! a blue `system` note carrying the raw text.
+//! message left in the terminal's default color. The `Filtering the log data …`
+//! banner `log stream` prints first and the `{"count":…,"finished":1}` summary
+//! `log show` closes with are the tool's, not the app's, so neither is shown;
+//! any other line that isn't JSON is shown as a blue `system` note carrying the
+//! raw text.
 
 use std::borrow::Cow;
 
@@ -21,6 +23,17 @@ struct Entry {
     category: Option<String>,
     #[serde(rename = "eventMessage")]
     event_message: Option<String>,
+    /// Set only on the summary `log show` closes with ([`is_query_summary`]).
+    finished: Option<serde_json::Value>,
+}
+
+impl Entry {
+    /// Whether this object is the `{"count":N,"finished":1}` summary rather
+    /// than a log entry. An entry always carries an `eventMessage`, which the
+    /// summary never does.
+    fn is_summary(&self) -> bool {
+        self.finished.is_some() && self.event_message.is_none()
+    }
 }
 
 /// os_log severity, ordered low→high so a live filter can compare against a
@@ -88,12 +101,14 @@ pub struct Line {
     pub text: String,
 }
 
-/// Render one ndjson line as a colored log line with its severity. Non-JSON input
-/// (the stream's banner, or anything unexpected) is shown as a blue `system` note
-/// at `Notice` level.
+/// Render one ndjson line as a colored log line with its severity, or `None`
+/// for the banner `log stream` opens with ([`is_stream_banner`]) and the
+/// summary `log show` closes with ([`is_query_summary`]). Other non-JSON input
+/// is shown as a blue `system` note at `Notice` level.
 #[must_use]
-pub fn render_ndjson_line(line: &str, color: bool) -> Line {
-    match serde_json::from_str::<Entry>(line) {
+pub fn render_ndjson_line(line: &str, color: bool) -> Option<Line> {
+    Some(match serde_json::from_str::<Entry>(line) {
+        Ok(entry) if entry.is_summary() => return None,
         Ok(entry) => render_fields(
             entry.timestamp.as_deref(),
             entry.message_type.as_deref().unwrap_or("Default"),
@@ -101,9 +116,29 @@ pub fn render_ndjson_line(line: &str, color: bool) -> Line {
             entry.event_message.as_deref().unwrap_or(""),
             color,
         ),
-        // Banner / non-JSON: a blue `N [system]` note carrying the raw line.
+        Err(_) if is_stream_banner(line) => return None,
+        // Non-JSON: a blue `N [system]` note carrying the raw line.
         Err(_) => render_fields(None, "Default", "system", line, color),
-    }
+    })
+}
+
+/// Whether `line` is the `Filtering the log data using "<predicate>"` line
+/// `log stream` prints on stdout before its first entry, even under
+/// `--style ndjson`. It restates the predicate sweetpad built, so it would
+/// read as the app's own log line and match an `--until` for the app's name.
+fn is_stream_banner(line: &str) -> bool {
+    line.starts_with("Filtering the log data")
+}
+
+/// Whether `line` is the `{"count":N,"finished":1}` object `log show --style
+/// ndjson` prints after its last entry. It counts what the query returned, so
+/// rendered it reads as an empty `N [?]` entry, and a consumer of the raw
+/// event stream would take it for one.
+#[must_use]
+pub fn is_query_summary(line: &str) -> bool {
+    // The substring test spares a parse of every entry on the raw stream.
+    line.contains("\"finished\"")
+        && serde_json::from_str::<Entry>(line).is_ok_and(|entry| entry.is_summary())
 }
 
 /// Render already-parsed log fields into a [`Line`], shared by [`render_ndjson_line`]
@@ -184,7 +219,7 @@ fn format_line(
 /// Extract `HH:MM:SS.sss` from an Apple timestamp like
 /// `2024-12-31 23:59:59.000000-0800`. Returns `None` if the shape doesn't match,
 /// so the caller falls back to a time-less prefix.
-fn clock_time(timestamp: &str) -> Option<String> {
+pub(crate) fn clock_time(timestamp: &str) -> Option<String> {
     // The clock portion follows the date: "HH:MM:SS.ffffff±zzzz".
     let (hms, frac) = timestamp.split(' ').nth(1)?.split_once('.')?;
     let mut parts = hms.split(':');
@@ -278,13 +313,13 @@ mod tests {
     #[test]
     fn renders_an_ndjson_entry_with_level_letter_and_category() {
         let line = r#"{"timestamp":"2024-12-31 23:59:59.123456-0800","messageType":"Info","category":"networking","eventMessage":"Request started"}"#;
-        let plain = render_ndjson_line(line, false);
+        let plain = render_ndjson_line(line, false).unwrap();
         assert_eq!(plain.level, Level::Info);
         // No color: plain "HH:MM:SS.sss L [cat] msg".
         assert_eq!(plain.text, "23:59:59.123 I [networking] Request started");
         // Color: bold + cyan (36) prefix, reset before the (uncolored) message.
         assert_eq!(
-            render_ndjson_line(line, true).text,
+            render_ndjson_line(line, true).unwrap().text,
             "\x1b[1;36m23:59:59.123 I [networking]\x1b[0m Request started"
         );
     }
@@ -340,14 +375,46 @@ mod tests {
 
     #[test]
     fn non_json_lines_become_a_system_note() {
-        let line = "Filtering the log data using \"process == ...\"";
-        let plain = render_ndjson_line(line, false);
+        let line = "not an ndjson entry";
+        let plain = render_ndjson_line(line, false).unwrap();
         assert_eq!(plain.level, Level::Notice);
         assert_eq!(plain.text, format!("N [system] {line}"));
         assert_eq!(
-            render_ndjson_line(line, true).text,
+            render_ndjson_line(line, true).unwrap().text,
             format!("\x1b[1;34mN [system]\x1b[0m {line}")
         );
+    }
+
+    /// The banner `log stream` prints first is the tool's own, so it never
+    /// reaches the output as one of the app's lines.
+    #[test]
+    fn the_log_tools_banner_is_dropped() {
+        let banner = "Filtering the log data using \"process == \"App\" AND \
+                      (sender == \"App\" OR sender == \"App.debug.dylib\")\"";
+        assert!(render_ndjson_line(banner, false).is_none());
+        assert!(render_ndjson_line(banner, true).is_none());
+    }
+
+    /// The object `log show --style ndjson` closes with counts the entries
+    /// it printed; it is none of them, so it renders as nothing rather than
+    /// an empty `N [?]` line.
+    #[test]
+    fn the_log_queries_closing_summary_is_dropped() {
+        let summary = r#"{"count":1264,"finished":1}"#;
+        assert!(is_query_summary(summary));
+        assert!(render_ndjson_line(summary, false).is_none());
+        assert!(render_ndjson_line(r#"{"count":0,"finished":1}"#, true).is_none());
+
+        // An entry is never the summary, even one whose message names it.
+        let entry = r#"{"timestamp":"2024-12-31 23:59:59.123456-0800","messageType":"Default","category":"app","eventMessage":"{\"count\":3,\"finished\":1}"}"#;
+        assert!(!is_query_summary(entry));
+        assert_eq!(
+            render_ndjson_line(entry, false).unwrap().text,
+            r#"23:59:59.123 N [app] {"count":3,"finished":1}"#
+        );
+        assert!(!is_query_summary(
+            "Filtering the log data using \"finished\""
+        ));
     }
 
     #[test]
@@ -375,7 +442,7 @@ mod tests {
     #[test]
     fn missing_timestamp_drops_only_the_time_token() {
         let line = r#"{"messageType":"Error","category":"db","eventMessage":"boom"}"#;
-        let rendered = render_ndjson_line(line, false);
+        let rendered = render_ndjson_line(line, false).unwrap();
         assert_eq!(rendered.level, Level::Error);
         assert_eq!(rendered.text, "E [db] boom");
     }

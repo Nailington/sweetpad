@@ -21,6 +21,9 @@
 
 use std::path::{Path, PathBuf};
 
+use sweetpad_core::devices::simctl::version_key;
+use sweetpad_lib::destination::{DestinationSpec, Platform};
+
 use crate::cli::config::Defaults;
 use crate::cli::state::{SelectedDestination, State};
 use crate::cli::{CliError, Context, ErrorKind};
@@ -50,31 +53,10 @@ impl Container {
     #[must_use]
     pub fn key(&self) -> String {
         std::fs::canonicalize(self.path())
-            .unwrap_or_else(|_| absolutize(self.path()))
+            .unwrap_or_else(|_| sweetpad_lib::project::absolutize(self.path()))
             .to_string_lossy()
             .into_owned()
     }
-}
-
-/// Join a path onto the cwd (when relative) and squash `.`/`..` lexically — the
-/// canonicalize fallback that never touches the filesystem.
-fn absolutize(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = if path.is_absolute() {
-        PathBuf::new()
-    } else {
-        std::env::current_dir().unwrap_or_default()
-    };
-    for comp in path.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            c => out.push(c.as_os_str()),
-        }
-    }
-    out
 }
 
 /// Resolve the project container from explicit flags, else from a committed
@@ -83,7 +65,19 @@ fn absolutize(path: &Path) -> PathBuf {
 /// explicitly flagged path must exist: passing it through would mint state
 /// entries for typos (silently pruned or kept as garbage) and die later inside
 /// xcodebuild with a worse message.
+///
+/// The container's `sweetpad.toml` is loaded here too. A `developer_dir` it
+/// pins only takes effect once the file is loaded, and every tool the command
+/// spawns has to run under that Xcode, including the manifest reads and
+/// package resolves that come before anything asks the file for a default.
 pub fn container(ctx: &Context) -> Result<Container, CliError> {
+    let container = locate_container(ctx)?;
+    ctx.project_file(&container);
+    Ok(container)
+}
+
+/// [`container`]'s search, without loading the container's `sweetpad.toml`.
+fn locate_container(ctx: &Context) -> Result<Container, CliError> {
     let must_exist = |path: &Path, flag: &str| -> Result<(), CliError> {
         if path.exists() {
             Ok(())
@@ -245,35 +239,32 @@ pub fn discover(dir: &Path) -> Option<Container> {
 }
 
 /// Everything discoverable in a directory, each kind sorted by name so the
-/// pick never depends on `read_dir` order.
+/// pick never depends on `read_dir` order ([`sweetpad_lib::discover::Found`]).
 #[derive(Debug, Default)]
-pub struct Discovery {
-    workspaces: Vec<PathBuf>,
-    projects: Vec<PathBuf>,
-    package: Option<PathBuf>,
-}
+pub struct Discovery(sweetpad_lib::discover::Found);
 
 impl Discovery {
     /// The winning container: workspace > project > package, alphabetically
     /// first within a kind.
     #[must_use]
     pub fn best(&self) -> Option<Container> {
-        self.workspaces
-            .first()
-            .cloned()
-            .map(Container::Workspace)
-            .or_else(|| self.projects.first().cloned().map(Container::Project))
-            .or_else(|| self.package.clone().map(Container::SwiftPackage))
+        use sweetpad_lib::discover::Kind;
+        self.0.containers().next().map(|(kind, path)| match kind {
+            Kind::Workspace => Container::Workspace(path.to_path_buf()),
+            Kind::Project => Container::Project(path.to_path_buf()),
+            Kind::Package => Container::SwiftPackage(path.to_path_buf()),
+        })
     }
 
     /// A warning when the *winning kind* has several candidates — the pick is
     /// then a policy (alphabetical), not the user's intent.
     #[must_use]
     pub fn ambiguity(&self) -> Option<String> {
-        let (kind, flag, candidates) = if self.workspaces.len() > 1 {
-            ("workspaces", "--workspace", &self.workspaces)
-        } else if self.workspaces.is_empty() && self.projects.len() > 1 {
-            ("projects", "--project", &self.projects)
+        let found = &self.0;
+        let (kind, flag, candidates) = if found.workspaces.len() > 1 {
+            ("workspaces", "--workspace", &found.workspaces)
+        } else if found.workspaces.is_empty() && found.projects.len() > 1 {
+            ("projects", "--project", &found.projects)
         } else {
             return None;
         };
@@ -291,25 +282,7 @@ impl Discovery {
 
 /// Collect every container in `dir`, sorted by file name within each kind.
 fn discover_all(dir: &Path) -> Discovery {
-    let mut found = Discovery::default();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("xcworkspace") => found.workspaces.push(path),
-            Some("xcodeproj") => found.projects.push(path),
-            _ => {
-                if path.file_name().and_then(|f| f.to_str()) == Some("Package.swift") {
-                    found.package = Some(path);
-                }
-            }
-        }
-    }
-    found.workspaces.sort();
-    found.projects.sort();
-    found
+    Discovery(sweetpad_lib::discover::in_dir(dir))
 }
 
 /// How far below a directory the downward scan looks. One level reaches the
@@ -319,76 +292,24 @@ fn discover_all(dir: &Path) -> Discovery {
 /// the container in `sweetpad.toml` is the better answer.
 const MAX_SCAN_DEPTH: usize = 2;
 
-/// Build output and vendored dependency trees, which hold projects that are
-/// never the one meant — `Pods/Pods.xcodeproj` above all.
-const VENDORED_DIRS: [&str; 6] = [
-    "node_modules",
-    "Pods",
-    "Carthage",
-    "vendor",
-    "DerivedData",
-    "build",
-];
-
-/// Directories the scan never enters: [vendored trees](VENDORED_DIRS), dotted
-/// directories, and bundles — which are directories on macOS and so would
-/// otherwise be walked like ordinary ones.
-fn skip_dir(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return true;
-    };
-    if name.starts_with('.') {
-        return true;
-    }
-    VENDORED_DIRS.contains(&name)
-        || matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("xcodeproj" | "xcworkspace" | "app" | "framework" | "bundle" | "playground")
-        )
-}
-
 /// Search below `root`, breadth-first, returning one [`Discovery`] per
 /// directory at the shallowest level that holds anything — a project one level
 /// down beats three of them two levels down, the same "nearest wins" the
 /// upward walk applies. More than one entry means directories tied at that
 /// depth, which is the ambiguity no policy should silently resolve.
 ///
-/// Symlinks are skipped for free: [`std::fs::DirEntry::file_type`] doesn't
-/// follow them, so a link to a directory never reports `is_dir`, and the scan
-/// can't cycle or escape the tree it was pointed at.
+/// The walk is [`sweetpad_lib::discover::below`], the one the extension's
+/// project picker takes: vendored trees (`Pods`, `node_modules`, …), dotted
+/// directories and bundles are never entered, and neither is a symlink.
 fn scan_down(root: &Path) -> Vec<Discovery> {
-    let mut frontier = vec![root.to_path_buf()];
-    for _ in 0..MAX_SCAN_DEPTH {
-        let mut hits = Vec::new();
-        let mut next = Vec::new();
-        for parent in &frontier {
-            let Ok(entries) = std::fs::read_dir(parent) else {
-                continue;
-            };
-            let mut dirs: Vec<PathBuf> = entries
-                .flatten()
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                .map(|e| e.path())
-                .filter(|p| !skip_dir(p))
-                .collect();
-            // Sorted so a same-depth tie resolves the same way on every
-            // machine, `read_dir` order being arbitrary.
-            dirs.sort();
-            for dir in dirs {
-                let found = discover_all(&dir);
-                if found.best().is_some() {
-                    hits.push(found);
-                } else {
-                    next.push(dir);
-                }
-            }
-        }
-        if !hits.is_empty() {
-            return hits;
-        }
-        frontier = next;
-    }
-    Vec::new()
+    let hits = sweetpad_lib::discover::below(root, MAX_SCAN_DEPTH);
+    let Some(nearest) = hits.iter().map(|h| h.depth).filter(|&d| d > 0).min() else {
+        return Vec::new();
+    };
+    hits.into_iter()
+        .filter(|h| h.depth == nearest)
+        .map(|h| Discovery(h.found))
+        .collect()
 }
 
 /// Look below the working directory, then below the repository root — nearest
@@ -640,7 +561,10 @@ pub fn schemes(container: &Container) -> Result<Vec<String>, CliError> {
     match container {
         Container::Workspace(p) => sweetpad_lib::workspace::open(p)
             .map(|w| {
-                let members = sweetpad_core::package_members::resolve_workspace(&w, None);
+                let members = sweetpad_core::package_members::resolve_workspace(
+                    &w,
+                    &sweetpad_core::package_members::Toolchain::default(),
+                );
                 w.merged_schemes_with_packages(&sweetpad_core::package_members::scheme_pairs(
                     &members,
                 ))
@@ -648,7 +572,10 @@ pub fn schemes(container: &Container) -> Result<Vec<String>, CliError> {
             .map_err(|e| CliError::new(format!("failed to read workspace {}: {e}", p.display()))),
         Container::Project(p) => sweetpad_lib::project::open(p)
             .map(|proj| {
-                let members = sweetpad_core::package_members::resolve_project(&proj, None);
+                let members = sweetpad_core::package_members::resolve_project(
+                    &proj,
+                    &sweetpad_core::package_members::Toolchain::default(),
+                );
                 proj.schemes_with_packages(&sweetpad_core::package_members::scheme_pairs(&members))
             })
             .map_err(|e| CliError::new(format!("failed to read project {}: {e}", p.display()))),
@@ -916,18 +843,11 @@ pub fn resolve_on(
 
     // Platform words: the newest matching simulator, most-used first among
     // equals.
-    let platform = match lower.as_str() {
-        "ios" | "iphone" | "ipad" => Some("iOS"),
-        "watchos" => Some("watchOS"),
-        "tvos" => Some("tvOS"),
-        "visionos" | "xros" => Some("visionOS"),
-        _ => None,
-    };
-    if let Some(platform) = platform {
+    if let Some(platform) = platform_word(&lower).and_then(Platform::simulator_for_os) {
         let mut candidates: Vec<&crate::cli::simctl::Simulator> = sims
             .iter()
             .filter(|s| {
-                s.os.eq_ignore_ascii_case(platform)
+                platform.matches_os(&s.os)
                     && (lower != "ipad" || s.name.to_ascii_lowercase().contains("ipad"))
                     && (lower != "iphone" || s.name.to_ascii_lowercase().contains("iphone"))
             })
@@ -1024,24 +944,26 @@ pub fn resolve_on(
     }
 }
 
-fn device_target(dev: &crate::cli::devicectl::Device) -> OnTarget {
-    let platform = if dev.platform.is_empty() {
-        "iOS"
-    } else {
-        &dev.platform
-    };
-    OnTarget::Device {
-        udid: dev.udid.clone(),
-        specifier: format!("platform={platform},id={}", dev.udid),
-    }
+/// The OS family a platform word names, ignoring case: `mac`/`macos`,
+/// `ios`/`iphone`/`ipad`, `watchos`, `tvos`, `visionos`/`xros`. `--on` reads
+/// it as the newest simulator of the family, `archive --on` as the family's
+/// generic device platform.
+pub(crate) fn platform_word(word: &str) -> Option<&'static str> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "mac" | "macos" => "macOS",
+        "ios" | "iphone" | "ipad" => "iOS",
+        "watchos" => "watchOS",
+        "tvos" => "tvOS",
+        "visionos" | "xros" => "visionOS",
+        _ => return None,
+    })
 }
 
-/// Numeric sort key for an OS version string (`"17.0"` → `[17, 0]`).
-fn version_key(version: &str) -> Vec<u32> {
-    version
-        .split('.')
-        .map(|part| part.parse().unwrap_or(0))
-        .collect()
+fn device_target(dev: &crate::cli::devicectl::Device) -> OnTarget {
+    OnTarget::Device {
+        udid: dev.udid.clone(),
+        specifier: dev.destination(),
+    }
 }
 
 /// A fully-settled build target: the three things `xcodebuild` always needs.
@@ -1151,7 +1073,51 @@ pub(crate) fn settle_scheme(
             validate_choice("scheme", higher, candidates)?;
         }
     }
+    if resolved.scheme.is_none() && candidates.len() > 1 && !ctx.out.is_interactive() {
+        let last = crate::cli::xcodebuild::last_build_scheme(&resolved.container);
+        return Err(missing_scheme(last.as_deref(), candidates));
+    }
     choose(ctx, "scheme", resolved.scheme.clone(), candidates)
+}
+
+/// The strict error for a scheme nobody named when several fit. A typed
+/// `--scheme` is not remembered (§5), so the command after a `build --scheme X`
+/// is where this bites: when the last build's scheme is one of `candidates`,
+/// the error names it; otherwise it lists them. Either way it names the two
+/// ways to supply one.
+fn missing_scheme(last_build: Option<&str>, candidates: &[String]) -> CliError {
+    const SHOWN: usize = 5;
+    let quote = |s: &str| {
+        if s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c))
+        {
+            s.to_string()
+        } else {
+            format!("\"{}\"", s.replace('"', "\\\""))
+        }
+    };
+    let hint = if let Some(scheme) = last_build.filter(|s| candidates.iter().any(|c| c == s)) {
+        let scheme = quote(scheme);
+        format!(
+            "the last build used '--scheme {scheme}': pass it again, or run \
+             'sweetpad context set scheme {scheme}' to remember it"
+        )
+    } else {
+        let listed: Vec<String> = candidates.iter().take(SHOWN).map(|s| quote(s)).collect();
+        let more = match candidates.len().saturating_sub(SHOWN) {
+            0 => String::new(),
+            n => format!(" and {n} more"),
+        };
+        format!(
+            "pass --scheme with one of {}{more}, or run 'sweetpad context set scheme <name>' \
+             to remember one",
+            listed.join(", ")
+        )
+    };
+    CliError::new(format!(
+        "no scheme specified and the terminal is not interactive; {hint}"
+    ))
+    .kind(ErrorKind::TargetResolution)
 }
 
 /// Settle the build configuration: an explicit/remembered value is validated
@@ -1262,9 +1228,9 @@ fn recover_stale(
         }
         let _ = ctx.state.save();
         let hint = if testing_match {
-            format!("`sweetpad context remove {what} --testing` does this by hand")
+            format!("'sweetpad context remove {what} --testing' does this by hand")
         } else {
-            format!("`sweetpad context remove {what}` does this by hand")
+            format!("'sweetpad context remove {what}' does this by hand")
         };
         ctx.out.warn(&format!(
             "the remembered {what} {value:?} no longer exists in the project — cleared it ({hint})"
@@ -1311,14 +1277,11 @@ fn recover_stale(
 ///
 /// Used to decide staleness conservatively: when `devicectl` can't answer (not
 /// installed, no Developer Mode, device asleep), a device pin must survive
-/// rather than be cleared as if it were a deleted simulator.
-fn is_device_destination(spec: &str) -> bool {
-    spec.split(',')
-        .filter_map(|part| part.trim().strip_prefix("platform="))
-        .any(|platform| {
-            let p = platform.trim().to_ascii_lowercase();
-            !p.contains("simulator") && p != "macos" && p != "my mac"
-        })
+/// rather than be cleared as if it were a deleted simulator. Also picks the
+/// destination errors that end on a `device info` tip
+/// ([`xcodebuild::device_tip`](crate::cli::xcodebuild::device_tip)).
+pub(crate) fn is_device_destination(spec: &str) -> bool {
+    DestinationSpec::parse(spec).is_device()
 }
 
 pub(crate) fn refresh_stale_destination(
@@ -1330,10 +1293,7 @@ pub(crate) fn refresh_stale_destination(
     configuration: &str,
     track: bool,
 ) -> Result<Option<String>, CliError> {
-    let Some(udid) = spec
-        .split(',')
-        .find_map(|part| part.trim().strip_prefix("id="))
-    else {
+    let Some(udid) = DestinationSpec::parse(spec).id else {
         return Ok(None);
     };
     let state_sourced = ctx.state.projects.get(key).is_some_and(|p| {
@@ -1382,7 +1342,7 @@ pub(crate) fn refresh_stale_destination(
     // The fresh pick is picker-sourced: `remember` should persist it — and
     // platform-filtered like any other pick.
     resolved.destination = None;
-    let platforms = SupportedPlatforms::resolve(resolved, scheme, configuration);
+    let platforms = SupportedPlatforms::resolve(resolved.container.path(), scheme, configuration);
     Ok(Some(pick_destination(
         ctx,
         key,
@@ -1399,12 +1359,12 @@ pub(crate) fn refresh_stale_destination(
 /// both were *typed*, and the CLI refuses to guess which one wins.
 ///
 /// # Errors
-/// Returns a `TargetResolution` error when both are set.
+/// Returns a `Usage` error when both are set.
 pub fn reject_on_destination_conflict(ctx: &Context) -> Result<(), CliError> {
     if ctx.targeting.on.is_some() && ctx.targeting.destination.is_some() {
         return Err(
             CliError::new("--on and --destination are mutually exclusive; pass one")
-                .kind(ErrorKind::TargetResolution),
+                .kind(ErrorKind::Usage),
         );
     }
     Ok(())
@@ -1507,165 +1467,15 @@ pub fn remember_testing(
     }
 }
 
-/// The platform tokens a scheme's targets can build for — the union of their
-/// *authored* `SUPPORTED_PLATFORMS`, falling back to the authored `SDKROOT`
-/// (a device SDK implies its simulator sibling), read straight from the
-/// pbxproj layers in-process. Drives the destination picker's filtering, so a
-/// macOS-only app isn't offered a wall of iPhone simulators. Guessing wrong
-/// can only ever *widen* the list: resolution failure means no filter, and an
-/// explicit `--destination` / `context set destination` bypasses the picker
-/// entirely.
-pub struct SupportedPlatforms(std::collections::BTreeSet<String>);
+/// The platforms a scheme builds for, the destination picker's filter.
+pub use sweetpad_core::supported_platforms::SupportedPlatforms;
 
-/// The target names `scheme` builds, or `None` when there is no scheme file to
-/// read — an autocreated scheme Xcode never materialized, or a name that
-/// doesn't resolve. `None` means "don't filter", so a missing file falls back
-/// to every target in the container rather than to an empty set.
-///
-/// Entries count regardless of which action they build for. A per-action set
-/// (Run vs Test vs Archive) could only ever narrow this further, and a
-/// narrower set makes a scheme look *more* platform-specific than it is —
-/// the wrong direction to guess in, since over-narrowing would send a build
-/// to a platform the scheme can't produce.
-fn scheme_build_targets(
-    container: &Container,
-    scheme: &str,
-) -> Option<std::collections::BTreeSet<String>> {
-    // A workspace scheme lives either in the workspace itself or in one of its
-    // member projects, so both are candidates.
-    let mut candidates = vec![container.path().to_path_buf()];
-    if let Container::Workspace(p) = container
-        && let Ok(ws) = sweetpad_lib::workspace::open(p)
-    {
-        candidates.extend(ws.project_refs);
-    }
-    let file = candidates
-        .iter()
-        .find_map(|c| sweetpad_lib::scheme::find_scheme_file(c, scheme))?;
-    let parsed = sweetpad_lib::scheme::parse_file(&file).ok()?;
-    let names: std::collections::BTreeSet<String> = parsed
-        .build_entries
-        .iter()
-        .map(|e| e.buildable.blueprint_name.clone())
-        .collect();
-    (!names.is_empty()).then_some(names)
-}
-
-impl SupportedPlatforms {
-    /// Resolve the platform tokens `scheme` builds for under `configuration`;
-    /// `None` (no filtering) for Swift packages, unreadable projects, or when
-    /// no target authors either setting. Reads the raw setting layers rather
-    /// than the full settings resolver — with no destination settled yet the
-    /// resolver would bind an arbitrary default platform, overriding the very
-    /// value being discovered.
-    ///
-    /// Only the scheme's own targets count. Every target in the container
-    /// would union an iOS sibling's tokens into a mac-only scheme, and the
-    /// mac-only answer is the one that decides whether a build goes to the
-    /// Mac or to a device platform.
-    #[must_use]
-    pub fn resolve(resolved: &Resolved, scheme: &str, configuration: &str) -> Option<Self> {
-        let projects: Vec<PathBuf> = match &resolved.container {
-            Container::Project(p) => vec![p.clone()],
-            Container::Workspace(p) => sweetpad_lib::workspace::open(p).ok()?.project_refs,
-            Container::SwiftPackage(_) => return None,
-        };
-        let scheme_targets = scheme_build_targets(&resolved.container, scheme);
-        let mut tokens = std::collections::BTreeSet::new();
-        for proj in &projects {
-            let Ok(project) = sweetpad_lib::project::open(proj) else {
-                continue;
-            };
-            for target in &project.targets {
-                if scheme_targets
-                    .as_ref()
-                    .is_some_and(|names| !names.contains(&target.name))
-                {
-                    continue;
-                }
-                let Ok(layers) =
-                    sweetpad_lib::project::build_settings_layers(proj, &target.name, configuration)
-                else {
-                    continue;
-                };
-                let supported = sweetpad_lib::project::last_unconditional_setting(
-                    &layers,
-                    "SUPPORTED_PLATFORMS",
-                );
-                match supported {
-                    Some(platforms) => tokens.extend(
-                        platforms
-                            .split_whitespace()
-                            .filter(|t| !t.contains('$'))
-                            .map(str::to_string),
-                    ),
-                    None => {
-                        if let Some(sdk) = sweetpad_lib::project::natural_sdkroot(&layers) {
-                            tokens.extend(sdk_platform_tokens(&sdk));
-                        }
-                    }
-                }
-            }
-        }
-        (!tokens.is_empty()).then_some(Self(tokens))
-    }
-
-    #[cfg(test)]
-    fn from_tokens(tokens: &[&str]) -> Self {
-        Self(tokens.iter().map(ToString::to_string).collect())
-    }
-
-    fn allows_mac(&self) -> bool {
-        self.0.contains("macosx")
-    }
-
-    /// Whether a simulator of this OS family (`simctl`'s `iOS` / `watchOS` /
-    /// `tvOS` / `xrOS`) can run the scheme. Unknown families stay visible —
-    /// filtering must never hide something it doesn't understand.
-    fn allows_simulator(&self, os: &str) -> bool {
-        let token = match os {
-            "iOS" => "iphonesimulator",
-            "watchOS" => "watchsimulator",
-            "tvOS" => "appletvsimulator",
-            "xrOS" | "visionOS" => "xrsimulator",
-            _ => return true,
-        };
-        self.0.contains(token)
-    }
-
-    /// Whether the Mac is the only destination the scheme supports — the case
-    /// that can skip the `simctl list` spawn entirely.
-    fn mac_only(&self) -> bool {
-        self.allows_mac() && !self.0.iter().any(|t| t.ends_with("simulator"))
-    }
-
-    /// Whether the target builds only for macOS — the signal `archive` uses to
-    /// pick a generic macOS destination instead of defaulting to iOS.
-    #[must_use]
-    pub fn is_mac_only(&self) -> bool {
-        self.mac_only()
-    }
-}
-
-/// The platform tokens an `SDKROOT` value implies (a device SDK brings its
-/// simulator sibling, mirroring Xcode's default `SUPPORTED_PLATFORMS`).
-/// Accepts the short name (`macosx`), a versioned one (`iphoneos17.5`), or a
-/// full SDK path (`…/MacOSX15.2.sdk`).
-fn sdk_platform_tokens(sdk: &str) -> Vec<String> {
-    let name = std::path::Path::new(sdk)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(sdk)
-        .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
-        .to_ascii_lowercase();
-    match name.as_str() {
-        "macosx" => vec!["macosx".to_string()],
-        "iphoneos" => vec!["iphoneos".to_string(), "iphonesimulator".to_string()],
-        "watchos" => vec!["watchos".to_string(), "watchsimulator".to_string()],
-        "appletvos" => vec!["appletvos".to_string(), "appletvsimulator".to_string()],
-        "xros" => vec!["xros".to_string(), "xrsimulator".to_string()],
-        _ => Vec::new(),
-    }
+/// The parsed file behind `scheme`, or `None` when there is none to read: an
+/// autocreated scheme Xcode never materialized, or a name that doesn't
+/// resolve.
+#[must_use]
+pub fn parse_scheme(container: &Container, scheme: &str) -> Option<sweetpad_lib::scheme::Scheme> {
+    sweetpad_core::app_locator::find_scheme(container.path(), scheme)
 }
 
 /// The platform-aware picker entry used by the build/run paths: resolve the
@@ -1680,11 +1490,14 @@ pub fn pick_destination_for(
     track: bool,
 ) -> Result<String, CliError> {
     let key = resolved.container.key();
-    let platforms = SupportedPlatforms::resolve(resolved, scheme, configuration);
-    if platforms.as_ref().is_some_and(SupportedPlatforms::mac_only) {
+    let platforms = SupportedPlatforms::resolve(resolved.container.path(), scheme, configuration);
+    if platforms
+        .as_ref()
+        .is_some_and(SupportedPlatforms::is_mac_only)
+    {
         ctx.out.note(
             "targeting My Mac (macOS) — the only destination this scheme supports \
-             (`context set destination` overrides)",
+             ('context set destination' overrides)",
         );
         return Ok("platform=macOS".to_string());
     }
@@ -1735,7 +1548,7 @@ pub fn pick_destination(
     if labels.len() == 1 {
         ctx.out.note(&format!(
             "targeting {} — the only destination this scheme supports \
-             (`context set destination` overrides)",
+             ('context set destination' overrides)",
             labels[0].trim()
         ));
     }
@@ -1857,26 +1670,6 @@ fn prompt_choice(what: &str, candidates: &[String], color: bool) -> Result<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::SupportedPlatforms;
-
-    fn platforms(tokens: &[&str]) -> SupportedPlatforms {
-        SupportedPlatforms(tokens.iter().map(|t| (*t).to_string()).collect())
-    }
-
-    #[test]
-    fn mac_only_targets_are_recognised_for_archive() {
-        // `archive` picks a generic macOS destination from this; getting it
-        // wrong sends a mac-only project to `generic/platform=iOS`, which
-        // fails inside xcodebuild.
-        assert!(platforms(&["macosx"]).is_mac_only());
-        // Catalyst/multiplatform targets also build for a simulator, so the
-        // iOS default stays correct for them.
-        assert!(!platforms(&["macosx", "iphonesimulator"]).is_mac_only());
-        assert!(!platforms(&["iphoneos", "iphonesimulator"]).is_mac_only());
-        // No tokens resolved: no opinion, keep the existing default.
-        assert!(!platforms(&[]).is_mac_only());
-    }
-
     use super::is_device_destination;
 
     #[test]
@@ -1894,19 +1687,13 @@ mod tests {
     }
 
     use super::*;
+    use crate::cli::testdir::TempDir;
     use crate::cli::{
         Context, GlobalArgs, Targeting, config::Config, output::Output, state::State,
     };
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("sweetpad-test-{tag}-{n}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> TempDir {
+        TempDir::new(&format!("sweetpad-test-{tag}"))
     }
 
     fn ctx() -> Context {
@@ -1944,6 +1731,7 @@ mod tests {
             available: true,
             os: "iOS".into(),
             os_version: "17.0".into(),
+            ..Default::default()
         };
         let mut state = State::default();
         track_destination(&mut state, "/p", &sim("A"));
@@ -1972,8 +1760,41 @@ mod tests {
         std::fs::create_dir(dir.join("App.xcworkspace")).unwrap();
         // Workspace beats project.
         assert!(matches!(discover(&dir), Some(Container::Workspace(_))));
+    }
 
-        std::fs::remove_dir_all(&dir).unwrap();
+    /// The container's scheme file is the one read, and a scheme without a
+    /// file reads as none.
+    #[test]
+    fn parse_scheme_reads_the_containers_scheme_file() {
+        let dir = temp_dir("launch-args");
+        let project = dir.join("App.xcodeproj");
+        let schemes = project.join("xcshareddata/xcschemes");
+        std::fs::create_dir_all(&schemes).unwrap();
+        std::fs::write(
+            schemes.join("App.xcscheme"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion="1600" version="1.7">
+   <BuildAction/>
+   <LaunchAction buildConfiguration="Debug">
+      <CommandLineArguments>
+         <CommandLineArgument argument="-ApplePersistenceIgnoreState NO" isEnabled="YES"/>
+         <CommandLineArgument argument="-Disabled YES" isEnabled="NO"/>
+         <CommandLineArgument argument="-Plain"/>
+      </CommandLineArguments>
+   </LaunchAction>
+</Scheme>
+"#,
+        )
+        .unwrap();
+        let container = Container::Project(project);
+        let launch = parse_scheme(&container, "App")
+            .unwrap()
+            .launch_settings(&std::collections::BTreeMap::new(), || None);
+        assert_eq!(
+            launch.args,
+            ["-ApplePersistenceIgnoreState", "NO", "-Plain"]
+        );
+        assert!(parse_scheme(&container, "Missing").is_none());
     }
 
     #[test]
@@ -1981,14 +1802,12 @@ mod tests {
         let dir = temp_dir("pkg");
         std::fs::write(dir.join("Package.swift"), "// pkg").unwrap();
         assert!(matches!(discover(&dir), Some(Container::SwiftPackage(_))));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn discover_none_in_empty_dir() {
         let dir = temp_dir("empty");
         assert!(discover(&dir).is_none());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The single container a scan settled on, or `None` when it found nothing
@@ -2010,8 +1829,6 @@ mod tests {
             scanned(&root).map(|c| c.path().to_path_buf()),
             Some(root.join("Sources/App.xcodeproj"))
         );
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2027,8 +1844,6 @@ mod tests {
             scanned(&root).map(|c| c.path().to_path_buf()),
             Some(root.join("ios/App.xcodeproj"))
         );
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2040,8 +1855,6 @@ mod tests {
         // The CocoaPods/React Native layout: one directory, both kinds, and no
         // ambiguity to report — the workspace wins as it does anywhere else.
         assert!(matches!(scanned(&root), Some(Container::Workspace(_))));
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2052,8 +1865,6 @@ mod tests {
 
         assert_eq!(scan_down(&root).len(), 2);
         assert!(scanned(&root).is_none());
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2076,8 +1887,6 @@ mod tests {
             scanned(&root).map(|c| c.path().to_path_buf()),
             Some(root.join("Sources/App.xcodeproj"))
         );
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2092,8 +1901,6 @@ mod tests {
             scanned(&root).map(|c| c.path().to_path_buf()),
             Some(root.join("x/y/Reachable.xcodeproj"))
         );
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2114,13 +1921,11 @@ mod tests {
             Some(root.join("Sources/App.xcodeproj"))
         );
         // The base rides back so the caller can say where it looked.
-        assert_eq!(base, root);
+        assert_eq!(base, *root);
 
         // Without a repository root there is nothing to widen to — scanning
         // down from the filesystem root is never the answer.
         assert!(scan_below(&from, None).0.is_empty());
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2131,7 +1936,7 @@ mod tests {
 
         let (found, repo_root) = discover_walk_up(&root.join("Scripts"));
         assert!(found.best().is_none());
-        assert_eq!(repo_root.as_deref(), Some(root.as_path()));
+        assert_eq!(repo_root.as_deref(), Some(&*root));
 
         // A container found on the way up ends the walk before the repository
         // root is known, and none is reported.
@@ -2139,8 +1944,6 @@ mod tests {
         let (found, repo_root) = discover_walk_up(&root.join("Scripts"));
         assert!(found.best().is_some());
         assert!(repo_root.is_none());
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2150,7 +1953,6 @@ mod tests {
         std::fs::create_dir(&proj).unwrap();
         let key = Container::Project(proj.clone()).key();
         assert_eq!(key, std::fs::canonicalize(&proj).unwrap().to_string_lossy());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2175,6 +1977,41 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_scheme_names_the_last_builds_or_the_candidates() {
+        let schemes: Vec<String> = ["SweetpadCIApp", "SweetpadCIMac"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            missing_scheme(Some("SweetpadCIApp"), &schemes).message,
+            "no scheme specified and the terminal is not interactive; the last build used \
+             '--scheme SweetpadCIApp': pass it again, or run 'sweetpad context set scheme \
+             SweetpadCIApp' to remember it"
+        );
+        // A last build of a scheme this project no longer has names nothing.
+        for last in [None, Some("Gone")] {
+            assert_eq!(
+                missing_scheme(last, &schemes).message,
+                "no scheme specified and the terminal is not interactive; pass --scheme with \
+                 one of SweetpadCIApp, SweetpadCIMac, or run 'sweetpad context set scheme \
+                 <name>' to remember one"
+            );
+        }
+        let many: Vec<String> = ["A", "B", "C", "D", "My App", "F", "G"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let err = missing_scheme(None, &many);
+        assert!(
+            err.message
+                .contains("one of A, B, C, D, \"My App\" and 2 more,"),
+            "{}",
+            err.message
+        );
+        assert!(matches!(err.kind, ErrorKind::TargetResolution));
+    }
+
+    #[test]
     fn choose_is_strict_when_ambiguous_and_non_interactive() {
         // Tests don't run under a TTY, so multiple candidates must error.
         let c = ctx();
@@ -2189,7 +2026,28 @@ mod tests {
             available: true,
             os: "iOS".into(),
             os_version: "17.0".into(),
+            ..Default::default()
         }
+    }
+
+    /// simctl names visionOS's runtime `xrOS`, so the platform word has to
+    /// reach it through the platform table, in either spelling.
+    #[test]
+    fn on_visionos_finds_the_xros_simulator() {
+        let c = ctx();
+        let mut vision = sim("VVVV", "Apple Vision Pro", false);
+        vision.os = "xrOS".into();
+        let sims = vec![sim("AAAA", "iPhone 17", true), vision];
+        for word in ["visionos", "xros", "visionOS"] {
+            let target = resolve_on(&c, "k", word, &sims).unwrap();
+            assert!(
+                matches!(&target, OnTarget::Simulator { udid, .. } if udid == "VVVV"),
+                "{word}"
+            );
+            assert_eq!(target.specifier(), "platform=visionOS Simulator,id=VVVV");
+        }
+        let target = resolve_on(&c, "k", "ios", &sims).unwrap();
+        assert_eq!(target.specifier(), "platform=iOS Simulator,id=AAAA");
     }
 
     #[test]
@@ -2361,97 +2219,5 @@ mod tests {
             ordered.iter().map(|s| s.udid.as_str()).collect::<Vec<_>>(),
             vec!["C", "B", "A"]
         );
-    }
-
-    #[test]
-    fn supported_platforms_map_simulator_families_and_mac() {
-        let mac_only = SupportedPlatforms::from_tokens(&["macosx"]);
-        assert!(mac_only.allows_mac());
-        assert!(!mac_only.allows_simulator("iOS"));
-        assert!(mac_only.mac_only());
-
-        let ios = SupportedPlatforms::from_tokens(&["iphoneos", "iphonesimulator"]);
-        assert!(!ios.allows_mac());
-        assert!(ios.allows_simulator("iOS"));
-        assert!(!ios.allows_simulator("watchOS"));
-        assert!(!ios.mac_only());
-
-        let multi = SupportedPlatforms::from_tokens(&["macosx", "iphonesimulator", "iphoneos"]);
-        assert!(multi.allows_mac());
-        assert!(multi.allows_simulator("iOS"));
-        assert!(!multi.mac_only());
-
-        // An OS family the filter doesn't understand stays visible.
-        assert!(mac_only.allows_simulator("futureOS"));
-    }
-
-    #[test]
-    fn sdk_platform_tokens_bring_the_simulator_sibling() {
-        assert_eq!(sdk_platform_tokens("macosx"), vec!["macosx"]);
-        assert_eq!(
-            sdk_platform_tokens("iphoneos17.5"),
-            vec!["iphoneos", "iphonesimulator"]
-        );
-        assert_eq!(sdk_platform_tokens("xros"), vec!["xros", "xrsimulator"]);
-        assert!(sdk_platform_tokens("somethingelse").is_empty());
-    }
-
-    /// Write `<name>.xcscheme` with one `BuildActionEntry` per target.
-    fn write_scheme(container: &std::path::Path, name: &str, targets: &[&str]) {
-        use std::fmt::Write as _;
-        let dir = container.join("xcshareddata/xcschemes");
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut entries = String::new();
-        for t in targets {
-            let _ = write!(
-                entries,
-                r#"<BuildActionEntry buildForRunning="YES" buildForTesting="YES" buildForProfiling="YES" buildForArchiving="YES" buildForAnalyzing="YES">
-<BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="ID{t}" BuildableName="{t}.app" BlueprintName="{t}" ReferencedContainer="container:App.xcodeproj"/>
-</BuildActionEntry>"#
-            );
-        }
-        std::fs::write(
-            dir.join(format!("{name}.xcscheme")),
-            format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<Scheme LastUpgradeVersion="1600" version="1.7">
-<BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">
-<BuildActionEntries>{entries}</BuildActionEntries>
-</BuildAction>
-</Scheme>"#
-            ),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn scheme_build_targets_reads_only_that_scheme() {
-        let dir = temp_dir("scheme-targets");
-        let proj = dir.join("App.xcodeproj");
-        std::fs::create_dir_all(&proj).unwrap();
-        write_scheme(&proj, "MacApp", &["MacApp"]);
-        write_scheme(&proj, "iOSApp", &["iOSApp", "iOSAppTests"]);
-        let container = Container::Project(proj);
-
-        // Each scheme sees its own targets, not the container's union — the
-        // whole point, since the union is what sent a mac-only scheme to
-        // `generic/platform=iOS`.
-        let mac = scheme_build_targets(&container, "MacApp").unwrap();
-        assert_eq!(
-            mac.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["MacApp"]
-        );
-        let ios = scheme_build_targets(&container, "iOSApp").unwrap();
-        assert_eq!(
-            ios.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["iOSApp", "iOSAppTests"]
-        );
-
-        // A scheme with no file on disk (autocreated, or simply absent) must
-        // read as "don't filter" rather than as an empty target set, which
-        // would resolve no platforms at all.
-        assert!(scheme_build_targets(&container, "Ghost").is_none());
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

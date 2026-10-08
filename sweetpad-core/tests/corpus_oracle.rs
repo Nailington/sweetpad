@@ -89,9 +89,12 @@ fn run_oracle(
             .and_then(|stem| stem.split_once("__").map(|(_, rest)| rest))
             .and_then(parse_destination_suffix);
 
-        let ctx = BuildContext::open(&xcodeproj)
+        let mut ctx = BuildContext::open(&xcodeproj)
             .ok()?
             .with_xcspec(catalog.clone());
+        if let Some(workspace) = common::capture_workspace_for_oracle(oracle_path) {
+            ctx = ctx.with_derived_data_container(workspace);
+        }
         let mut query = ResolveQuery::new(target, config, sdk, arch);
         if let Some(d) = destination {
             query = query.with_destination(d);
@@ -295,6 +298,7 @@ fn full_corpus_oracle_coverage() {
 /// correctness by structural + the systematic-mismatch tally, not exact%.
 fn version_floor(version: &str) -> Option<(u64, u64, u64)> {
     match version {
+        "27.0.0" => Some(CORPUS_FLOOR_2700),
         "26.5.0" => Some(CORPUS_FLOOR_2650),
         "16.4.0" => Some(CORPUS_FLOOR_1640),
         "15.4.0" => Some(CORPUS_FLOOR_1540),
@@ -302,6 +306,9 @@ fn version_floor(version: &str) -> Option<(u64, u64, u64)> {
     }
 }
 
+// 27.0 sits ~3pt under 26.5 on exact/canon: five behaviour deltas new in
+// that major (§6.2) are not modelled yet. Ratchet once they land.
+const CORPUS_FLOOR_2700: (u64, u64, u64) = (84, 95, 98);
 const CORPUS_FLOOR_2650: (u64, u64, u64) = (88, 97, 99);
 const CORPUS_FLOOR_1640: (u64, u64, u64) = (88, 100, 100);
 // 15.4 structural sits ~97% (vs 99% on 16+) because that Xcode reports host/arch

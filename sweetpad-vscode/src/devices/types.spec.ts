@@ -30,13 +30,8 @@ describe("iOSDeviceDestination", () => {
   });
 
   describe("udid property", () => {
-    it("returns hardwareProperties.udid when present", () => {
-      const device = createMockDevice({
-        hardwareProperties: {
-          ...createMockDevice().hardwareProperties,
-          udid: "00008110-001234567890001E",
-        },
-      });
+    it("returns the hardware udid when present", () => {
+      const device = createMockDevice({ udid: "00008110-001234567890001E" });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.udid).toBe("00008110-001234567890001E");
@@ -50,13 +45,7 @@ describe("iOSDeviceDestination", () => {
     });
 
     it("falls back to identifier when udid is undefined", () => {
-      const device = createMockDevice({
-        hardwareProperties: {
-          ...createMockDevice().hardwareProperties,
-          udid: undefined,
-        },
-        identifier: "fallback-identifier",
-      });
+      const device = createMockDevice({ udid: undefined, identifier: "fallback-identifier" });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.udid).toBe("fallback-identifier");
@@ -75,28 +64,15 @@ describe("iOSDeviceDestination", () => {
   });
 
   describe("name property", () => {
-    it("returns deviceProperties.name when present", () => {
-      const device = createMockDevice({
-        deviceProperties: {
-          name: "My iPhone",
-          osVersionNumber: "17.0",
-        },
-      });
+    it("returns devicectl's name when present", () => {
+      const device = createMockDevice({ name: "My iPhone", osVersion: "17.0" });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.name).toBe("My iPhone");
     });
 
     it("falls back to marketingName when name is missing", () => {
-      const device = createMockDevice({
-        deviceProperties: {
-          osVersionNumber: "17.0",
-        },
-        hardwareProperties: {
-          ...createMockDevice().hardwareProperties,
-          marketingName: "iPhone 14 Pro",
-        },
-      });
+      const device = createMockDevice({ name: undefined, osVersion: "17.0", marketingName: "iPhone 14 Pro" });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.name).toBe("iPhone 14 Pro");
@@ -104,14 +80,10 @@ describe("iOSDeviceDestination", () => {
 
     it("falls back to productType when name and marketingName are missing", () => {
       const device = createMockDevice({
-        deviceProperties: {
-          osVersionNumber: "17.0",
-        },
-        hardwareProperties: {
-          ...createMockDevice().hardwareProperties,
-          marketingName: undefined,
-          productType: "iPhone15,2",
-        },
+        name: undefined,
+        osVersion: "17.0",
+        marketingName: undefined,
+        productType: "iPhone15,2",
       });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
@@ -120,14 +92,10 @@ describe("iOSDeviceDestination", () => {
 
     it("returns 'Unknown Device' when all name sources are missing", () => {
       const device = createMockDevice({
-        deviceProperties: {
-          osVersionNumber: "17.0",
-        },
-        hardwareProperties: {
-          ...createMockDevice().hardwareProperties,
-          marketingName: undefined,
-          productType: undefined,
-        },
+        name: undefined,
+        osVersion: "17.0",
+        marketingName: undefined,
+        productType: undefined,
       });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
@@ -151,11 +119,7 @@ describe("iOSDeviceDestination", () => {
     });
 
     it("returns 'Unknown' when osVersionNumber is undefined", () => {
-      const device = createMockDevice({
-        deviceProperties: {
-          osVersionNumber: undefined,
-        },
-      });
+      const device = createMockDevice({ name: undefined, osVersion: undefined });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.osVersion).toBe("Unknown");
@@ -180,23 +144,14 @@ describe("iOSDeviceDestination", () => {
 
   describe("label property", () => {
     it("includes OS version when known", () => {
-      const device = createMockDevice({
-        deviceProperties: {
-          name: "iPhone 14 Pro",
-          osVersionNumber: "17.0",
-        },
-      });
+      const device = createMockDevice({ name: "iPhone 14 Pro", osVersion: "17.0" });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.label).toBe("iPhone 14 Pro (17.0)");
     });
 
     it("excludes OS version when unknown", () => {
-      const device = createMockDevice({
-        deviceProperties: {
-          name: "iPhone 14 Pro",
-        },
-      });
+      const device = createMockDevice({ name: "iPhone 14 Pro", osVersion: undefined });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.label).toBe("iPhone 14 Pro");
@@ -257,19 +212,14 @@ describe("iOSDeviceDestination", () => {
 
     it("returns disconnected iPhone icon when deviceType is iPhone and disconnected", () => {
       const device = createMockDeviceOfType("iPhone");
-      device.connectionProperties.tunnelState = "disconnected";
+      device.connection = "disconnected";
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.icon).toBe("sweetpad-device-mobile-x");
     });
 
     it("returns default icon for other device types", () => {
-      const device = createMockDevice({
-        hardwareProperties: {
-          ...createMockDevice().hardwareProperties,
-          deviceType: "iPhone",
-        },
-      });
+      const device = createMockDevice({ deviceType: "iPhone" });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.icon).toBe("sweetpad-device-mobile");
@@ -286,7 +236,7 @@ describe("iOSDeviceDestination", () => {
 
     it("returns false when tunnelState is disconnected", () => {
       const device = createMockDevice();
-      device.connectionProperties.tunnelState = "disconnected";
+      device.connection = "disconnected";
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.isConnected).toBe(false);
@@ -294,7 +244,7 @@ describe("iOSDeviceDestination", () => {
 
     it("returns false when tunnelState is unavailable", () => {
       const device = createMockDevice();
-      device.connectionProperties.tunnelState = "unavailable";
+      device.connection = "unavailable";
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.isConnected).toBe(false);
@@ -306,7 +256,7 @@ describe("iOSDeviceDestination", () => {
       // devicectl says connected, xcdevice says unavailable (e.g. stale error from
       // a previous lock). devicectl is authoritative for iOS 17+ so we trust it.
       const device = createMockDevice();
-      device.connectionProperties.tunnelState = "connected";
+      device.connection = "connected";
       const xc = {
         identifier: "00008110-001234567890001E",
         modelCode: "iPhone16,1",
@@ -325,7 +275,7 @@ describe("iOSDeviceDestination", () => {
 
     it("reports unavailable when devicectl tunnelState is unavailable even if xcdevice says available", () => {
       const device = createMockDevice();
-      device.connectionProperties.tunnelState = "unavailable";
+      device.connection = "unavailable";
       const xc = {
         identifier: "00008110-001234567890001E",
         modelCode: "iPhone16,1",
@@ -352,12 +302,7 @@ describe("iOSDeviceDestination", () => {
 
   describe("quickPickDetails property", () => {
     it("returns detailed info string", () => {
-      const device = createMockDevice({
-        deviceProperties: {
-          name: "iPhone 14 Pro",
-          osVersionNumber: "17.0",
-        },
-      });
+      const device = createMockDevice({ name: "iPhone 14 Pro", osVersion: "17.0" });
       const destination = new iOSDeviceDestination({ devicectl: device });
 
       expect(destination.quickPickDetails).toBe("Type: iOS Device, Version: 17.0, ID: 00008110-001234567890001e");
@@ -378,7 +323,7 @@ describe("watchOSDeviceDestination", () => {
   describe("supportsDevicectl property", () => {
     it("returns true for watchOS 10.0", () => {
       const device = createMockDeviceOfType("appleWatch");
-      device.deviceProperties.osVersionNumber = "10.0";
+      device.osVersion = "10.0";
       const destination = new watchOSDeviceDestination({ devicectl: device });
 
       expect(destination.supportsDevicectl).toBe(true);
@@ -386,7 +331,7 @@ describe("watchOSDeviceDestination", () => {
 
     it("returns false for watchOS 9.5", () => {
       const device = createMockDeviceOfType("appleWatch");
-      device.deviceProperties.osVersionNumber = "9.5";
+      device.osVersion = "9.5";
       const destination = new watchOSDeviceDestination({ devicectl: device });
 
       expect(destination.supportsDevicectl).toBe(false);
@@ -403,7 +348,7 @@ describe("watchOSDeviceDestination", () => {
 
     it("returns disconnected icon when disconnected", () => {
       const device = createMockDeviceOfType("appleWatch");
-      device.connectionProperties.tunnelState = "disconnected";
+      device.connection = "disconnected";
       const destination = new watchOSDeviceDestination({ devicectl: device });
 
       expect(destination.icon).toBe("sweetpad-device-watch-pause");
@@ -424,7 +369,7 @@ describe("tvOSDeviceDestination", () => {
   describe("supportsDevicectl property", () => {
     it("returns true for tvOS 17.0", () => {
       const device = createMockDeviceOfType("appleTV");
-      device.deviceProperties.osVersionNumber = "17.0";
+      device.osVersion = "17.0";
       const destination = new tvOSDeviceDestination({ devicectl: device });
 
       expect(destination.supportsDevicectl).toBe(true);
@@ -432,7 +377,7 @@ describe("tvOSDeviceDestination", () => {
 
     it("returns false for tvOS 16.5", () => {
       const device = createMockDeviceOfType("appleTV");
-      device.deviceProperties.osVersionNumber = "16.5";
+      device.osVersion = "16.5";
       const destination = new tvOSDeviceDestination({ devicectl: device });
 
       expect(destination.supportsDevicectl).toBe(false);
@@ -462,7 +407,7 @@ describe("visionOSDeviceDestination", () => {
   describe("supportsDevicectl property", () => {
     it("returns true for visionOS 1.0", () => {
       const device = createMockDeviceOfType("appleVision");
-      device.deviceProperties.osVersionNumber = "1.0";
+      device.osVersion = "1.0";
       const destination = new visionOSDeviceDestination({ devicectl: device });
 
       expect(destination.supportsDevicectl).toBe(true);
@@ -470,7 +415,7 @@ describe("visionOSDeviceDestination", () => {
 
     it("returns true for visionOS 2.0", () => {
       const device = createMockDeviceOfType("appleVision");
-      device.deviceProperties.osVersionNumber = "2.0";
+      device.osVersion = "2.0";
       const destination = new visionOSDeviceDestination({ devicectl: device });
 
       expect(destination.supportsDevicectl).toBe(true);
@@ -478,7 +423,7 @@ describe("visionOSDeviceDestination", () => {
 
     it("returns false when OS version is unknown", () => {
       const device = createMockDeviceOfType("appleVision");
-      device.deviceProperties.osVersionNumber = undefined;
+      device.osVersion = undefined;
       const destination = new visionOSDeviceDestination({ devicectl: device });
 
       expect(destination.supportsDevicectl).toBe(false);
@@ -519,8 +464,8 @@ describe("Common device destination behavior", () => {
       const iOSDest = new iOSDeviceDestination({ devicectl: device });
       expect(iOSDest.name).toBe("iPhone15,2");
 
-      device.hardwareProperties.marketingName = undefined;
-      device.hardwareProperties.productType = undefined;
+      device.marketingName = undefined;
+      device.productType = undefined;
       const iOSDest2 = new iOSDeviceDestination({ devicectl: device });
       expect(iOSDest2.name).toBe("Unknown Device");
     });
@@ -544,11 +489,7 @@ describe("Common device destination behavior", () => {
 
   describe("label behavior with unknown OS", () => {
     it("all device types exclude OS version from label when unknown", () => {
-      const device = createMockDevice({
-        deviceProperties: {
-          name: "Test Device",
-        },
-      });
+      const device = createMockDevice({ name: "Test Device", osVersion: undefined });
 
       const iOSDest = new iOSDeviceDestination({ devicectl: device });
       const watchOSDest = new watchOSDeviceDestination({ devicectl: device });
@@ -560,5 +501,34 @@ describe("Common device destination behavior", () => {
       expect(tvOSDest.label).toBe("Test Device");
       expect(visionOSDest.label).toBe("Test Device");
     });
+  });
+});
+
+describe("devices the addon read from devicectl", () => {
+  it("drives every unified getter from the parsed record", () => {
+    const destination = new iOSDeviceDestination({ devicectl: createMockDevice() });
+
+    expect(destination.udid).toBe("00008110-001234567890001E");
+    expect(destination.name).toBe("iPhone 14 Pro");
+    expect(destination.osVersion).toBe("17.0");
+    expect(destination.deviceType).toBe("iPhone");
+    expect(destination.state).toBe("connected");
+    expect(destination.isConnected).toBe(true);
+    expect(destination.supportsDevicectl).toBe(true);
+  });
+
+  it("reports the connection state devicectl gave", () => {
+    const destination = new iOSDeviceDestination({ devicectl: createMockDevice({ connection: "disconnected" }) });
+
+    expect(destination.state).toBe("disconnected");
+    expect(destination.isConnected).toBe(false);
+  });
+
+  it("dates the last connection from the addon's epoch milliseconds", () => {
+    const device = createMockDevice({ lastConnectionMs: Date.parse("2026-09-19T22:21:56.000Z") });
+    const destination = new iOSDeviceDestination({ devicectl: device });
+
+    expect(destination.lastConnectionDate?.toISOString()).toBe("2026-09-19T22:21:56.000Z");
+    expect(new iOSDeviceDestination({ devicectl: createMockDevice() }).lastConnectionDate).toBeNull();
   });
 });

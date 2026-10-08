@@ -8,6 +8,7 @@
 use std::process::{Command, Stdio};
 
 use crate::cli::output::Output;
+use crate::cli::swiftpm;
 use crate::cli::{CommandResult, Context, Render, Rendered};
 
 /// One diagnostic line.
@@ -121,7 +122,7 @@ fn gather() -> Vec<Check> {
             name: "Xcode",
             status: Status::Fail,
             detail: "xcode-select -p failed — no developer directory".into(),
-            hint: Some("install Xcode, then run `xcode-select --switch /Applications/Xcode.app`"),
+            hint: Some("install Xcode, then run 'xcode-select --switch /Applications/Xcode.app'"),
         },
     });
 
@@ -130,15 +131,16 @@ fn gather() -> Vec<Check> {
         "xcodebuild",
         first_line(probe("xcodebuild", &["-version"])),
         Status::Fail,
-        Some("install Xcode and accept its license (`sudo xcodebuild -license`)"),
+        Some("install Xcode and accept its license ('sudo xcodebuild -license')"),
     ));
 
-    // Swift toolchain.
+    // Swift toolchain. Probed with a throwaway TMPDIR, since `swift --version`
+    // leaves a temp directory behind.
     checks.push(tool_check(
         "swift",
-        first_line(probe("swift", &["--version"])),
+        first_line(swiftpm::swift_version().filter(|s| !s.trim().is_empty())),
         Status::Fail,
-        Some("install the Xcode command-line tools (`xcode-select --install`)"),
+        Some("install the Xcode command-line tools ('xcode-select --install')"),
     ));
 
     // Simulator runtimes — needed to run on a simulator.
@@ -193,7 +195,7 @@ fn gather() -> Vec<Check> {
         "swift-format",
         first_line(probe("xcrun", &["--find", "swift-format"])),
         Status::Warn,
-        Some("bundled with recent Xcode; or `brew install swift-format` — needed for `sweetpad format`"),
+        Some("bundled with recent Xcode; or 'brew install swift-format' — needed for 'sweetpad format'"),
     ));
 
     // SwiftLint — optional formatter/linter backend.
@@ -201,7 +203,7 @@ fn gather() -> Vec<Check> {
         "swiftlint",
         first_line(probe("swiftlint", &["version"])),
         Status::Warn,
-        Some("optional: `brew install swiftlint` for `sweetpad format --tool swiftlint`"),
+        Some("optional: 'brew install swiftlint' for 'sweetpad format --tool swiftlint'"),
     ));
 
     checks

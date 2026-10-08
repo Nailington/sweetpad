@@ -13,7 +13,11 @@
 //! * the startup warm-up reaches a target **no scheme builds**, which needs a
 //!   `-target` build with the output roots named explicitly.
 //!
-//! Opt-in: runs `xcodebuild`, so gated on `BSP_ORACLE=1` (+ Xcode 26.5).
+//! Opt-in: runs `xcodebuild`, so gated on `BSP_ORACLE=1`. It builds with the
+//! Xcode `BSP_ORACLE_XCODE` names (the `.app` or its `Developer` directory),
+//! else the selected one: `DEVELOPER_DIR`, then `xcode-select -p`.
+
+mod oracle_xcode;
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -21,7 +25,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const XCODE: &str = "/Applications/Xcode-26.5.0.app";
+use oracle_xcode::OracleXcode;
+use sweetpad_core::scratch::ScratchDir;
 
 /// Long enough for a cold `xcodebuild` on a small fixture, short enough that a
 /// wedged server fails the run rather than hanging it.
@@ -38,17 +43,14 @@ fn fixture(name: &str, proj: &str) -> String {
     )
 }
 
-/// Whether the gated preconditions hold; prints why when they don't.
-fn gated() -> bool {
+/// The Xcode the server builds with, when the gated preconditions hold;
+/// prints why when they don't.
+fn gated() -> Option<OracleXcode> {
     if std::env::var("BSP_ORACLE").is_err() {
         eprintln!("skipping: set BSP_ORACLE=1 to run the BSP prepare oracle");
-        return false;
+        return None;
     }
-    if !Path::new(XCODE).exists() {
-        eprintln!("skipping: {XCODE} not installed");
-        return false;
-    }
-    true
+    oracle_xcode::find()
 }
 
 /// A running BSP server plus everything it has written to stdout so far, so a
@@ -61,10 +63,10 @@ struct Session {
 }
 
 impl Session {
-    fn start(project: &str, dd: &Path, log: &Path) -> Session {
+    fn start(xcode: &OracleXcode, project: &str, dd: &Path, log: &Path) -> Session {
         let mut child = Command::new(env!("CARGO_BIN_EXE_bsp-server"))
             .args(["bsp", "--project", project, "--xcode"])
-            .arg(format!("{XCODE}/Contents/Developer"))
+            .arg(&xcode.path)
             .arg("--derived-data-path")
             .arg(dd)
             .env("SWEETPAD_BSP_LOG", log)
@@ -147,17 +149,15 @@ fn last_compiler_arguments(transcript: &str) -> String {
 
 #[test]
 fn prepare_builds_dependency_module_from_clean_deriveddata() {
-    if !gated() {
+    let Some(xcode) = gated() else {
         return;
-    }
+    };
     let project = fixture("_synthetic-multimodule", "MultiModule.xcodeproj");
-    let dd = std::env::temp_dir().join(format!("sweetpad-bsp-prep-{}", std::process::id()));
-    let log = std::env::temp_dir().join(format!("sweetpad-bsp-prep-log-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dd);
-    let _ = std::fs::remove_file(&log);
+    let scratch = ScratchDir::new("sweetpad-bsp-prep").unwrap();
+    let (dd, log) = (scratch.join("dd"), scratch.join("bsp.log"));
     let dep_module = dd.join("Build/Products/Debug/ModuleA.swiftmodule");
 
-    let mut session = Session::start(&project, &dd, &log);
+    let mut session = Session::start(&xcode, &project, &dd, &log);
     session.send(r#"{"jsonrpc":"2.0","id":1,"method":"build/initialize","params":{}}"#);
     session.send(r#"{"jsonrpc":"2.0","method":"build/initialized"}"#);
     // prepare ModuleB → must build its dependency ModuleA's module.
@@ -169,8 +169,6 @@ fn prepare_builds_dependency_module_from_clean_deriveddata() {
 
     let module_exists = dep_module.exists();
     let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&dd);
-    let _ = std::fs::remove_file(&log);
 
     assert!(replied, "server never answered buildTarget/prepare");
     assert!(
@@ -197,18 +195,16 @@ fn prepare_builds_dependency_module_from_clean_deriveddata() {
 /// would prepare the target before this can observe the cold tree.
 #[test]
 fn prepare_publishes_header_maps_and_notifies() {
-    if !gated() {
+    let Some(xcode) = gated() else {
         return;
-    }
+    };
     let project = fixture("_synthetic-headermaps", "HeaderMaps.xcodeproj");
     let widget = format!(
         "{}/fixtures/_synthetic-headermaps/project/Top/Widget.m",
         env!("SWEETPAD_LIB_DIR")
     );
-    let dd = std::env::temp_dir().join(format!("sweetpad-bsp-hm-{}", std::process::id()));
-    let log = std::env::temp_dir().join(format!("sweetpad-bsp-hm-log-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dd);
-    let _ = std::fs::remove_file(&log);
+    let scratch = ScratchDir::new("sweetpad-bsp-hm").unwrap();
+    let (dd, log) = (scratch.join("dd"), scratch.join("bsp.log"));
 
     let options = |id: u32| {
         format!(
@@ -216,7 +212,7 @@ fn prepare_publishes_header_maps_and_notifies() {
         )
     };
 
-    let mut session = Session::start(&project, &dd, &log);
+    let mut session = Session::start(&xcode, &project, &dd, &log);
     session.send(r#"{"jsonrpc":"2.0","id":1,"method":"build/initialize","params":{}}"#);
     session.send(&options(2));
     assert!(
@@ -237,8 +233,6 @@ fn prepare_publishes_header_maps_and_notifies() {
     let transcript = session.shutdown();
 
     let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&dd);
-    let _ = std::fs::remove_file(&log);
 
     assert!(replied, "server never answered buildTarget/prepare");
     assert!(re_replied, "server never re-answered sourceKitOptions");
@@ -270,20 +264,18 @@ fn prepare_publishes_header_maps_and_notifies() {
 /// nothing here ever sends `buildTarget/prepare`.
 #[test]
 fn startup_warmup_prepares_a_target_no_scheme_builds() {
-    if !gated() {
+    let Some(xcode) = gated() else {
         return;
-    }
+    };
     let project = fixture("_synthetic-headermaps", "HeaderMaps.xcodeproj");
-    let dd = std::env::temp_dir().join(format!("sweetpad-bsp-orphan-{}", std::process::id()));
-    let log = std::env::temp_dir().join(format!("sweetpad-bsp-orphan-log-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dd);
-    let _ = std::fs::remove_file(&log);
+    let scratch = ScratchDir::new("sweetpad-bsp-orphan").unwrap();
+    let (dd, log) = (scratch.join("dd"), scratch.join("bsp.log"));
     let orphan_hmap = dd.join(
         "Build/Intermediates.noindex/HeaderMaps.build/Debug/HeaderMapsOrphan.build/\
          HeaderMapsOrphan-project-headers.hmap",
     );
 
-    let mut session = Session::start(&project, &dd, &log);
+    let mut session = Session::start(&xcode, &project, &dd, &log);
     session.send(r#"{"jsonrpc":"2.0","id":1,"method":"build/initialize","params":{}}"#);
     session.send(r#"{"jsonrpc":"2.0","method":"build/initialized"}"#);
 
@@ -299,8 +291,6 @@ fn startup_warmup_prepares_a_target_no_scheme_builds() {
     session.shutdown();
 
     let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&dd);
-    let _ = std::fs::remove_file(&log);
 
     assert!(
         appeared,
@@ -318,22 +308,19 @@ fn startup_warmup_prepares_a_target_no_scheme_builds() {
 /// serializes a fresh build behind every one of them.
 #[test]
 fn a_repeat_prepare_over_unchanged_inputs_is_skipped() {
-    if !gated() {
+    let Some(xcode) = gated() else {
         return;
-    }
+    };
     let project = fixture("_synthetic-headermaps", "HeaderMaps.xcodeproj");
-    let dd = std::env::temp_dir().join(format!("sweetpad-bsp-coalesce-{}", std::process::id()));
-    let log =
-        std::env::temp_dir().join(format!("sweetpad-bsp-coalesce-log-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dd);
-    let _ = std::fs::remove_file(&log);
+    let scratch = ScratchDir::new("sweetpad-bsp-coalesce").unwrap();
+    let (dd, log) = (scratch.join("dd"), scratch.join("bsp.log"));
 
     let prepare = |id: u32| {
         format!(
             r#"{{"jsonrpc":"2.0","id":{id},"method":"buildTarget/prepare","params":{{"targets":[{{"uri":"sweetpad://target/HeaderMaps"}}]}}}}"#
         )
     };
-    let mut session = Session::start(&project, &dd, &log);
+    let mut session = Session::start(&xcode, &project, &dd, &log);
     session.send(r#"{"jsonrpc":"2.0","id":1,"method":"build/initialize","params":{}}"#);
     session.send(&prepare(2));
     let first = session.wait_for(r#""id":2"#, BUILD_TIMEOUT);
@@ -342,8 +329,6 @@ fn a_repeat_prepare_over_unchanged_inputs_is_skipped() {
     session.shutdown();
 
     let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&dd);
-    let _ = std::fs::remove_file(&log);
 
     assert!(first && second, "both prepares must be answered");
     assert_eq!(

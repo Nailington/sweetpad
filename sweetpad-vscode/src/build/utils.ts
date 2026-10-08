@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 import * as sweetpadLib from "@sweetpad/native";
@@ -16,7 +16,8 @@ import {
   findSchemeFile,
   generateBuildServerConfig,
   generateSweetpadBuildServerConfig,
-  getBuildSettingsToAskDestination,
+  getBuildSettingsList,
+  getSupportedPlatforms,
   getIsXBSInstalled,
   getSchemes,
   SWEETPAD_CLI_MISSING_MESSAGE,
@@ -27,7 +28,7 @@ import {
 } from "../common/cli/scripts";
 import { getWorkspaceConfig } from "../common/config";
 import { ExtensionError } from "../common/errors";
-import { createDirectory, findFilesRecursive, isFileExists, readJsonFile, removeDirectory } from "../common/files";
+import { createDirectory, isFileExists, readJsonFile, removeDirectory } from "../common/files";
 import { commonLogger } from "../common/logger";
 import { type QuickPickItem, showQuickPick } from "../common/quick-pick";
 import type { TaskTerminal } from "../common/tasks/types";
@@ -130,16 +131,12 @@ export async function askDestinationToRunOn(
     }
   }
 
-  // We can remove platforms that are not supported by the build settings
-  // WARNING: if want to avoid refetching build settings, move this logic to build manager or build context (not exist yet)
-  const buildSettings = await getBuildSettingsToAskDestination({
-    workspaceRoot: options.workspaceRoot,
+  // Destinations the scheme can't run on go under "Other".
+  const supportedPlatforms = getSupportedPlatforms({
     scheme: options.scheme,
     configuration: options.configuration,
-    sdk: options.sdk,
     xcworkspace: options.xcworkspace,
   });
-  const supportedPlatforms = buildSettings?.supportedPlatforms;
 
   // The picker records the choice, so a setting pinning a destination that no longer
   // exists is rewritten with this pick instead of re-prompting on every build.
@@ -314,8 +311,18 @@ export async function prepareBundleDir(vscodeContext: vscode.ExtensionContext, s
   return bundleDir;
 }
 
+/**
+ * The DerivedData the extension's builds write, for every reader of it to share: the builds themselves, the
+ * app locator, and the BSP index through `bsp.json`. A `-derivedDataPath` in `sweetpad.build.args` replaces
+ * the extension's own on the build's command line, so the last one there wins over
+ * `sweetpad.build.derivedDataPath`. A relative path resolves against the workspace folder, where the builds
+ * run xcodebuild. xcodebuild reads such a path against the folder's physical directory, so a folder opened
+ * through a symlink is standardized first (`standardizeDirectory`), as the CLI does. `null` leaves the
+ * location to xcodebuild.
+ */
 export function prepareDerivedDataPath(options: { workspaceRoot: string }): string | null {
-  const configPath = getWorkspaceConfig("build.derivedDataPath");
+  const buildArgs: string[] = getWorkspaceConfig("build.args") ?? [];
+  const configPath = lastFlagValue(buildArgs, "-derivedDataPath") ?? getWorkspaceConfig("build.derivedDataPath");
 
   // No config -> path will be provided by xcodebuild
   if (!configPath) {
@@ -326,10 +333,49 @@ export function prepareDerivedDataPath(options: { workspaceRoot: string }): stri
   let derivedDataPath: string = configPath;
   if (!path.isAbsolute(configPath)) {
     // Example: .biuld/ -> /Users/username/Projects/project/.build
-    derivedDataPath = path.join(options.workspaceRoot, configPath);
+    derivedDataPath = path.join(standardizeDirectory(options.workspaceRoot), configPath);
   }
 
   return derivedDataPath;
+}
+
+/**
+ * Xcode's spelling of a directory, the one `sweetpad_lib::project::standardize` gives: symlinks resolved, then a
+ * leading `/private` dropped when the shorter path is the same directory (`/private/tmp/app` is `/tmp/app`). A
+ * literal `/private/…` directory that no root symlink reaches keeps its prefix. A directory that can't be
+ * resolved, such as one that doesn't exist, keeps the spelling it was given. Synchronous, and one or two
+ * `realpath` calls.
+ */
+function standardizeDirectory(dir: string): string {
+  let resolved: string;
+  try {
+    resolved = realpathSync.native(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+  if (!resolved.startsWith("/private/")) {
+    return resolved;
+  }
+  const shorter = resolved.slice("/private".length);
+  try {
+    return realpathSync.native(shorter) === resolved ? shorter : resolved;
+  } catch {
+    return resolved;
+  }
+}
+
+/**
+ * The value after the last `flag` in `args`, read the way `XcodeCommandBuilder.addAdditionalArgs` reads it
+ * (`parseXcodebuildArgs`). A `flag` that ends `args` without a value gives none.
+ */
+function lastFlagValue(args: string[], flag: string): string | undefined {
+  let value: string | undefined;
+  for (const parsed of parseXcodebuildArgs(args)) {
+    if (parsed.kind === "flag" && parsed.arg === flag && parsed.value !== undefined) {
+      value = parsed.value;
+    }
+  }
+  return value;
 }
 
 /**
@@ -752,6 +798,43 @@ export async function generateBuildServerConfigOnBuild(options: {
 }
 
 /**
+ * xcodebuild's arguments naming an Xcode container: `-project` for a bare `.xcodeproj`, `-workspace`
+ * for a workspace, a project's embedded workspace among them.
+ */
+export function xcodeContainerArgs(xcworkspace: string): ["-project" | "-workspace", string] {
+  return xcworkspace.endsWith(".xcodeproj") ? ["-project", xcworkspace] : ["-workspace", xcworkspace];
+}
+
+/**
+ * Every workspace, project and `Package.swift` in `directory` and up to `depth` directories below
+ * it, found by the addon's walk: nearest first, a directory's workspaces before its projects before
+ * its package. The walk never enters a vendored tree (`Pods`, `node_modules`, `Carthage`,
+ * `SourcePackages`, …), a dotted directory (`.build`, `.swiftpm`) or a bundle, the same walk the
+ * CLI's auto-discovery takes.
+ */
+async function discoverContainers(directory: string, depth: number): Promise<string[]> {
+  return (await sweetpadLib.discoverContainers(directory, depth)).map((found) => found.path);
+}
+
+/**
+ * The paths SweetPad addresses discovered containers by, each once. A project goes through its
+ * embedded `project.xcworkspace`, and stands for itself only when it has none: Xcode writes that
+ * workspace on first open, so a checkout that ignores it holds the bare `.xcodeproj` (issue #339).
+ */
+async function containerPaths(found: string[]): Promise<string[]> {
+  const paths: string[] = [];
+  for (const foundPath of found) {
+    const embedded = path.join(foundPath, "project.xcworkspace");
+    if (foundPath.endsWith(".xcodeproj") && (await isFileExists(embedded))) {
+      paths.push(embedded);
+    } else {
+      paths.push(foundPath);
+    }
+  }
+  return [...new Set(paths)];
+}
+
+/**
  * Detect xcode workspaces in all VS Code workspace folders
  */
 export async function detectXcodeWorkspacesPaths(): Promise<string[]> {
@@ -760,21 +843,11 @@ export async function detectXcodeWorkspacesPaths(): Promise<string[]> {
     throw new ExtensionError("No workspace folder found");
   }
 
-  // Get all files that end with .xcworkspace or Package.swift (4 depth) in every folder
-  const results = await Promise.all(
-    folders.map((folder) =>
-      findFilesRecursive({
-        directory: folder,
-        depth: 4,
-        matcher: (file) => {
-          return file.name.endsWith(".xcworkspace") || file.name === "Package.swift";
-        },
-      }),
-    ),
-  );
+  // Every workspace, project and Package.swift down to 4 levels in every folder
+  const results = await Promise.all(folders.map((folder) => discoverContainers(folder, 4)));
   // Workspace folders may nest (both "/repo" and "/repo/ios" can be added), in which case the same
   // project is found by more than one scan. Collapse those so each project is offered once.
-  return [...new Set(results.flat())];
+  return await containerPaths(results.flat());
 }
 
 /**
@@ -841,7 +914,7 @@ export async function selectXcodeWorkspace(options: {
         const parentDir = path.dirname(relativePath);
 
         const isInRootDir = parentDir === ".";
-        const isCocoaPods = isInRootDir && cocoaPodsRoots.has(rootDir);
+        const isCocoaPods = isInRootDir && cocoaPodsRoots.has(rootDir) && xwPath.endsWith(".xcworkspace");
         const isSPMPackage = detectWorkspaceType(xwPath) === "spm";
 
         let projectType: string | undefined;
@@ -849,7 +922,7 @@ export async function selectXcodeWorkspace(options: {
           projectType = "Swift Package Manager";
         } else if (isCocoaPods && isInRootDir) {
           projectType = "CocoaPods (recommended)";
-        } else if (!isInRootDir && parentDir.endsWith(".xcodeproj")) {
+        } else if ((!isInRootDir && parentDir.endsWith(".xcodeproj")) || xwPath.endsWith(".xcodeproj")) {
           projectType = "Xcode";
         }
         // todo: add workspace with multiple projects
@@ -904,6 +977,140 @@ export function isXcbeautifyEnabled() {
   return getWorkspaceConfig("build.xcbeautifyEnabled") ?? true;
 }
 
+/**
+ * The xcodebuild flags that take a value and read every copy, as Xcode 27 takes them: a build runs for each
+ * `-destination` and `-target`, and each test filter adds to the others. xcodebuild refuses a second copy of
+ * nearly every other flag that takes a value ("option '-jobs' may only be provided once").
+ */
+const REPEATABLE_XCODEBUILD_FLAGS = new Set([
+  "-destination",
+  "-target",
+  "-arch",
+  "-toolchain",
+  "-packageCachePath",
+  "-only-testing",
+  "-skip-testing",
+  "-only-test-configuration",
+  "-skip-test-configuration",
+  "-exportLanguage",
+]);
+
+/**
+ * The xcodebuild flags that take the next argument as their value, whatever it looks like: `-xcconfig -quiet`
+ * names a file called `-quiet`. The same list as `VALUE_FLAGS` in sweetpad-core, which the BSP server reads the
+ * `buildArgs` in `bsp.json` with, and a spec fails when the two differ.
+ */
+export const XCODEBUILD_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  "-project",
+  "-workspace",
+  "-target",
+  "-scheme",
+  "-configuration",
+  "-sdk",
+  "-arch",
+  "-destination",
+  "-destination-timeout",
+  "-xcconfig",
+  "-xctestrun",
+  "-testPlan",
+  "-toolchain",
+  "-jobs",
+  "-derivedDataPath",
+  "-resultBundlePath",
+  "-resultStreamPath",
+  "-resultBundleVersion",
+  "-archivePath",
+  "-exportPath",
+  "-exportOptionsPlist",
+  "-clonedSourcePackagesDirPath",
+  "-packageCachePath",
+  "-enableCodeCoverage",
+  "-testLanguage",
+  "-testRegion",
+  "-testProductsPath",
+  "-enablePerformanceTestsDiagnostics",
+  "-only-testing",
+  "-skip-testing",
+  "-only-test-configuration",
+  "-skip-test-configuration",
+  "-collect-test-diagnostics",
+  "-test-iterations",
+  "-test-timeouts-enabled",
+  "-default-test-execution-time-allowance",
+  "-maximum-test-execution-time-allowance",
+  "-test-repetition-relaunch-enabled",
+  "-parallel-testing-enabled",
+  "-parallel-testing-worker-count",
+  "-maximum-parallel-testing-workers",
+  "-maximum-concurrent-test-device-destinations",
+  "-maximum-concurrent-test-simulator-destinations",
+  "-enableAddressSanitizer",
+  "-enableThreadSanitizer",
+  "-enableUndefinedBehaviorSanitizer",
+  "-enableCodesizeProfile",
+  "-codesizeProfileOutputDir",
+  "-packageAuthorizationProvider",
+  "-defaultPackageRegistryURL",
+  "-packageDependencySCMToRegistryTransformation",
+  "-packageFingerprintPolicy",
+  "-packageSigningEntityPolicy",
+  "-scmProvider",
+  "-authenticationKeyPath",
+  "-authenticationKeyID",
+  "-authenticationKeyIssuerID",
+]);
+
+/** The xcodebuild actions `sweetpad.build.args` can add to a command. */
+const XCODEBUILD_ACTIONS: ReadonlySet<string> = new Set(["clean", "build", "test"]);
+
+type XcodebuildArg =
+  | { kind: "flag"; arg: string; value: string | undefined }
+  | { kind: "setting"; key: string; value: string }
+  | { kind: "action"; action: string }
+  | { kind: "unknown"; arg: string };
+
+/**
+ * What `arg` is when no flag takes it as its value. A setting splits at its first `=`, so
+ * `OTHER_SWIFT_FLAGS=-D A=1` keeps its value whole.
+ */
+function readXcodebuildArg(arg: string): XcodebuildArg {
+  if (arg.startsWith("-")) {
+    return { kind: "flag", arg: arg, value: undefined };
+  }
+  const separator = arg.indexOf("=");
+  if (separator !== -1) {
+    return { kind: "setting", key: arg.slice(0, separator), value: arg.slice(separator + 1) };
+  }
+  if (XCODEBUILD_ACTIONS.has(arg)) {
+    return { kind: "action", action: arg };
+  }
+  return { kind: "unknown", arg: arg };
+}
+
+/**
+ * Read `args` the way xcodebuild reads them. A flag in `XCODEBUILD_VALUE_FLAGS` takes the next argument as its
+ * value. Another flag takes the next argument only when that is not a flag, a `KEY=VALUE` setting or an action,
+ * so `-quiet build` stays a switch and an action while a flag the list lacks, such as one a newer Xcode adds,
+ * keeps a plain word after it as its value. A value flag that ends `args` has no value.
+ */
+function parseXcodebuildArgs(args: string[]): XcodebuildArg[] {
+  const parsed: XcodebuildArg[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const read = readXcodebuildArg(args[i]);
+    const next = args[i + 1];
+    if (
+      read.kind === "flag" &&
+      next !== undefined &&
+      (XCODEBUILD_VALUE_FLAGS.has(read.arg) || readXcodebuildArg(next).kind === "unknown")
+    ) {
+      read.value = next;
+      i++;
+    }
+    parsed.push(read);
+  }
+  return parsed;
+}
+
 export class XcodeCommandBuilder {
   NO_VALUE = "__NO_VALUE__";
 
@@ -940,52 +1147,41 @@ export class XcodeCommandBuilder {
     this.actions.push(action);
   }
 
+  /**
+   * Add the user's `sweetpad.build.args`, read by `parseXcodebuildArgs`. A flag given there replaces the
+   * extension's own copy of it, so a typed `-destination` or `-derivedDataPath` overrides the one the extension
+   * picked. Among the user's flags, each copy of a flag in `REPEATABLE_XCODEBUILD_FLAGS` is kept in order, and
+   * of any other flag the last copy wins.
+   */
   addAdditionalArgs(args: string[]) {
-    // Cases:
-    // ["-arg1", "value1", "-arg2", "value2", "-arg3", "-arg4", "value4"]
-    // ["xcodebuild", "-arg1", "value1", "-arg2", "value2", "-arg3", "-arg4", "value4"]
-    // ["ARG1=value1", "ARG2=value2", "ARG3", "ARG4=value4"]
-    // ["xcodebuild", "ARG1=value1", "ARG2=value2", "ARG3", "ARG4=value4"]
     if (args.length === 0) {
       return;
     }
 
-    for (let i = 0; i < args.length; i++) {
-      const current = args[i];
-      const next = args[i + 1];
-      if (current && next && current.startsWith("-") && !next.startsWith("-")) {
-        this.parameters.push({
-          arg: current,
-          value: next,
-        });
-        i++;
-      } else if (current?.startsWith("-")) {
-        this.parameters.push({
-          arg: current,
-          value: this.NO_VALUE,
-        });
-      } else if (current?.includes("=")) {
-        const [arg, value] = current.split("=");
-        this.buildSettings.push({
-          key: arg,
-          value: value,
-        });
-      } else if (["clean", "build", "test"].includes(current)) {
-        this.actions.push(current);
+    const parameters: { arg: string; value: string }[] = [];
+    for (const parsed of parseXcodebuildArgs(args)) {
+      if (parsed.kind === "flag") {
+        parameters.push({ arg: parsed.arg, value: parsed.value ?? this.NO_VALUE });
+      } else if (parsed.kind === "setting") {
+        this.buildSettings.push({ key: parsed.key, value: parsed.value });
+      } else if (parsed.kind === "action") {
+        this.actions.push(parsed.action);
       } else {
         commonLogger.warn("Unknown argument", {
-          argument: current,
+          argument: parsed.arg,
           args: args,
         });
       }
     }
 
-    // Remove duplicates, with higher priority for the last occurrence
+    const given = new Set(parameters.map((param) => param.arg));
     const seenParameters = new Set<string>();
-    this.parameters = this.parameters
-      .slice()
+    const kept = parameters
       .toReversed()
       .filter((param) => {
+        if (REPEATABLE_XCODEBUILD_FLAGS.has(param.arg)) {
+          return true;
+        }
         if (seenParameters.has(param.arg)) {
           return false;
         }
@@ -993,6 +1189,7 @@ export class XcodeCommandBuilder {
         return true;
       })
       .toReversed();
+    this.parameters = [...this.parameters.filter((param) => !given.has(param.arg)), ...kept];
 
     // Remove duplicates, with higher priority for the last occurrence
     const seenActions = new Set<string>();
@@ -1233,90 +1430,30 @@ export async function detectGitWorktrees(options: { workspaceRoot: string }): Pr
 }
 
 /**
- * Find Xcode workspace/project or SPM package files inside a given directory (up to 4 levels).
- * Returns the first .xcworkspace or Package.swift path found, or undefined.
+ * The Xcode workspace, project or SPM package to open in a directory (up to 4 levels down): the
+ * nearest, and of those the kind Xcode prefers, addressed the way `detectXcodeWorkspacesPaths`
+ * addresses it. Undefined when there is none.
  */
 export async function findXcodeWorkspaceInDirectory(directory: string): Promise<string | undefined> {
-  const paths = await findFilesRecursive({
-    directory,
-    depth: 4,
-    ignore: ["Pods", "DerivedData", ".build", "node_modules"],
-    maxResults: 1,
-    matcher: (file) => file.name.endsWith(".xcworkspace") || file.name === "Package.swift",
-  });
-  return paths.length > 0 ? paths[0] : undefined;
-}
-
-/** The subset of a parsed scheme that drives launch argv/env. */
-type SchemeLaunchOptions = Pick<
-  sweetpadLib.SchemeInfo,
-  "launchArguments" | "launchEnvironmentVariables" | "launchLanguage" | "launchRegion"
->;
-
-/**
- * Translate a scheme's <LaunchAction> into launch-time argv + env, mirroring
- * what Xcode itself injects when you press Run:
- *
- *  - enabled <CommandLineArgument>s are appended (whitespace-split, the way
- *    Xcode tokenizes each row so that `-AppleLanguages (he)` becomes two argv)
- *  - enabled <EnvironmentVariable>s become entries in `env`
- *  - the `language` / `region` attrs (Edit Scheme → Options → App Language /
- *    App Region) become argv flags Foundation reads at launch via
- *    NSArgumentDomain:
- *      - `language` alone     → `-AppleLanguages (<lang>)`
- *      - `language + region`  → `-AppleLanguages (<lang>) -AppleLocale <lang>_<region>`
- *      - `region` alone       → nothing (a bare region code like "IL" is not
- *                                a valid POSIX locale identifier; Xcode would
- *                                pair it with the device's system language,
- *                                which we can't know here. The user can add
- *                                an explicit `-AppleLocale` CLI arg if needed.)
- *    Discussion #197 use case.
- */
-export function launchActionToSettings(scheme: SchemeLaunchOptions): {
-  args: string[];
-  env: Record<string, string>;
-} {
-  const args: string[] = [];
-
-  for (const arg of scheme.launchArguments) {
-    if (!arg.isEnabled) continue;
-    const raw = arg.argument;
-    if (!raw) continue;
-    // Xcode splits each row on whitespace (no shell-style quote handling), so
-    // `-AppleLanguages (he)` becomes `["-AppleLanguages", "(he)"]`.
-    for (const token of raw.trim().split(/\s+/)) {
-      if (token) args.push(token);
-    }
-  }
-
-  const language = scheme.launchLanguage;
-  const region = scheme.launchRegion;
-  if (language) {
-    args.push("-AppleLanguages", `(${language})`);
-  }
-  if (language && region) {
-    args.push("-AppleLocale", `${language}_${region}`);
-  }
-
-  const env: Record<string, string> = {};
-  for (const ev of scheme.launchEnvironmentVariables) {
-    if (!ev.isEnabled) continue;
-    if (ev.key && ev.value !== undefined) {
-      env[ev.key] = ev.value;
-    }
-  }
-
-  return { args, env };
+  return (await containerPaths(await discoverContainers(directory, 4)))[0];
 }
 
 /**
- * Load the scheme file for `scheme` inside `xcworkspace` and extract its
- * <LaunchAction> args/env. Returns empty values if the scheme can't be found,
- * has no on-disk file (default scheme), or has no <LaunchAction>.
+ * Load the scheme file for `scheme` inside `xcworkspace` and return what its
+ * <LaunchAction> launches the app with, as Xcode applies it (the native
+ * `schemeLaunchSettings`): enabled rows only, `$(VAR)` expanded against the
+ * resolved build settings, arguments split with shell-style quoting, then the
+ * App Language and App Region flags. Build settings are resolved only when a
+ * row refers to one. Returns empty values if the scheme can't be found, has no
+ * on-disk file (default scheme), or has no <LaunchAction>.
  */
 export async function getSchemeLaunchSettings(options: {
+  workspaceRoot: string;
   xcworkspace: string;
   scheme: string;
+  configuration: string;
+  sdk: string | undefined;
+  destination: string;
 }): Promise<{ args: string[]; env: Record<string, string> }> {
   try {
     const schemeFile = await findSchemeFile(options.xcworkspace, options.scheme);
@@ -1324,7 +1461,13 @@ export async function getSchemeLaunchSettings(options: {
       // No on-disk scheme (Xcode's autogenerated default) — no launch overrides.
       return { args: [], env: {} };
     }
-    return launchActionToSettings(sweetpadLib.parseScheme(schemeFile));
+    const settings = sweetpadLib.parseScheme(schemeFile).launchReferencesSettings
+      ? await getBuildSettingsList(options)
+      : [];
+    return sweetpadLib.schemeLaunchSettings(
+      schemeFile,
+      settings.map((entry) => ({ target: entry.target, settings: entry.settings })),
+    );
   } catch (error) {
     commonLogger.warn("Failed to read scheme launch settings; continuing without them", {
       error: error,

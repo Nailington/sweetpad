@@ -122,6 +122,7 @@ pub fn target_arguments(
         arguments: swift_arguments(
             settings,
             arch,
+            &swift_inputs,
             swift_options,
             xcode_version,
             has_package_products,
@@ -186,6 +187,8 @@ fn link_tool(settings: &Settings, product_type: Option<&str>) -> &'static str {
 /// (`options`) through that data and hand-coding the computed/build-system flags
 /// it doesn't (the target triple, search paths, driver defaults, …). Pass `&[]`
 /// for `options` to fall back to the hand-coded heuristic for every option.
+/// `inputs` are the `.swift` files the invocation compiles, which decide
+/// `-parse-as-library` ([`emit_parse_as_library`]).
 ///
 /// Order is not significant — the oracle comparator scores argv as a multiset —
 /// so flags are grouped by concern for readability.
@@ -193,6 +196,7 @@ fn link_tool(settings: &Settings, product_type: Option<&str>) -> &'static str {
 pub fn swift_arguments(
     settings: &Settings,
     arch: &str,
+    inputs: &[String],
     options: &[CompilerOption],
     xcode_version: &str,
     has_package_products: bool,
@@ -296,6 +300,8 @@ pub fn swift_arguments(
         a.pair("-F", &p);
     }
     emit_unit_test_search_paths(&mut a, settings);
+    emit_swift_system_search_paths(&mut a, settings);
+    emit_parse_as_library(&mut a, settings, inputs);
 
     // Swift macros a package vends are out-of-process executable plugins. A
     // plugin *search path* doesn't discover executables, so the frontend
@@ -371,6 +377,74 @@ fn emit_unit_test_search_paths(a: &mut ArgBuilder, settings: &Settings) {
     if let Some(platform) = settings.get("PLATFORM_DIR") {
         a.pair("-F", &format!("{platform}/Developer/Library/Frameworks"));
         a.pair("-I", &format!("{platform}/Developer/usr/lib"));
+    }
+}
+
+/// `-parse-as-library` where Swift Build passes it (`SwiftCompilerSpec`): under
+/// `SWIFT_LIBRARIES_ONLY` (the xcspec's encoding), and for a compile of a
+/// single file not named `main.swift` unless `SWIFT_DISABLE_PARSE_AS_LIBRARY`
+/// is set. Without it a lone file compiles as the module's `main.swift`, so an
+/// app whose only file declares `@main` reports top-level code.
+fn emit_parse_as_library(a: &mut ArgBuilder, settings: &Settings, inputs: &[String]) {
+    let yes = |key: &str| is_yes(settings.get(key).map_or("", String::as_str));
+    let lone_file = matches!(
+        inputs,
+        [only] if Path::new(only).file_name().is_none_or(|name| name != "main.swift")
+    );
+    if yes("SWIFT_LIBRARIES_ONLY") || (lone_file && !yes("SWIFT_DISABLE_PARSE_AS_LIBRARY")) {
+        a.flag("-parse-as-library");
+    }
+}
+
+/// The system search paths, the way Swift Build hands them to swiftc
+/// (`SwiftCompilerSpec.searchPathArguments`). Each `SYSTEM_FRAMEWORK_SEARCH_PATHS`
+/// entry not already searched as a framework path is `-Fsystem` for Mac
+/// Catalyst's `System/iOSSupport` `Frameworks` and `SubFrameworks`, where its
+/// UIKit and SwiftUI live, or for every path under
+/// `SYSTEM_FRAMEWORK_SEARCH_PATHS_USE_FSYSTEM`, and `-F` otherwise. Each
+/// `SYSTEM_HEADER_SEARCH_PATHS` entry reaches the clang importer as
+/// `-isystem`, once (Catalyst's value repeats its iOSSupport `usr/include`).
+fn emit_swift_system_search_paths(a: &mut ArgBuilder, settings: &Settings) {
+    let all_fsystem = is_yes(
+        settings
+            .get("SYSTEM_FRAMEWORK_SEARCH_PATHS_USE_FSYSTEM")
+            .map_or("", String::as_str),
+    );
+    let mut searched: BTreeSet<String> = a
+        .out
+        .windows(2)
+        .filter(|w| matches!(w[0].as_str(), "-F" | "-Fsystem"))
+        .map(|w| w[1].clone())
+        .collect();
+    for path in ws_unquoted(
+        settings
+            .get("SYSTEM_FRAMEWORK_SEARCH_PATHS")
+            .map(String::as_str),
+    ) {
+        if !searched.insert(path.clone()) {
+            continue;
+        }
+        let ios_support = path.ends_with("System/iOSSupport/System/Library/Frameworks")
+            || path.ends_with("System/iOSSupport/System/Library/SubFrameworks");
+        a.pair(
+            if ios_support || all_fsystem {
+                "-Fsystem"
+            } else {
+                "-F"
+            },
+            &path,
+        );
+    }
+    let mut headers = BTreeSet::new();
+    for path in ws_unquoted(
+        settings
+            .get("SYSTEM_HEADER_SEARCH_PATHS")
+            .map(String::as_str),
+    ) {
+        if headers.insert(path.clone()) {
+            a.pair("-Xcc", "-isystem");
+            a.pair("-Xcc", &path);
+        }
     }
 }
 
@@ -526,8 +600,8 @@ pub fn clang_arguments(
 /// from the core build settings (not the Clang xcspec): the target's generated
 /// header maps, the products dir's generated-headers `include` subdir +
 /// `HEADER_SEARCH_PATHS` as `-I`, the target's generated-sources dirs, the
-/// products dir + `FRAMEWORK_SEARCH_PATHS` as `-F`, and the user/system header
-/// paths as `-iquote`/`-isystem`. Each `flag`/path pair is emitted once (a
+/// products dir + `FRAMEWORK_SEARCH_PATHS` as `-F`, the system framework paths
+/// as `-iframework`, and the user/system header paths as `-iquote`/`-isystem`. Each `flag`/path pair is emitted once (a
 /// setting often re-inherits the products dir), as `emit_library_paths` does
 /// for `-L`.
 fn emit_clang_search_paths(a: &mut ArgBuilder, settings: &Settings, arch: &str) {
@@ -563,7 +637,9 @@ fn emit_clang_search_paths(a: &mut ArgBuilder, settings: &Settings, arch: &str) 
         }
     }
 
-    // `-F`: the products dir, then FRAMEWORK_SEARCH_PATHS.
+    // `-F`: the products dir, then FRAMEWORK_SEARCH_PATHS; then
+    // SYSTEM_FRAMEWORK_SEARCH_PATHS as `-iframework`, less a path already
+    // searched with `-F`, as Swift Build adds a system framework path.
     if let Some(p) = products {
         paths.push(("-F", p.to_string()));
     }
@@ -571,6 +647,17 @@ fn emit_clang_search_paths(a: &mut ArgBuilder, settings: &Settings, arch: &str) 
         ws_unquoted(get("FRAMEWORK_SEARCH_PATHS"))
             .into_iter()
             .map(|p| ("-F", p)),
+    );
+    let frameworks: BTreeSet<String> = paths
+        .iter()
+        .filter(|(flag, _)| *flag == "-F")
+        .map(|(_, p)| p.clone())
+        .collect();
+    paths.extend(
+        ws_unquoted(get("SYSTEM_FRAMEWORK_SEARCH_PATHS"))
+            .into_iter()
+            .filter(|p| !frameworks.contains(p))
+            .map(|p| ("-iframework", p)),
     );
     paths.extend(
         ws_unquoted(get("USER_HEADER_SEARCH_PATHS"))
@@ -1507,6 +1594,7 @@ fn target_triple(settings: &Settings, arch: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdir::TempDir;
 
     #[test]
     fn swift_version_strips_dot_zero() {
@@ -1558,7 +1646,7 @@ mod tests {
         s.insert("SWIFT_VERSION".into(), "5.0".into());
         s.insert("SWIFT_ACTIVE_COMPILATION_CONDITIONS".into(), "DEBUG".into());
         // No spec options: exercises the hand-coded fallback path.
-        let args = swift_arguments(&s, "arm64", &[], "26.5.0", false, &[]);
+        let args = swift_arguments(&s, "arm64", &[], &[], "26.5.0", false, &[]);
         let joined = args.join(" ");
         assert!(joined.contains("-module-name Alamofire"));
         assert!(joined.contains("-Onone"));
@@ -1604,7 +1692,7 @@ mod tests {
             "SWIFT_ACTIVE_COMPILATION_CONDITIONS".into(),
             "DEBUG COCOAPODS".into(),
         );
-        let args = swift_arguments(&s, "arm64", &[opt_level, conds], "26.5.0", false, &[]);
+        let args = swift_arguments(&s, "arm64", &[], &[opt_level, conds], "26.5.0", false, &[]);
         // The enum's special-cased `-Owholemodule` expands; conditions become -D.
         assert!(
             args.windows(2)
@@ -1697,7 +1785,7 @@ mod tests {
         // `-Xfrontend -load-plugin-executable -Xfrontend <plugin>#<module>` form.
         let s = Settings::new();
         let plugins = [PathBuf::from("/dd/Build/Products/Debug/MyMacros")];
-        let args = swift_arguments(&s, "arm64", &[], "26.5.0", false, &plugins);
+        let args = swift_arguments(&s, "arm64", &[], &[], "26.5.0", false, &plugins);
         let joined = args.join(" ");
         assert!(
             args.iter().any(|a| a == "-load-plugin-executable"),
@@ -1718,7 +1806,7 @@ mod tests {
             "BUILT_PRODUCTS_DIR".into(),
             "/dd/Build/Products/Debug".into(),
         );
-        let args = swift_arguments(&s, "arm64", &[], "26.5.0", true, &[]);
+        let args = swift_arguments(&s, "arm64", &[], &[], "26.5.0", true, &[]);
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "-F" && w[1] == "/dd/Build/Products/Debug/PackageFrameworks"),
@@ -1755,7 +1843,7 @@ mod tests {
              -fmodule-map-file=\"/dd/Build/Products/Debug-iphoneos/Pod A/Pod_A.modulemap\""
                 .into(),
         );
-        let args = swift_arguments(&s, "arm64", &[], "26.5.0", false, &[]);
+        let args = swift_arguments(&s, "arm64", &[], &[], "26.5.0", false, &[]);
         assert!(
             args.contains(
                 &"-fmodule-map-file=/dd/Build/Products/Debug-iphoneos/Pod A/Pod_A.modulemap"
@@ -1805,15 +1893,8 @@ mod tests {
     /// A unique scratch dir standing in for a target's build tree — the header
     /// maps and generated-sources dirs are only emitted when they exist, so
     /// these tests have to put real files on disk.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "sweetpad-hmap-{}-{name}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+    fn scratch(name: &str) -> TempDir {
+        TempDir::new(&format!("sweetpad-hmap-{name}"))
     }
 
     /// The `(flag, value)` pairs in an argv, for asserting on search paths.
@@ -1863,7 +1944,6 @@ mod tests {
             let want = (flag.to_string(), format!("{t}/Widget{suffix}"));
             assert!(got.contains(&want), "missing {want:?} in {got:?}");
         }
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
@@ -1877,7 +1957,6 @@ mod tests {
             !args.iter().any(|a| a.contains(".hmap")),
             "named a header map that is not on disk: {args:?}"
         );
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
@@ -1893,7 +1972,6 @@ mod tests {
                 .any(|a| a.ends_with("/DifferentProductName-project-headers.hmap")),
             "keyed the header maps off the target name: {args:?}"
         );
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
@@ -1922,7 +2000,6 @@ mod tests {
             !args.iter().any(|a| a.ends_with("-project-headers.hmap")),
             "HEADERMAP_INCLUDES_PROJECT_HEADERS = NO still emitted it: {args:?}"
         );
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
@@ -1958,7 +2035,6 @@ mod tests {
                 "missing {suffix} in {args:?}"
             );
         }
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
@@ -1998,6 +2074,115 @@ mod tests {
         let got = pairs(&a.into_vec());
         assert!(got.contains(&("-I".to_string(), d.to_string())));
         assert!(!got.contains(&("-I".to_string(), format!("{d}/arm64"))));
-        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// Mac Catalyst's UIKit and SwiftUI live under the macOS SDK's
+    /// `System/iOSSupport`, which Swift Build passes swiftc as `-Fsystem` and
+    /// `-Xcc -isystem`, once each though the setting repeats them. Any other
+    /// system framework path is a plain `-F`, and none repeats a `-F` already
+    /// there.
+    #[test]
+    fn swift_passes_system_search_paths_as_swift_build_does() {
+        let sdk = "/SDKs/MacOSX.sdk";
+        let frameworks = format!("{sdk}/System/iOSSupport/System/Library/Frameworks");
+        let subframeworks = format!("{sdk}/System/iOSSupport/System/Library/SubFrameworks");
+        let include = format!("{sdk}/System/iOSSupport/usr/include");
+        let mut s = Settings::new();
+        s.insert(
+            "SYSTEM_FRAMEWORK_SEARCH_PATHS".into(),
+            format!(" {frameworks} {subframeworks} /Vendor/Frameworks /Shared {frameworks}"),
+        );
+        s.insert("FRAMEWORK_SEARCH_PATHS".into(), "/Shared".into());
+        s.insert(
+            "SYSTEM_HEADER_SEARCH_PATHS".into(),
+            format!(" {include}  {include}"),
+        );
+        let args = swift_arguments(&s, "arm64", &[], &[], "27.0.0", false, &[]);
+        let found = pairs(&args);
+        let count = |flag: &str, value: &str| {
+            found
+                .iter()
+                .filter(|(f, v)| f == flag && v == value)
+                .count()
+        };
+        assert_eq!(count("-Fsystem", &frameworks), 1, "{args:?}");
+        assert_eq!(count("-Fsystem", &subframeworks), 1, "{args:?}");
+        assert_eq!(count("-F", "/Vendor/Frameworks"), 1, "{args:?}");
+        assert_eq!(count("-F", "/Shared"), 1, "{args:?}");
+        assert_eq!(count("-Fsystem", "/Shared"), 0, "{args:?}");
+        let isystem = args
+            .windows(4)
+            .filter(|w| w[..] == ["-Xcc", "-isystem", "-Xcc", include.as_str()])
+            .count();
+        assert_eq!(isystem, 1, "{args:?}");
+
+        s.insert(
+            "SYSTEM_FRAMEWORK_SEARCH_PATHS_USE_FSYSTEM".into(),
+            "YES".into(),
+        );
+        let args = swift_arguments(&s, "arm64", &[], &[], "27.0.0", false, &[]);
+        assert!(
+            pairs(&args).contains(&("-Fsystem".to_string(), "/Vendor/Frameworks".to_string())),
+            "{args:?}"
+        );
+    }
+
+    /// Swift Build parses a lone file as a library unless it is `main.swift`
+    /// or `SWIFT_DISABLE_PARSE_AS_LIBRARY` says not to, and parses every file
+    /// as one under `SWIFT_LIBRARIES_ONLY`. A module of several files needs
+    /// no flag: only its `main.swift` holds top-level code.
+    #[test]
+    fn parse_as_library_follows_swift_build() {
+        let inputs =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| format!("/src/{n}")).collect() };
+        let count = |settings: &[(&str, &str)], names: &[&str]| {
+            let mut s = Settings::new();
+            for (k, v) in settings {
+                s.insert((*k).to_string(), (*v).to_string());
+            }
+            swift_arguments(&s, "arm64", &inputs(names), &[], "27.0.0", false, &[])
+                .iter()
+                .filter(|a| *a == "-parse-as-library")
+                .count()
+        };
+        assert_eq!(count(&[], &["App.swift"]), 1);
+        assert_eq!(count(&[], &["main.swift"]), 0);
+        assert_eq!(count(&[], &["App.swift", "Model.swift"]), 0);
+        assert_eq!(count(&[], &[]), 0);
+        assert_eq!(
+            count(&[("SWIFT_DISABLE_PARSE_AS_LIBRARY", "YES")], &["App.swift"]),
+            0
+        );
+        assert_eq!(
+            count(&[("SWIFT_LIBRARIES_ONLY", "YES")], &["A.swift", "B.swift"]),
+            1
+        );
+        assert_eq!(count(&[("SWIFT_LIBRARIES_ONLY", "YES")], &["App.swift"]), 1);
+    }
+
+    /// clang searches each system framework path with `-iframework`, except
+    /// one already searched with `-F`.
+    #[test]
+    fn clang_passes_system_frameworks_as_iframework() {
+        let mut s = Settings::new();
+        s.insert(
+            "SYSTEM_FRAMEWORK_SEARCH_PATHS".into(),
+            "/Platform/Developer/Library/Frameworks /Shared".into(),
+        );
+        s.insert("FRAMEWORK_SEARCH_PATHS".into(), "/Shared".into());
+        let file_types = BTreeSet::from(["sourcecode.c.objc".to_string()]);
+        let args = clang_arguments(&s, "arm64", &[], &file_types);
+        let found = pairs(&args);
+        assert!(
+            found.contains(&(
+                "-iframework".to_string(),
+                "/Platform/Developer/Library/Frameworks".to_string()
+            )),
+            "{args:?}"
+        );
+        assert!(
+            !found.contains(&("-iframework".to_string(), "/Shared".to_string())),
+            "{args:?}"
+        );
     }
 }

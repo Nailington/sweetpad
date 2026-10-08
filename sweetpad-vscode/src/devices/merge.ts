@@ -1,4 +1,4 @@
-import type { DeviceCtlDevice, DeviceCtlDeviceType } from "../common/xcode/devicectl";
+import { type DeviceCtlDeviceType, type DevicectlDevice, deviceType } from "../common/xcode/devicectl";
 import type { XcdeviceDevice } from "../common/xcode/xcdevice";
 import type { DeviceRaw } from "./types";
 
@@ -8,7 +8,7 @@ import type { DeviceRaw } from "./types";
  * turned into a DeviceDestination and must be dropped.
  */
 export function resolveDeviceType(raw: DeviceRaw): DeviceCtlDeviceType | null {
-  const dcType = raw.devicectl?.hardwareProperties?.deviceType;
+  const dcType = raw.devicectl ? deviceType(raw.devicectl) : undefined;
   if (dcType) {
     return dcType;
   }
@@ -53,6 +53,8 @@ function inferDeviceTypeFromXcdevice(xc: XcdeviceDevice): DeviceCtlDeviceType | 
 
 /**
  * Merge devicectl and xcdevice outputs into a deduplicated list of source-record pairs.
+ * The devicectl side is already physical devices only: the addon drops the simulators
+ * Xcode 27's devicectl lists beside them.
  *
  * Scenario examples:
  *
@@ -65,7 +67,7 @@ function inferDeviceTypeFromXcdevice(xc: XcdeviceDevice): DeviceCtlDeviceType | 
  * - iOS 16 Wi-Fi device: devicectl list empty, xcdevice lists it
  *   → 1 record with just xcdevice.
  *
- * - iOS 16 USB device: devicectl returns it with empty hardwareProperties (no UDID),
+ * - iOS 16 USB device: devicectl returns it with an empty hardware section (no UDID),
  *   xcdevice also has it
  *   → devicectl entry can't be paired (no UDID) and has no deviceType → dropped.
  *     xcdevice entry stands alone → 1 record with just xcdevice.
@@ -74,7 +76,7 @@ function inferDeviceTypeFromXcdevice(xc: XcdeviceDevice): DeviceCtlDeviceType | 
  *   → 1 record with just xcdevice (DeviceDestination will render as unavailable).
  */
 export function mergeDeviceSources(
-  devicectlDevices: DeviceCtlDevice[],
+  devicectlDevices: DevicectlDevice[],
   xcdeviceDevices: XcdeviceDevice[],
 ): DeviceRaw[] {
   const xcByUdid = new Map<string, XcdeviceDevice>();
@@ -92,11 +94,11 @@ export function mergeDeviceSources(
       continue;
     }
 
-    const dcUdid = dc.hardwareProperties?.udid?.toLowerCase();
+    const dcUdid = dc.udid?.toLowerCase();
     const matchedXc = dcUdid ? xcByUdid.get(dcUdid) : undefined;
 
     // Rule 1: pair devicectl + xcdevice when UDIDs match (case-insensitive,
-    // "devicectl.hardwareProperties.udid" ↔ "xcdevice.identifier").
+    // devicectl's hardware udid ↔ "xcdevice.identifier").
     if (matchedXc && dcUdid) {
       consumedXcUdids.add(dcUdid);
       result.push({ devicectl: dc, xcdevice: matchedXc });
@@ -105,7 +107,7 @@ export function mergeDeviceSources(
 
     // Rule 2: devicectl entries with no "deviceType" AND no xcdevice match are
     // dropped — no way to pick a DeviceDestination subclass for them.
-    if (!dc.hardwareProperties?.deviceType) {
+    if (!deviceType(dc)) {
       continue;
     }
     result.push({ devicectl: dc });

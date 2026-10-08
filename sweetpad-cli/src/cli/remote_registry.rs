@@ -21,7 +21,7 @@ pub enum Action {
     Add {
         /// Local name, including spaces when quoted.
         name: String,
-        /// SSH host, `user@host`, or alias from ~/.ssh/config.
+        /// SSH host, 'user@host', or alias from ~/.ssh/config.
         host: String,
         /// Existing private key file to use for this Mac.
         #[arg(long = "identity-file", value_name = "PATH")]
@@ -148,7 +148,7 @@ pub fn resolve(reference: &str) -> Result<Mac, String> {
         });
     }
     Err(format!(
-        "no saved Mac named {reference:?}; run `sweetpad remote list` or `sweetpad remote add`"
+        "no saved Mac named {reference:?}; run 'sweetpad remote list' or 'sweetpad remote add'"
     ))
 }
 
@@ -266,7 +266,7 @@ impl Render for RegistryReport {
             out.note(message);
         }
         if self.entries.is_empty() {
-            out.note("no saved Macs; add one with `sweetpad remote add NAME SSH_TARGET`");
+            out.note("no saved Macs; add one with 'sweetpad remote add NAME SSH_TARGET'");
         } else {
             for (name, mac) in &self.entries {
                 let mut details = format!("{name}  →  {}", mac.host);

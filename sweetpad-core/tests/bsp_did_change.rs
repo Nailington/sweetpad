@@ -1,8 +1,8 @@
 //! The change-watcher pushes `buildTarget/didChange` when the project file is
 //! edited mid-session, so the client re-queries targets/sources without an LSP
-//! restart. Hermetic: copies the multi-module fixture to a temp dir (so its
-//! pbxproj can be mutated), drives the server with a short watch interval, edits
-//! the pbxproj, and checks the notification arrives.
+//! restart. Hermetic: copies the multi-module fixture into a scratch
+//! directory (so its pbxproj can be mutated), drives the server with a short
+//! watch interval, edits the pbxproj, and checks the notification arrives.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use sweetpad_core::scratch::ScratchDir;
 
 fn frame(body: &str) -> Vec<u8> {
     format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
@@ -27,18 +29,40 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+/// A `bsp-server` command that keeps what a session writes in Cargo's scratch
+/// space for integration tests. The server resolves against the active Xcode,
+/// and the parsed catalog it caches would otherwise land in the user's
+/// `~/.cache/sweetpad`. Its home is there too, as `CFFIXED_USER_HOME`: the
+/// DerivedData locator and the `xcodebuild` a prepare runs both follow that,
+/// not `HOME`, so what the warm-up after `build/initialized` builds stays out
+/// of the user's DerivedData.
+fn bsp_server() -> Command {
+    let home = concat!(env!("CARGO_TARGET_TMPDIR"), "/home");
+    fs::create_dir_all(home).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bsp-server"));
+    cmd.env("SWEETPAD_CACHE_DIR", env!("CARGO_TARGET_TMPDIR"))
+        .env("HOME", home)
+        .env("CFFIXED_USER_HOME", home);
+    cmd
+}
+
 #[test]
 fn buildtarget_did_change_on_pbxproj_edit() {
     let src =
         PathBuf::from(env!("SWEETPAD_LIB_DIR")).join("fixtures/_synthetic-multimodule/project");
-    let tmp = std::env::temp_dir().join(format!("sweetpad-bsp-didchange-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&tmp);
+    // What the warm-up after `build/initialized` builds goes in the scratch
+    // directory too, rather than in a DerivedData folder keyed by the copy's
+    // path that nothing removes.
+    let scratch = ScratchDir::new("sweetpad-bsp-did-change").unwrap();
+    let tmp = scratch.join("project");
     copy_dir(&src, &tmp);
     let proj = tmp.join("MultiModule.xcodeproj");
     let pbxproj = proj.join("project.pbxproj");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bsp-server"))
+    let mut child = bsp_server()
         .args(["bsp", "--project", proj.to_str().unwrap()])
+        .arg("--derived-data-path")
+        .arg(scratch.join("dd"))
         .env("SWEETPAD_BSP_WATCH_MS", "100")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -92,7 +116,6 @@ fn buildtarget_did_change_on_pbxproj_edit() {
     drop(stdin);
     let _ = child.wait();
     let _ = reader.join();
-    let _ = fs::remove_dir_all(&tmp);
 
     assert!(
         got.contains("buildTarget/didChange"),

@@ -1,84 +1,49 @@
+import type { DevicectlAppProcess, DevicectlDevice } from "@sweetpad/native";
 import type * as vscode from "vscode";
 
 import { exec } from "../exec";
-import { readJsonFile, tempFilePath } from "../files";
+import { readTextFile, tempFilePath } from "../files";
 import { commonLogger } from "../logger";
 
-type DeviceCtlListCommandOutput = {
-  result: {
-    devices: DeviceCtlDevice[];
-  };
-};
+/**
+ * A physical device as devicectl lists it. The addon's "parseDevicectlDevices" reads
+ * both JSON shapes devicectl writes and leaves out the simulators Xcode 27 lists beside
+ * the devices, the same way the CLI does.
+ */
+export type { DevicectlAppProcess, DevicectlDevice };
 
-export type DeviceCtlDevice = {
-  capabilities: DeviceCtlDeviceCapability[];
-  connectionProperties: DeviceCtlConnectionProperties;
-  deviceProperties: DeviceCtlDeviceProperties;
-  hardwareProperties: DeviceCtlHardwareProperties;
-  identifier: string;
-  visibilityClass: "default";
-};
-
-type DeviceCtlConnectionProperties = {
-  authenticationType?: "manualPairing";
-  isMobileDeviceOnly?: boolean;
-  lastConnectionDate?: string;
-  pairingState: "paired" | "unsupported";
-  potentialHostnames?: string[];
-  transportType?: "localNetwork" | "wired";
-  tunnelState: "disconnected" | "connected" | "unavailable";
-  tunnelTransportProtocol?: "tcp";
-};
-
-type DeviceCtlCpuType = {
-  name: "arm64e" | "arm64" | "arm64_32";
-  subType: number;
-  type: number;
-};
-
-type DeviceCtlDeviceProperties = {
-  bootedFromSnapshot?: boolean;
-  bootedSnapshotName?: string;
-  ddiServicesAvailable?: boolean;
-  developerModeStatus?: "enabled";
-  hasInternalOSBuild?: boolean;
-  name?: string;
-  osBuildUpdate?: string;
-  osVersionNumber?: string;
-  rootFileSystemIsWritable?: boolean;
-};
+export type DeviceCtlTunnelState = "disconnected" | "connected" | "unavailable";
 
 export type DeviceCtlDeviceType = "iPhone" | "iPad" | "appleWatch" | "appleTV" | "appleVision" | "realityDevice";
 
+const DEVICE_TYPES: ReadonlySet<string> = new Set<DeviceCtlDeviceType>([
+  "iPhone",
+  "iPad",
+  "appleWatch",
+  "appleTV",
+  "appleVision",
+  "realityDevice",
+]);
+
+const TUNNEL_STATES: ReadonlySet<string> = new Set<DeviceCtlTunnelState>(["disconnected", "connected", "unavailable"]);
+
+/** The device's type, or undefined when devicectl leaves it out or names one this code doesn't know. */
+export function deviceType(device: DevicectlDevice): DeviceCtlDeviceType | undefined {
+  const type = device.deviceType;
+  return type && DEVICE_TYPES.has(type) ? (type as DeviceCtlDeviceType) : undefined;
+}
+
+/** Reachability, e.g. "connected". */
+export function deviceTunnelState(device: DevicectlDevice): DeviceCtlTunnelState | undefined {
+  const state = device.connection;
+  return state && TUNNEL_STATES.has(state) ? (state as DeviceCtlTunnelState) : undefined;
+}
+
 /**
- * All fields are optional because devicectl returns "hardwareProperties": {} for
- * some iOS <= 16 devices connected via USB (see sweetpad-dev/sweetpad#223). Callers
- * must handle missing deviceType / platform / udid.
+ * Run "devicectl list devices" and return the JSON it wrote, for the addon's
+ * "parseDevicectlDevices" to read.
  */
-type DeviceCtlHardwareProperties = {
-  cpuType?: DeviceCtlCpuType;
-  deviceType?: DeviceCtlDeviceType;
-  ecid?: number;
-  hardwareModel?: string;
-  internalStorageCapacity?: number;
-  isProductionFused?: boolean;
-  marketingName?: string;
-  platform?: "iOS";
-  productType?: string;
-  reality?: "physical";
-  serialNumber?: string;
-  supportedCPUTypes?: DeviceCtlCpuType[];
-  supportedDeviceFamilies?: number[];
-  thinningProductType?: string;
-  udid?: string;
-};
-
-type DeviceCtlDeviceCapability = {
-  name: string;
-  featureIdentifier: string;
-};
-
-export async function listDevices(vscodeContext: vscode.ExtensionContext): Promise<DeviceCtlListCommandOutput> {
+export async function listDevicesJson(vscodeContext: vscode.ExtensionContext): Promise<string> {
   await using tmpPath = await tempFilePath(vscodeContext, {
     prefix: "devices",
   });
@@ -90,26 +55,19 @@ export async function listDevices(vscodeContext: vscode.ExtensionContext): Promi
   });
   commonLogger.debug("Stdout devicectl list devices", { stdout: devicesStdout });
 
-  return await readJsonFile<DeviceCtlListCommandOutput>(tmpPath.path);
+  return await readTextFile(tmpPath.path);
 }
 
-export type DeviceCtlProcessResult = {
-  result: {
-    runningProcesses: DeviceCtlProcess[];
-  };
-};
-
-export type DeviceCtlProcess = {
-  executable?: string; // Ex: file:///private/var/containers/Bundle/Application/183E1862-A6F2-4060-AEEF-16F61C88F91E/terminal23.app/terminal23
-  processIdentifier: number; // Ex: 1234
-};
-
-export async function getRunningProcesses(
+/**
+ * Run "devicectl device info processes" on a device and return the JSON it wrote, for
+ * the addon's "devicectlAppProcesses" to read.
+ */
+export async function getRunningProcessesJson(
   vscodeContext: vscode.ExtensionContext,
   options: {
     deviceId: string;
   },
-): Promise<DeviceCtlProcessResult> {
+): Promise<string> {
   await using tmpPath = await tempFilePath(vscodeContext, {
     prefix: "processes",
   });
@@ -120,7 +78,7 @@ export async function getRunningProcesses(
     cwd: null,
   });
 
-  return await readJsonFile<DeviceCtlProcessResult>(tmpPath.path);
+  return await readTextFile(tmpPath.path);
 }
 
 export async function pairDevice(options: { deviceId: string }): Promise<void> {

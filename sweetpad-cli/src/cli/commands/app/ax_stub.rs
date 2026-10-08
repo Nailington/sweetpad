@@ -46,10 +46,10 @@ pub fn permission_error() -> CliError {
 pub fn snapshot(_pid: i32, _depth: usize) -> Result<Node, CliError> {
     Err(unsupported())
 }
-pub fn find<'a>(_root: &'a Node, _query: &Query) -> Result<&'a Node, String> {
+pub fn find<'a>(_root: &'a Node, _query: &Query, _tree: &str) -> Result<&'a Node, String> {
     Err("accessibility requires macOS".into())
 }
-pub fn act(_pid: i32, _target: &Node, _action: &Act<'_>) -> Result<(), CliError> {
+pub fn act(_pid: i32, _target: &Node, _action: &Act<'_>, _tree: &str) -> Result<(), CliError> {
     Err(unsupported())
 }
 pub fn outline(_root: &Node) -> Vec<String> {

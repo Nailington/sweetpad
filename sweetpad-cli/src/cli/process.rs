@@ -2,9 +2,14 @@
 //! app). Two modes: [`capture`] for commands whose stdout we parse (e.g.
 //! `simctl list --json`), and [`stream`] for long-running commands whose output
 //! belongs on the user's terminal live (e.g. `xcodebuild`).
+//!
+//! A build tool that runs and is reaped here removes the Swift driver's
+//! directories it left in `$TMPDIR` ([`TmpdirLeftovers`]).
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+
+use sweetpad_core::scratch::TmpdirLeftovers;
 
 use crate::cli::{CliError, ErrorKind};
 
@@ -30,7 +35,9 @@ pub fn capture_env(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    let leftovers = TmpdirLeftovers::before(&cmd);
     let output = cmd.output().map_err(|e| spawn_error(program, &e))?;
+    drop(leftovers);
     if !output.status.success() {
         return Err(CliError::new(format!(
             "{program} {} exited with {}",
@@ -80,7 +87,9 @@ pub fn run_captured(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    let leftovers = TmpdirLeftovers::before(&cmd);
     let output = cmd.output().map_err(|e| spawn_error(program, &e))?;
+    drop(leftovers);
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr_text = String::from_utf8_lossy(&output.stderr);
     // Keep the streams line-separated: without this, a stdout that doesn't
@@ -119,7 +128,9 @@ pub fn stream_env(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    let leftovers = TmpdirLeftovers::before(&cmd);
     let status = cmd.status().map_err(|e| spawn_error(program, &e))?;
+    drop(leftovers);
     if status.success() {
         Ok(())
     } else {
@@ -151,8 +162,43 @@ pub fn run(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    let leftovers = TmpdirLeftovers::before(&cmd);
     let status = cmd.status().map_err(|e| spawn_error(program, &e))?;
+    drop(leftovers);
     Ok(status.success())
+}
+
+/// Run a command with every stream detached, killing it once `limit` has
+/// passed. `Ok(None)` means it was killed; otherwise whether it succeeded. For
+/// a tool that waits on something outside this machine (a device over Wi-Fi)
+/// and has its own timeout, as the backstop behind it.
+pub fn run_quiet_within(
+    program: &str,
+    args: &[&str],
+    limit: std::time::Duration,
+) -> Result<Option<bool>, CliError> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| spawn_error(program, &e))?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| CliError::new(format!("failed to wait for '{program}': {e}")))?
+        {
+            return Ok(Some(status.success()));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Run a command, invoking `on_line` for each line of output as it arrives.
@@ -175,6 +221,7 @@ pub fn stream_lines(
     }
     let (reader, out, err) = merged_output_pipe(program)?;
     cmd.stdout(out).stderr(err);
+    let leftovers = TmpdirLeftovers::before(&cmd);
     let mut child = cmd.spawn().map_err(|e| spawn_error(program, &e))?;
     // `spawn` only borrows fds > 2, so `cmd` still owns the pipe's two write
     // ends — drop it now or the read below never sees EOF after the child
@@ -187,6 +234,7 @@ pub fn stream_lines(
     read_lines_lossy(reader, &mut on_line);
     crate::cli::signals::unregister_child(reap_slot);
     let status = child.wait().map_err(|e| spawn_error(program, &e))?;
+    drop(leftovers);
     Ok(status.success())
 }
 
@@ -204,7 +252,7 @@ fn merged_output_pipe(program: &str) -> Result<(std::fs::File, Stdio, Stdio), Cl
     unsafe {
         if libc::pipe(fds.as_mut_ptr()) != 0 {
             return Err(CliError::new(format!(
-                "failed to run `{program}`: {}",
+                "failed to run '{program}': {}",
                 std::io::Error::last_os_error()
             )));
         }
@@ -213,7 +261,7 @@ fn merged_output_pipe(program: &str) -> Result<(std::fs::File, Stdio, Stdio), Cl
             let e = std::io::Error::last_os_error();
             libc::close(fds[0]);
             libc::close(fds[1]);
-            return Err(CliError::new(format!("failed to run `{program}`: {e}")));
+            return Err(CliError::new(format!("failed to run '{program}': {e}")));
         }
         // CLOEXEC on all three (macOS has no pipe2): a child spawned
         // concurrently on another thread (BgBoot, the hot-reload watcher)
@@ -288,9 +336,9 @@ pub(crate) fn read_lines_lossy(reader: impl std::io::Read, mut on_line: &mut imp
 }
 
 /// Spawn a long-running command in the background with stdout **piped** for the
-/// caller to read/format on its own thread (stderr inherited, stdin null). Used
-/// by the `app run` session to render the simulator log stream while the keypress
-/// loop runs; stdin is null so the child never competes for the terminal's keys.
+/// caller to read/format on its own thread (stderr inherited, stdin null, so the
+/// child never competes for the terminal's keys). A child that only ever gets a
+/// forwarded SIGINT uses [`spawn_piped_forwarded`] instead.
 pub fn spawn_piped(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<Child, CliError> {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -301,6 +349,38 @@ pub fn spawn_piped(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<C
         cmd.current_dir(dir);
     }
     cmd.spawn().map_err(|e| spawn_error(program, &e))
+}
+
+/// [`spawn_piped`] for a child the signal handler's forward-only mode
+/// ([`crate::cli::signals::set_forward_child`]) ends with a SIGINT, such as the
+/// log follow's `log stream`; see [`default_sigint`].
+pub fn spawn_piped_forwarded(program: &str, args: &[&str]) -> Result<Child, CliError> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    default_sigint(&mut cmd);
+    cmd.spawn().map_err(|e| spawn_error(program, &e))
+}
+
+/// Start the child with SIGINT at its default disposition, so the one SIGINT
+/// forward-only mode sends it is delivered. The CLI honors an inherited
+/// `SIG_IGN` for itself (a background job of a script starts that way), and a
+/// child left to inherit it too drops the forwarded signal until it installs a
+/// handler of its own: `simctl spawn … log stream` takes seconds to get there
+/// on a loaded machine, and a SIGTERM landing in that window leaves the CLI
+/// waiting on a stream that never ends.
+fn default_sigint(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // Safety: signal(2) is async-signal-safe and touches no shared state; this
+    // closure runs in the forked child before `exec`.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
 }
 
 /// Like [`spawn_piped`], but with **stderr also piped** so the caller can drain and
@@ -338,12 +418,13 @@ pub fn spawn_piped_both_env(
 /// returned reader — see [`stream_lines`] for why) and placed in its **own
 /// process group**, so a supervisor can signal just this process tree — e.g.
 /// forward Ctrl-C to an interruptible build without taking down the parent.
-/// stdin is null so it never competes for the terminal's keys.
+/// stdin is null so it never competes for the terminal's keys. The caller
+/// drops the returned [`TmpdirLeftovers`] once it has reaped the child.
 pub fn spawn_piped_group(
     program: &str,
     args: &[&str],
     cwd: Option<&Path>,
-) -> Result<(Child, std::fs::File), CliError> {
+) -> Result<(Child, std::fs::File, TmpdirLeftovers), CliError> {
     use std::os::unix::process::CommandExt;
 
     let mut cmd = Command::new(program);
@@ -356,8 +437,9 @@ pub fn spawn_piped_group(
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    let leftovers = TmpdirLeftovers::before(&cmd);
     let child = cmd.spawn().map_err(|e| spawn_error(program, &e))?;
-    Ok((child, reader))
+    Ok((child, reader, leftovers))
 }
 
 /// Spawn a command with **inherited** stdio in its **own process group**: the
@@ -376,6 +458,7 @@ pub fn spawn_group_inherit(
 
     let mut cmd = Command::new(program);
     cmd.args(args).stdin(Stdio::null()).process_group(0);
+    default_sigint(&mut cmd);
     if quiet_stdout {
         cmd.stdout(Stdio::null());
     }
@@ -385,7 +468,9 @@ pub fn spawn_group_inherit(
     cmd.spawn().map_err(|e| spawn_error(program, &e))
 }
 
-fn spawn_error(program: &str, e: &std::io::Error) -> CliError {
+/// The error for a `program` that could not be spawned. A missing tool names
+/// what provides it.
+pub(crate) fn spawn_error(program: &str, e: &std::io::Error) -> CliError {
     if e.kind() == std::io::ErrorKind::NotFound {
         let hint = match program {
             "xcrun" | "xcodebuild" | "xcode-select" | "swift" | "simctl" => {
@@ -394,8 +479,8 @@ fn spawn_error(program: &str, e: &std::io::Error) -> CliError {
             "brew" => " (install Homebrew from https://brew.sh)",
             _ => "",
         };
-        CliError::new(format!("`{program}` not found on PATH{hint}")).kind(ErrorKind::ToolMissing)
+        CliError::new(format!("'{program}' not found on PATH{hint}")).kind(ErrorKind::ToolMissing)
     } else {
-        CliError::new(format!("failed to run `{program}`: {e}"))
+        CliError::new(format!("failed to run '{program}': {e}"))
     }
 }

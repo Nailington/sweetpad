@@ -10,8 +10,8 @@ live, and they exist because they answer different questions:
 
 - **`sweetpad.toml`**, committed next to your project: *what does this project need?* Everyone who
   clones the repo gets it.
-- **`~/.config/sweetpad/config.toml`**, yours alone: *what do I prefer?* SweetPad never writes this
-  file.
+- **`~/.config/sweetpad/config.toml`**, yours alone: *what do I prefer?* SweetPad writes only its
+  `[feedback]` table there, and only when you run `sweetpad feedback off` or `on`.
 - **Remembered context**, managed for you: *what did I pick last time?* This is where the answers to
   interactive prompts go.
 
@@ -46,7 +46,7 @@ The top level takes the same targeting values as the flags:
 | `configuration` | Default build configuration.                                        |
 | `destination`   | Default destination, as a raw specifier.                            |
 | `sdk`           | SDK override. Rarely needed, since the destination usually implies it.   |
-| `developer_dir` | Pin the Xcode this project builds with.                             |
+| `developer_dir` | Pin the Xcode this project uses, for builds and manifest reads.     |
 | `workspace`     | Name the `.xcworkspace`, relative to this file. See below.          |
 | `project`       | Name the `.xcodeproj`, relative to this file. See below.            |
 | `generator`     | Declare the project as [generated](./generated-projects.md), e.g. `"xcodegen"`. |
@@ -102,14 +102,43 @@ dotfile directories), so a layout like `ios/App.xcodeproj` works with no setup. 
 when two projects sit at the same depth. SweetPad reports that as an error listing both rather than
 guessing, and this is how you settle it.
 
+### Test-only flags
+
+`[xcodebuild] args` reaches every command that runs `xcodebuild`, but some flags only work when
+testing. `xcodebuild build`, `archive`, and `clean` fail on `-enableCodeCoverage`, `-testPlan`,
+`-testLanguage`, `-testRegion`, and `-testProductsPath`. SweetPad leaves these out of every command
+except `sweetpad test` and `sweetpad test build`, so you can keep them in the file:
+
+```toml
+[xcodebuild]
+args = ["-skipMacroValidation", "-testPlan", "CI"]   # -testPlan reaches only the test runs
+```
+
+`-resultStreamPath` needs a result bundle to stream into, so it stays out of `sweetpad clean` and out
+of `sweetpad archive` unless you pass `-resultBundlePath` after `--`. Run with `-v` to see each flag a
+command left out.
+
+The rest of the testing flags, such as `-test-iterations` and `-parallel-testing-enabled`, work with
+every action and reach every command. Flags you type after `--` are never left out.
+
 ### Arguments SweetPad won't let you put here
 
 `[xcodebuild] args` refuses the arguments SweetPad settles itself, naming the key to use instead:
-`-scheme`, `-configuration`, `-destination`, `-sdk`, `-workspace`, `-project`, and `-resultBundlePath`.
+`-scheme`, `-configuration`, `-destination`, `-sdk`, `-workspace`, and `-project`.
 
-`-derivedDataPath` is refused too, for a subtler reason: a relative value in a committed file would
-resolve against the working directory rather than the file, so it would mean a different place
-depending on where the command ran. Pass that one per command.
+It also refuses the paths SweetPad names for itself. `sweetpad test` writes and reads back its own
+`-resultBundlePath`, so name one per run with `sweetpad test --result-bundle`, or pass it after `--`
+on a build. `sweetpad archive` names its own `-archivePath`, `-exportPath`, and `-exportOptionsPlist`,
+so use `--output-file` and `--export-options` instead.
+
+`-enableCodeCoverage` and `-test-iterations` can stay in the file. When you pass `--coverage` or
+`--retry-flaky` to `sweetpad test`, the flag replaces the file's copy, and `-v` says so.
+
+`-derivedDataPath` is refused too. Only the builds, `sweetpad clean`, and the `app` commands would
+follow it, while `sweetpad clean --purge`, `sweetpad derived-data`, and the editor's index would keep
+using the DerivedData location Xcode's settings name. A relative value would also resolve against the project's directory, where SweetPad runs
+`xcodebuild`, and not against this file the way `project` does. Pass that one per command, after
+`--` on the build and as `--derived-data-path` on `app launch`.
 
 Swift packages ignore the table entirely: they build with `swift build`, which knows none of
 xcodebuild's flags.
@@ -124,8 +153,10 @@ settings in an xcconfig unless you specifically want them only when building thr
 
 ## Your personal config
 
-`~/.config/sweetpad/config.toml` holds your own preferences, and it's never written to by SweetPad.
-It's a file you own. It honors `XDG_CONFIG_HOME` if you set one.
+`~/.config/sweetpad/config.toml` holds your own preferences. It's a file you own, and it honors
+`XDG_CONFIG_HOME` if you set one. SweetPad writes to it in one case: `sweetpad feedback off` sets
+`enabled = false` under `[feedback]` (see [Feedback reports](./feedback.md)), and `sweetpad feedback on`
+sets it back. Both change only that key and keep the rest of the file, comments included.
 
 It has a `[defaults]` table for values that apply everywhere, plus per-project tables:
 
@@ -214,7 +245,7 @@ this is the one part of the config system that's deliberately noisy.
 | Path                                   | What                                              |
 | -------------------------------------- | ------------------------------------------------- |
 | `sweetpad.toml`                        | Project defaults. Committed, hand-authored.       |
-| `~/.config/sweetpad/config.toml`       | Your defaults. Hand-authored, never written to.   |
+| `~/.config/sweetpad/config.toml`       | Your defaults. Hand-authored; `sweetpad feedback off` sets one key. |
 | `~/.local/state/sweetpad/state.toml`   | Remembered context. Managed; use `sweetpad context`. |
 
 `sweetpad open config` opens your personal config in your editor, and `sweetpad help config` has this

@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { ensureDir, getProjectStateDir } from "../cli-server/paths";
 import { registerBspConfig } from "../cli-server/registry";
 import { getWorkspaceConfig } from "../common/config";
-import { isFileExists } from "../common/files";
+import { isFileExists, readJsonFile } from "../common/files";
 import { getBspConfigFile, getBspLogPath, getBspSocketPath } from "./paths";
 
 /**
@@ -22,11 +22,28 @@ export type BspResolvedConfig = {
   developerDir: string | null;
   scheme: string | null;
   configuration: string;
+  /**
+   * The platform of the destination builds go to (`iphonesimulator`, `watchos`, …), or null when
+   * none is selected. A target that builds for this platform is analyzed for it, and a file that
+   * several targets compile is read as the target the selected scheme builds, then as the one for
+   * this platform.
+   */
+  destinationPlatform: string | null;
+  /**
+   * The DerivedData the extension's builds write (`prepareDerivedDataPath`), which follows a
+   * `-derivedDataPath` in `buildArgs`. The server reads it once at startup.
+   */
   derivedDataPath: string | null;
   /** Debug log file. Defaults to the per-project state dir (out of the project tree); overridable via `sweetpad.buildServer.logPath`. */
   logPath: string;
   /** Unix socket the BSP server binds for telemetry; the extension connects to it for live logs/status. */
   socket: string;
+  /**
+   * `sweetpad.build.args`, which the extension's builds add to the xcodebuild command line. The
+   * server applies its `KEY=VALUE` settings and `-xcconfig` (relative to `workspacePath`, where
+   * those builds run) so the index resolves each target the way they build it.
+   */
+  buildArgs: string[];
 };
 
 /**
@@ -39,7 +56,9 @@ export function assembleBspConfig(parts: {
   developerDir: string | null;
   scheme: string | null;
   configuration: string;
+  destinationPlatform: string | null;
   derivedDataPath: string | null;
+  buildArgs: string[];
 }): BspResolvedConfig {
   return {
     workspacePath: parts.workspacePath,
@@ -47,9 +66,11 @@ export function assembleBspConfig(parts: {
     developerDir: parts.developerDir,
     scheme: parts.scheme,
     configuration: parts.configuration,
+    destinationPlatform: parts.destinationPlatform,
     derivedDataPath: parts.derivedDataPath,
     logPath: resolveBspLogPath(parts.workspacePath),
     socket: getBspSocketPath(parts.workspacePath),
+    buildArgs: parts.buildArgs,
   };
 }
 
@@ -81,6 +102,15 @@ export async function writeBspConfig(config: BspResolvedConfig): Promise<string>
 
 export async function hasBspConfig(workspacePath: string): Promise<boolean> {
   return await isFileExists(getBspConfigFile(workspacePath));
+}
+
+/** The `bsp.json` on disk for `workspacePath`, or `undefined` when there is none to read. */
+export async function readBspConfig(workspacePath: string): Promise<Partial<BspResolvedConfig> | undefined> {
+  try {
+    return await readJsonFile<Partial<BspResolvedConfig>>(getBspConfigFile(workspacePath));
+  } catch {
+    return undefined;
+  }
 }
 
 /**

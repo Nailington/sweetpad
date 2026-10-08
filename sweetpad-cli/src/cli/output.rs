@@ -122,6 +122,25 @@ impl Output {
         !self.json && !self.ndjson && !self.non_interactive && std::io::stderr().is_terminal()
     }
 
+    /// Whether stdout and stderr are the same file: one terminal, or one
+    /// capture behind a `2>&1`. A line streamed to stdout then sits just
+    /// above an error printed after it on stderr, so the error need not
+    /// repeat it. With `2>err.log`, or stdout piped elsewhere, they part.
+    #[must_use]
+    pub fn streams_share_a_file() -> bool {
+        use std::os::fd::{AsFd, BorrowedFd};
+        use std::os::unix::fs::MetadataExt;
+
+        let identity = |fd: BorrowedFd<'_>| {
+            let meta = std::fs::File::from(fd.try_clone_to_owned().ok()?)
+                .metadata()
+                .ok()?;
+            Some((meta.dev(), meta.ino()))
+        };
+        let stdout = identity(std::io::stdout().as_fd());
+        stdout.is_some() && stdout == identity(std::io::stderr().as_fd())
+    }
+
     /// True when `-v`/`--verbose` was passed — surfaces raw/extra output.
     #[must_use]
     pub fn is_verbose(&self) -> bool {
@@ -252,7 +271,9 @@ impl Output {
     /// with the operation [`headline`](CliError::headline) in bold; any
     /// underlying [`detail`](CliError::detail) follows on the next line, dimmed
     /// and indented two spaces — so "what we were doing" reads at a glance and
-    /// the raw tool output sits quietly beneath it.
+    /// the raw tool output sits quietly beneath it. A failure the terminal
+    /// already shows ([`CliError::shown`]) prints nothing in human mode but
+    /// its [`tip`](CliError::tip), which closes the output either way.
     pub fn error(&self, err: &CliError) {
         if self.json || self.ndjson {
             let payload = serde_json::json!({
@@ -265,20 +286,25 @@ impl Output {
             }
             return;
         }
-        let prefix = if self.color_stderr {
-            "\x1b[31merror:\x1b[0m"
-        } else {
-            "error:"
-        };
         let stderr = std::io::stderr();
-        match err.headline() {
-            Some(headline) => {
-                let _ = writeln!(&stderr, "{prefix} {}", self.bold(headline));
-                let _ = writeln!(&stderr, "  {}", self.dim(err.detail()));
+        if !err.is_shown() {
+            let prefix = if self.color_stderr {
+                "\x1b[31merror:\x1b[0m"
+            } else {
+                "error:"
+            };
+            match err.headline() {
+                Some(headline) => {
+                    let _ = writeln!(&stderr, "{prefix} {}", self.bold(headline));
+                    let _ = writeln!(&stderr, "  {}", self.dim(err.detail()));
+                }
+                None => {
+                    let _ = writeln!(&stderr, "{prefix} {}", err.detail());
+                }
             }
-            None => {
-                let _ = writeln!(&stderr, "{prefix} {}", err.detail());
-            }
+        }
+        if let Some(tip) = err.tip_text() {
+            let _ = writeln!(&stderr, "tip: {tip}");
         }
     }
 

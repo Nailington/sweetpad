@@ -1,7 +1,8 @@
 //! `sweetpad clean` — remove build artifacts: `xcodebuild clean` for the
-//! resolved scheme (or `swift package clean` for a package), with `--purge`
-//! also deleting the project's DerivedData folder(s). The standalone
-//! counterpart of `build --clean`, so a clean no longer requires a rebuild.
+//! resolved scheme with the project's `[xcodebuild] args` (or `swift package
+//! clean` for a package), with `--purge` also deleting the project's
+//! DerivedData folder(s). The standalone counterpart of `build --clean`, so a
+//! clean needs no rebuild.
 
 use crate::cli::output::Output;
 use crate::cli::resolve::{self, Container};
@@ -18,20 +19,26 @@ pub struct CleanArgs {
     pub scheme: crate::cli::SchemeArgs,
 
     /// Build configuration whose products to clean (e.g. Debug, Release).
-    #[arg(long, env = "SWEETPAD_CONFIGURATION")]
+    #[arg(
+        long,
+        env = "SWEETPAD_CONFIGURATION",
+        help_heading = crate::cli::TARGET_SELECTION
+    )]
     pub configuration: Option<String>,
 
-    /// Also delete this project's DerivedData folder(s). The flag itself is
-    /// the consent — it only ever touches this project's folders, unlike the
-    /// store-wide 'derived-data purge' (which prompts).
+    /// Also delete this project's DerivedData folder(s), without a prompt:
+    /// the flag is the consent. 'derived-data purge' deletes the same folders,
+    /// or every project's with '--all', and asks first unless given '--yes'.
     #[arg(long)]
     pub purge: bool,
 }
 
-/// The clean outcome: what was cleaned, and any DerivedData folders purged.
+/// The clean outcome: what was cleaned, any DerivedData folders purged, and
+/// the note naming the same-named folders `--purge` kept.
 struct CleanReport {
     cleaned: &'static str,
     purged: Vec<String>,
+    others_note: Option<String>,
 }
 
 impl Render for CleanReport {
@@ -39,6 +46,9 @@ impl Render for CleanReport {
         out.note(&format!("cleaned ({})", self.cleaned));
         for p in &self.purged {
             out.note(&format!("purged {p}"));
+        }
+        if let Some(note) = &self.others_note {
+            out.note(note);
         }
     }
 
@@ -48,6 +58,28 @@ impl Render for CleanReport {
             "purged": self.purged,
         })
     }
+}
+
+/// The `xcodebuild clean` argv for a scheme and configuration. The project's
+/// `[xcodebuild] args` place the products (a `SYMROOT=`, an `-xcconfig`), so
+/// the clean takes them to reach where the build wrote, without the flags
+/// `xcodebuild clean` fails on ([`xcodebuild::for_action`]).
+fn xcodebuild_clean_args(
+    ctx: &Context,
+    container: &Container,
+    scheme: String,
+    configuration: String,
+) -> Result<Vec<String>, CliError> {
+    let mut args: Vec<String> = vec![
+        "clean".into(),
+        "-scheme".into(),
+        scheme,
+        "-configuration".into(),
+        configuration,
+    ];
+    args.extend(xcodebuild::container_args(container));
+    args.extend(ctx.xcodebuild_args(xcodebuild::Action::Clean, &[])?);
+    Ok(args)
 }
 
 pub fn run(ctx: &mut Context, purge: bool) -> CommandResult {
@@ -60,13 +92,13 @@ pub fn run(ctx: &mut Context, purge: bool) -> CommandResult {
             // for its own inapplicable flags).
             if ctx.targeting.scheme.is_some() {
                 return Err(CliError::new(
-                    "--scheme doesn't apply to a Swift package; `swift package clean` cleans \
+                    "--scheme doesn't apply to a Swift package; 'swift package clean' cleans \
                      the whole package",
                 ));
             }
             if ctx.targeting.configuration.is_some() {
                 return Err(CliError::new(
-                    "--configuration doesn't apply to a Swift package; `swift package clean` \
+                    "--configuration doesn't apply to a Swift package; 'swift package clean' \
                      removes every configuration's products",
                 ));
             }
@@ -93,15 +125,7 @@ pub fn run(ctx: &mut Context, purge: bool) -> CommandResult {
             let schemes = resolve::schemes(&resolved.container)?;
             let scheme = resolve::settle_scheme(ctx, &mut resolved, &schemes, true)?;
             let configuration = resolve::settle_configuration(ctx, &mut resolved, true)?;
-
-            let mut args: Vec<String> = vec![
-                "clean".into(),
-                "-scheme".into(),
-                scheme,
-                "-configuration".into(),
-                configuration,
-            ];
-            args.extend(xcodebuild::container_args(&resolved.container));
+            let args = xcodebuild_clean_args(ctx, &resolved.container, scheme, configuration)?;
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let cwd = xcodebuild::working_dir(&resolved.container);
             let ok = if ctx.out.is_json() || ctx.out.is_ndjson() {
@@ -134,8 +158,10 @@ pub fn run(ctx: &mut Context, purge: bool) -> CommandResult {
     };
 
     // `--purge` is explicit consent on the command line — it deletes only this
-    // project's DerivedData folder(s), never the whole store.
+    // project's DerivedData folder(s), never the whole store, and never the
+    // folder another checkout of the same project wrote.
     let mut purged = Vec::new();
+    let mut others_note = None;
     if purge {
         // A Swift package builds into `.build/` beside `Package.swift`, not
         // DerivedData — purging only the DerivedData store would report
@@ -151,12 +177,18 @@ pub fn run(ctx: &mut Context, purge: bool) -> CommandResult {
                 purged.push(build_dir.display().to_string());
             }
         }
-        for path in super::derived_data::project_paths(ctx)? {
-            std::fs::remove_dir_all(&path)
+        let scope = super::derived_data::project_scope(ctx)?;
+        for path in &scope.own {
+            std::fs::remove_dir_all(path)
                 .map_err(|e| CliError::new(format!("failed to remove {}: {e}", path.display())))?;
             purged.push(path.display().to_string());
         }
+        others_note = scope.others_note("kept");
     }
 
-    Ok(Rendered::data(CleanReport { cleaned, purged }))
+    Ok(Rendered::data(CleanReport {
+        cleaned,
+        purged,
+        others_note,
+    }))
 }

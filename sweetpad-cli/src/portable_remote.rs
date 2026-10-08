@@ -119,7 +119,7 @@ impl Registry {
             });
         }
         Err(format!(
-            "no saved Mac named {name:?}; run `sweetpad remote list`"
+            "no saved Mac named {name:?}; run 'sweetpad remote list'"
         ))
     }
 }
@@ -1723,7 +1723,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     } else if parsed.remote.is_some() {
         execute(&parsed.forwarded, &parsed)
     } else {
-        Err("this Windows build runs Xcode commands on a Mac; use --remote MAC or `sweetpad remote add`".into())
+        Err("this Windows build runs Xcode commands on a Mac; use --remote MAC or 'sweetpad remote add'".into())
     };
     match result {
         Ok(code) => ExitCode::from(code),

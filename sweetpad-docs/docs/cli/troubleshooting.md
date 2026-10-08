@@ -59,8 +59,14 @@ sweetpad clean            # xcodebuild clean
 sweetpad clean --purge    # and delete this project's DerivedData
 ```
 
-`--purge` is scoped to the current project and doesn't prompt; the flag itself is the consent. For the
-whole store there's a separate group, which does prompt:
+`sweetpad clean` passes `sweetpad.toml`'s `[xcodebuild] args` to `xcodebuild clean`, so a `SYMROOT=` or
+an `-xcconfig` there sends the clean to where the build wrote. It leaves out the flags that
+`xcodebuild clean` refuses, such as `-enableCodeCoverage` and `-testPlan`.
+
+`--purge` is scoped to the current project and doesn't prompt; the flag itself is the consent. The
+scope is this copy of the project. Another clone or worktree writes its own DerivedData folder with the
+same name prefix, and `--purge` leaves that folder alone and says how many it kept. For the whole store
+there's a separate group, which does prompt:
 
 ```bash
 sweetpad derived-data size     # how much is it costing you?
@@ -117,19 +123,68 @@ It checks each link in the chain and says which one broke. The usual causes are 
 missing a required field, which sourcekit-lsp skips silently, or absolute paths in it
 that went stale when the checkout moved. [Editor autocomplete](./autocomplete.md) covers both.
 
+## The editor's debugger doesn't start
+
+```bash
+sweetpad dap doctor
+```
+
+It checks that Xcode's lldb-dap resolves and answers. Set `SWEETPAD_DAP_LOG` to a file path to record
+everything the editor and the debugger send each other. [Editor debugging](./editor-debugging.md#when-it-doesnt-start)
+has more.
+
 ## A device build hangs looking for a destination
 
 A connected iPhone has to be unlocked, trusted, and in Developer Mode before xcodebuild can reach it.
-`sweetpad device list` reports the connection state:
+When it can't reach it, the build waits about a minute and then fails. The error includes the reason
+xcodebuild gave for that device, followed by the command that checks the device:
 
 ```console
-$ sweetpad device list
-Iphone 13 (iPhone 13, iOS 26.6)  [disconnected]
-    00008110-000559182E90401E
+$ sweetpad build --on "Iphone 13"
+error: xcodebuild: Timed out waiting for all destinations matching the provided destination specifier to become available
+  Destinations compatible with the "MyApp" scheme:
+    { platform:iOS, arch:arm64, id:00008110-000559182E90401E, name:Iphone 13, error:Iphone 13 needs to be unlocked to enable development services Please unlock the device. }
+✗ Build failed
+tip: run 'sweetpad device info 00008110-000559182E90401E' to see why the device isn't ready
 ```
 
-Device builds also need signing settings that a simulator build doesn't. See
+Under `-o json` the same suggestion is in the error's `tip` field.
+
+To check a device before spending a build on it, run `sweetpad device info`. It connects to the
+device, checks pairing, Developer Mode, and the lock, and says what to fix first:
+
+```console
+$ sweetpad device info "Iphone 13"
+…
+not ready: Iphone 13 is locked; unlock it so Xcode can start its development services
+```
+
+[Checking that a device is ready](./destinations.md#checking-that-a-device-is-ready) shows the full
+report. Device builds also need signing settings that a simulator build doesn't. See
 [Destinations and devices](./destinations.md#physical-devices).
+
+## A simulator run stalls at "Launching app"
+
+A simulator can get wedged: it stays booted, but an install, launch, or terminate sent to it never
+comes back. SweetPad gives each of those steps two minutes. If one takes longer, the command fails
+with exit code 1, names the step, and prints the commands that restart the simulator:
+
+```console
+$ sweetpad run --no-logs --on "iPhone 17"
+▶ MyApp · Debug · iPhone 17
+✓ Build succeeded (1.6s)
+error: launching the app on the simulator
+  'xcrun simctl launch' didn't finish within 120s, so the simulator looks stuck
+tip: restart the simulator with 'sweetpad simulator shutdown F13C004A-…' and 'sweetpad simulator boot F13C004A-…', then run the command again
+```
+
+Under `-o json` the restart commands are in the error's `tip` field.
+
+The interactive `sweetpad run` session has the same limits. It gives the launch two minutes to start
+the app, and gives the stop two minutes when you press `r` or `q`. If either step times out, the
+session prints the same error and tip. After a failed launch the session stays open, so you can
+restart the simulator and press `r`. If the stop fails when you press `q`, the app may still be
+running, so the session says that and exits with code 1 instead of 0.
 
 ## I need to see what xcodebuild actually said
 
@@ -154,7 +209,7 @@ disk rather than repeating the work.
 | 3    | The build or the tests failed.                                             |
 | 4    | Couldn't resolve a target: unknown scheme, destination, simulator, device. |
 | 5    | A required tool is missing.                                                |
-| 6    | Cancelled: a declined prompt, or Ctrl-C.                                   |
+| 6    | Cancelled: a declined prompt, or Ctrl-C while `sweetpad run` is building.  |
 
 The pair worth learning is 3 and 4: code 3 means your code is broken, code 4 means the invocation is.
 [Scripts and CI](./scripts-and-ci.md#exit-codes) has the rest.

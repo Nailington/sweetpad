@@ -8,19 +8,22 @@
 //! Schemes are the link between "I want to do X with this app" (run, test,
 //! profile, archive) and "these are the targets that need resolving."
 //! [`crate::build_context::BuildContext::plan_build`] consumes one of these
-//! to produce a `Vec<ResolveQuery>`.
+//! to produce a `Vec<ResolveQuery>`. [`Scheme::launch_settings`] turns the
+//! Run action's arguments, environment and app language into what the app is
+//! launched with.
 //!
 //! What's NOT modeled (yet, deliberately): pre/post actions, test plans,
 //! custom working directory, debugger / launcher identifiers. Add these
 //! incrementally as concrete callers need them — see DOCS.md §3.2 "minimum
 //! abstraction."
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::resolver::expand_one;
 use crate::xcscheme::{self, Element};
 
 #[derive(Debug, Clone)]
@@ -54,8 +57,14 @@ pub struct Scheme {
     pub archive_configuration: Option<String>,
     /// `AnalyzeAction.buildConfiguration`.
     pub analyze_configuration: Option<String>,
-    /// `LaunchAction.CommandLineArguments`, in scheme order. The caller
-    /// filters by `is_enabled` and applies Xcode's whitespace-splitting.
+    /// `LaunchAction.MacroExpansion` — the target whose build settings expand
+    /// `$(VAR)` in the launch arguments and environment (the scheme editor's
+    /// "Expand Variables Based On"). `None` when absent, and then Xcode uses
+    /// [`Self::launch_target`]; [`Self::launch_expansion_target`] applies
+    /// that fallback.
+    pub launch_macro_expansion: Option<BuildableRef>,
+    /// `LaunchAction.CommandLineArguments`, in scheme order, disabled rows
+    /// included. [`Self::launch_settings`] turns them into process arguments.
     pub launch_arguments: Vec<CommandLineArgument>,
     /// `LaunchAction.EnvironmentVariables`, in scheme order.
     pub launch_environment_variables: Vec<EnvironmentVariable>,
@@ -163,7 +172,9 @@ pub struct BuildableRef {
 /// A `<CommandLineArgument>` under `LaunchAction.CommandLineArguments`.
 #[derive(Debug, Clone)]
 pub struct CommandLineArgument {
-    /// The raw argument string. Xcode splits it on whitespace at launch.
+    /// The raw argument string. At launch Xcode expands the build settings
+    /// it references, then splits it into words with shell-style quoting
+    /// ([`split_launch_argument`]).
     pub argument: String,
     /// `isEnabled="NO"` unchecks the row; an absent attribute is enabled.
     pub is_enabled: bool,
@@ -174,7 +185,8 @@ pub struct CommandLineArgument {
 pub struct EnvironmentVariable {
     pub key: String,
     /// `None` when the `value` attribute is absent (distinct from empty `""`);
-    /// Xcode writes value-less rows for widget-preview placeholders.
+    /// Xcode writes value-less rows for widget-preview placeholders, and
+    /// launches with such a variable set to the empty string.
     pub value: Option<String>,
     /// `isEnabled="NO"` unchecks the row; an absent attribute is enabled.
     pub is_enabled: bool,
@@ -228,18 +240,20 @@ pub fn parse_file(path: &Path) -> Result<Scheme, Error> {
     from_element(&root)
 }
 
-/// The login user whose `xcuserdata` Xcode would consult, or `None` when the
-/// process has no usable identity (then we fall back to scanning every user's
-/// directory rather than seeing no per-user schemes at all).
+/// The login user whose `xcuserdata` Xcode would consult: the account's
+/// name from the user database, as `xcodebuild` reads it, whatever `$USER`
+/// says ([`crate::host::user`]). `None` when the process has no usable
+/// identity (then we fall back to scanning every user's directory rather
+/// than seeing no per-user schemes at all).
 fn detected_user() -> Option<String> {
-    std::env::var("USER").ok().filter(|u| !u.is_empty())
+    crate::host::user()
 }
 
 /// Test-only: a username whose `xcuserdata` directory is visible through the
-/// public scheme-discovery APIs on this host — the detected `$USER` when set,
-/// any fixed name otherwise (no identity → every user dir is scanned). Tests
-/// that create per-user scheme files use this so they pass both on developer
-/// machines (where `$USER` is set and scoping applies) and in bare containers.
+/// public scheme-discovery APIs on this host — the account's name when there
+/// is one, any fixed name otherwise (no identity → every user dir is
+/// scanned). Tests that create per-user scheme files use this so they pass
+/// both on developer machines (where scoping applies) and in bare containers.
 #[cfg(test)]
 pub(crate) fn visible_user() -> String {
     detected_user().unwrap_or_else(|| "tester".into())
@@ -250,8 +264,9 @@ pub(crate) fn visible_user() -> String {
 /// then the per-user `xcuserdata/<user>.xcuserdatad/xcschemes`. Xcode and
 /// xcodebuild only consult the *current* user's directory — a committed
 /// `xcuserdata/alice.xcuserdatad` scheme is invisible to bob — so we scope to
-/// `$USER` when the identity is known, and scan every user directory (sorted,
-/// for a stable order) only as a best-effort fallback when it isn't.
+/// the account's name when the identity is known, and scan every user
+/// directory (sorted, for a stable order) only as a best-effort fallback when
+/// it isn't.
 fn scheme_dirs(container: &Path) -> Vec<PathBuf> {
     scheme_dirs_for_user(container, detected_user().as_deref())
 }
@@ -353,6 +368,177 @@ pub fn find_scheme_file(container: &Path, name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// The targets the scheme files stored in a container point at, which decide
+/// the targets Xcode autocreates no scheme for.
+///
+/// Measured on Xcode 27.0 with `xcodebuild -list`: a target that runs (an
+/// app, a tool, an extension) loses its autocreated scheme once a scheme with
+/// another name runs it in its Launch or Profile action, and keeps it when
+/// that scheme only builds it or names it as the test action's macro
+/// expansion. A target that doesn't run (a framework, a library, a package's
+/// library product) loses it once a scheme builds it. A workspace's scheme
+/// files count for its member projects the same way.
+#[derive(Debug, Clone, Default)]
+pub struct SchemeReferences {
+    /// Each scheme's Launch or Profile runnable, as the project its
+    /// `ReferencedContainer` names and the target's name.
+    runs: Vec<(Option<PathBuf>, String)>,
+    /// Each scheme's Build action entries, the same way.
+    builds: Vec<(Option<PathBuf>, String)>,
+}
+
+impl SchemeReferences {
+    /// What the shared and the current user's scheme files in `container` (a
+    /// `.xcodeproj`, a `.xcworkspace`, or a package's `.swiftpm/xcode`) point
+    /// at. A `container:` reference resolves against the directory holding
+    /// `container`; one that names no project (a package's `container:`)
+    /// matches by target name alone.
+    #[must_use]
+    pub fn of(container: &Path) -> Self {
+        let base = container.parent().unwrap_or(Path::new(""));
+        let project_of = |reference: &BuildableRef| match reference.container.split_once(':') {
+            Some(("container", "")) => None,
+            Some(("container", rel)) => Some(crate::project::absolutize(&base.join(rel))),
+            Some(("absolute", abs)) => Some(crate::project::absolutize(Path::new(abs))),
+            _ => None,
+        };
+        let mut out = Self::default();
+        for name in container_schemes(container) {
+            let Some(root) =
+                find_scheme_file(container, &name).and_then(|p| xcscheme::parse_file(&p).ok())
+            else {
+                continue;
+            };
+            for action in ["LaunchAction", "ProfileAction"] {
+                if let Some(reference) = root
+                    .child(action)
+                    .and_then(|a| {
+                        a.child("BuildableProductRunnable")
+                            .or_else(|| a.child("RemoteRunnable"))
+                    })
+                    .and_then(|r| r.child("BuildableReference"))
+                    .and_then(parse_buildable)
+                {
+                    out.runs
+                        .push((project_of(&reference), reference.blueprint_name.clone()));
+                }
+            }
+            let entries = root
+                .child("BuildAction")
+                .and_then(|b| b.child("BuildActionEntries"));
+            for entry in entries
+                .map(|e| e.children_named("BuildActionEntry").collect::<Vec<_>>())
+                .unwrap_or_default()
+            {
+                if let Some(reference) = entry.child("BuildableReference").and_then(parse_buildable)
+                {
+                    out.builds
+                        .push((project_of(&reference), reference.blueprint_name.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether a scheme takes the place of `target`'s autocreated one: a
+    /// scheme that runs it, for a target that `runs`, or one that builds it,
+    /// for one that doesn't. `project` is the target's `.xcodeproj`; `None`
+    /// matches by name alone.
+    #[must_use]
+    pub fn cover(&self, project: Option<&Path>, target: &str, runs: bool) -> bool {
+        let project = project.map(crate::project::absolutize);
+        let references = if runs { &self.runs } else { &self.builds };
+        references.iter().any(|(p, t)| {
+            t == target
+                && match (p, &project) {
+                    (Some(p), Some(project)) => p == project,
+                    _ => true,
+                }
+        })
+    }
+}
+
+/// The file behind the scheme `name` that `xcodebuild` lists for `container`,
+/// or `None` when it has none (an autocreated scheme Xcode never wrote, or a
+/// name the container doesn't know). See [`locate_all`] for where it looks.
+#[must_use]
+pub fn locate(container: &Path, name: &str) -> Option<PathBuf> {
+    scheme_containers(container)
+        .flat_map(|c| scheme_dirs(&c))
+        .map(|dir| dir.join(format!("{name}.xcscheme")))
+        .find(|p| p.is_file())
+}
+
+/// Every file named for the scheme `name` among the scheme containers
+/// `xcodebuild -list` reads for `container`, the one it uses first. Only the
+/// current user's `xcuserdata` counts, as it does for Xcode.
+///
+/// - A `.xcworkspace` (a project's embedded one included): its own schemes,
+///   then each member project's, then each local package's `.swiftpm/xcode`,
+///   the workspace's own package members before the ones its projects declare.
+/// - A `.xcodeproj`: its own, then the `.swiftpm/xcode` of each local package
+///   it declares.
+/// - A Swift package, named by its `Package.swift` or its directory: its
+///   `.swiftpm/xcode`.
+///
+/// A package reached only through another package's `.package(path:)` is not
+/// looked in: only its manifest names it.
+#[must_use]
+pub fn locate_all(container: &Path, name: &str) -> Vec<PathBuf> {
+    scheme_containers(container)
+        .flat_map(|c| scheme_dirs(&c))
+        .map(|dir| dir.join(format!("{name}.xcscheme")))
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+/// The directories holding `xcshareddata`/`xcuserdata` scheme folders for
+/// `container`, in lookup order. The container's own comes first and costs
+/// nothing to name; the members behind it are read only when a lookup gets
+/// that far.
+fn scheme_containers(container: &Path) -> impl Iterator<Item = PathBuf> {
+    let own = if container.file_name() == Some(OsStr::new("Package.swift")) {
+        crate::workspace::package_scheme_root(container.parent().unwrap_or(Path::new(".")))
+    } else if matches!(
+        container.extension().and_then(OsStr::to_str),
+        Some("xcworkspace" | "xcodeproj")
+    ) {
+        container.to_path_buf()
+    } else {
+        crate::workspace::package_scheme_root(container)
+    };
+    let container = container.to_path_buf();
+    std::iter::once(own).chain(std::iter::once_with(move || members(&container)).flatten())
+}
+
+/// The scheme containers behind `container`'s own: a workspace's member
+/// projects and local packages, a project's local packages.
+fn members(container: &Path) -> Vec<PathBuf> {
+    match container.extension().and_then(OsStr::to_str) {
+        Some("xcworkspace") => crate::workspace::open(container)
+            .map(|ws| {
+                let packages = ws
+                    .package_refs
+                    .iter()
+                    .cloned()
+                    .chain(ws.project_package_refs())
+                    .map(|dir| crate::workspace::package_scheme_root(&dir));
+                ws.project_refs.iter().cloned().chain(packages).collect()
+            })
+            .unwrap_or_default(),
+        Some("xcodeproj") => crate::project::open(container)
+            .map(|project| {
+                project
+                    .package_refs
+                    .iter()
+                    .map(|dir| crate::workspace::package_scheme_root(dir))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// Build a [`Scheme`] from an already-parsed `<Scheme>` element.
 pub fn from_element(root: &Element) -> Result<Scheme, Error> {
     if root.name != "Scheme" {
@@ -400,6 +586,10 @@ pub fn from_element(root: &Element) -> Result<Scheme, Error> {
         launch_configuration: launch_action
             .and_then(|a| a.attr("buildConfiguration"))
             .map(str::to_string),
+        launch_macro_expansion: launch_action
+            .and_then(|a| a.child("MacroExpansion"))
+            .and_then(|m| m.child("BuildableReference"))
+            .and_then(parse_buildable),
         launch_arguments: launch_action
             .map(parse_command_line_arguments)
             .unwrap_or_default(),
@@ -524,9 +714,213 @@ fn parse_yes(v: &str) -> bool {
     v.eq_ignore_ascii_case("YES")
 }
 
+/// What a scheme's Run action launches its app with: the process arguments
+/// and environment Xcode passes, in the order it passes them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchSettings {
+    /// The enabled argument rows, expanded and split into words, then the
+    /// App Language and App Region flags.
+    pub args: Vec<String>,
+    /// The enabled environment rows with their values expanded, one entry per
+    /// key: a later row for a key replaces the value of an earlier one.
+    pub env: Vec<(String, String)>,
+}
+
+impl Scheme {
+    /// The target whose resolved build settings expand `$(VAR)` in the launch
+    /// arguments and environment: the Run action's `MacroExpansion`, or else
+    /// the target it launches.
+    #[must_use]
+    pub fn launch_expansion_target(&self) -> Option<&BuildableRef> {
+        self.launch_macro_expansion
+            .as_ref()
+            .or(self.launch_target.as_ref())
+    }
+
+    /// Whether an enabled launch argument or environment value refers to a
+    /// build setting, so [`Self::launch_settings`] needs the resolved settings
+    /// of [`Self::launch_expansion_target`]. A caller can skip resolving them
+    /// when this is false.
+    #[must_use]
+    pub fn launch_references_settings(&self) -> bool {
+        self.launch_arguments
+            .iter()
+            .any(|a| a.is_enabled && a.argument.contains('$'))
+            || self
+                .launch_environment_variables
+                .iter()
+                .any(|v| v.is_enabled && v.value.as_deref().is_some_and(|v| v.contains('$')))
+    }
+
+    /// The arguments and environment Xcode launches this scheme's app with.
+    /// Checked against `xcodebuild test`, which launches with the Run
+    /// action's rows when the Test action shares them:
+    ///
+    /// - disabled rows are left out;
+    /// - `$(VAR)`, `${VAR}` and `$VAR` expand against `settings`, the resolved
+    ///   build settings of [`Self::launch_expansion_target`]. An undefined
+    ///   `$(VAR)` expands to nothing, an undefined bare `$VAR` stays as
+    ///   written, and `$$` is a literal `$`;
+    /// - each argument row is split into words after expansion
+    ///   ([`split_launch_argument`]), so a setting whose value holds a space
+    ///   becomes two arguments unless the row quotes it;
+    /// - an environment value is used as written once expanded, quotes
+    ///   included. A row with no value sets the variable to the empty string.
+    ///   Keys are not expanded;
+    /// - App Language adds `-AppleLanguages (<language>)` and
+    ///   `-AppleTextDirection YES` or `NO`, and App Region adds `-AppleLocale
+    ///   <language>_<region>`. With a region and no language, the language is
+    ///   the host's, from `host_language`, which is called only then.
+    pub fn launch_settings(
+        &self,
+        settings: &BTreeMap<String, String>,
+        host_language: impl FnOnce() -> Option<String>,
+    ) -> LaunchSettings {
+        let mut args = Vec::new();
+        for row in self.launch_arguments.iter().filter(|a| a.is_enabled) {
+            args.extend(split_launch_argument(&expand_one(&row.argument, settings)));
+        }
+        let language = self.launch_language.as_deref().filter(|l| !l.is_empty());
+        if let Some(language) = language {
+            args.push("-AppleLanguages".into());
+            args.push(format!("({language})"));
+            args.push("-AppleTextDirection".into());
+            args.push(
+                if is_right_to_left(language) {
+                    "YES"
+                } else {
+                    "NO"
+                }
+                .into(),
+            );
+        }
+        if let Some(region) = self.launch_region.as_deref().filter(|r| !r.is_empty())
+            && let Some(language) = language.map(str::to_string).or_else(host_language)
+        {
+            args.push("-AppleLocale".into());
+            args.push(format!("{language}_{region}"));
+        }
+
+        let mut env: Vec<(String, String)> = Vec::new();
+        for row in self
+            .launch_environment_variables
+            .iter()
+            .filter(|v| v.is_enabled && !v.key.is_empty())
+        {
+            let value = row
+                .value
+                .as_deref()
+                .map(|v| expand_one(v, settings))
+                .unwrap_or_default();
+            match env.iter_mut().find(|(key, _)| *key == row.key) {
+                Some(slot) => slot.1 = value,
+                None => env.push((row.key.clone(), value)),
+            }
+        }
+        LaunchSettings { args, env }
+    }
+}
+
+/// Split one launch-argument row into process arguments the way Xcode does:
+/// at unquoted whitespace, with shell-style quoting. Single quotes keep
+/// everything up to the next `'` as written. Outside them, a backslash takes
+/// the next character literally, inside double quotes too. Quoted text joins
+/// the text around it (`a"b c"d` is `ab cd`), `""` is an empty argument, and
+/// an unclosed quote runs to the end of the row.
+#[must_use]
+pub fn split_launch_argument(row: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = row.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                word.extend(chars.by_ref().take_while(|&c| c != '\''));
+            }
+            '"' => {
+                in_word = true;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => word.extend(chars.next()),
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                word.extend(chars.next());
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Whether Foundation lays `language` out right to left, which is the
+/// `-AppleTextDirection` Xcode passes with App Language. Mirrors
+/// `NSLocale.characterDirection(forLanguage:)` as `xcodebuild` applies it: a
+/// right-to-left base language (`he`, `ar-SA`), or a script-qualified tag
+/// whose locale data is right to left (`pa-Arab`). A left-to-right script
+/// overrides a right-to-left base (`sd-Deva`), and a right-to-left script on
+/// a language with no such locale data does not (`az-Arab`).
+fn is_right_to_left(language: &str) -> bool {
+    const LANGUAGES: &[&str] = &[
+        "ar", "ckb", "dv", "fa", "he", "iw", "ks", "lrc", "mzn", "nqo", "ps", "rhg", "sd", "syr",
+        "ug", "ur", "yi",
+    ];
+    const SCRIPTED: &[&str] = &[
+        "ff-adlm", "ks-arab", "ms-arab", "pa-arab", "sd-arab", "uz-arab",
+    ];
+    const SCRIPTS: &[&str] = &["adlm", "arab", "hebr", "nkoo", "rohg", "syrc", "thaa"];
+    let tag = language.to_ascii_lowercase().replace('_', "-");
+    let mut parts = tag.split('-');
+    let base = parts.next().unwrap_or_default();
+    let script = parts
+        .next()
+        .filter(|p| p.len() == 4 && p.bytes().all(|b| b.is_ascii_alphabetic()));
+    match script {
+        Some(script) if SCRIPTS.contains(&script) => {
+            SCRIPTED.contains(&format!("{base}-{script}").as_str()) || LANGUAGES.contains(&base)
+        }
+        Some(_) => false,
+        None => LANGUAGES.contains(&base),
+    }
+}
+
+/// The host's language, which Xcode pairs with a scheme's App Region when the
+/// scheme sets no App Language: the language part of the user's
+/// `AppleLocale` default (`en` for `en_UA`). `None` when it can't be read.
+#[must_use]
+pub fn host_language() -> Option<String> {
+    let out = std::process::Command::new("defaults")
+        .args(["read", "-g", "AppleLocale"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let locale = String::from_utf8(out.stdout).ok()?;
+    let language = locale.trim().split(['_', '@']).next()?.trim();
+    (!language.is_empty()).then(|| language.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdir::TempDir;
     use std::path::PathBuf;
 
     fn fixtures_root() -> PathBuf {
@@ -619,6 +1013,271 @@ mod tests {
         assert!(scheme.launch_region.is_none());
     }
 
+    /// A scheme whose Run action carries `inner` (argument and environment
+    /// rows) and the given `LaunchAction` attributes.
+    fn launch_scheme(attrs: &str, inner: &str) -> Scheme {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Scheme version="1.7">
+   <LaunchAction buildConfiguration="Debug" {attrs}>
+      <BuildableProductRunnable>
+         <BuildableReference BlueprintIdentifier="A1" BuildableName="App.app"
+            BlueprintName="App" ReferencedContainer="container:App.xcodeproj"/>
+      </BuildableProductRunnable>
+      {inner}
+   </LaunchAction>
+</Scheme>"#
+        );
+        from_element(&xcscheme::parse(&xml).unwrap()).unwrap()
+    }
+
+    fn arg(argument: &str, enabled: bool) -> String {
+        let argument = argument.replace('"', "&quot;");
+        let enabled = if enabled { "YES" } else { "NO" };
+        format!(r#"<CommandLineArgument argument="{argument}" isEnabled="{enabled}"/>"#)
+    }
+
+    fn settings(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn no_host() -> Option<String> {
+        panic!("the host language is read only for a region without a language")
+    }
+
+    /// The rows and results of an `xcodebuild test` run (Xcode 27.0) whose
+    /// Test action shares the Run action's arguments and environment.
+    #[test]
+    fn launch_settings_expand_then_split_like_xcodebuild() {
+        let rows = [
+            arg("-Plain YES", true),
+            arg("-Disabled YES", false),
+            arg(r#"-Quoted "a b" 'c d' e\ f"#, true),
+            arg(
+                "-Expand $(PRODUCT_NAME) ${TARGET_NAME} $(SRCROOT)/x $(NOT_SET)| $PRODUCT_NAME",
+                true,
+            ),
+            arg(
+                r#"-Spacey $(SPACEY) $NOT_SET_BARE $(PRODUCT_NAME:lower) $$(PRODUCT_NAME) "$(SPACEY)""#,
+                true,
+            ),
+            arg(
+                r#"-Edge a"b c"d "x\"y" 'it''s' "" 'single\q' "dbl\q" tab	sep $(QUOTED) "abc def"#,
+                true,
+            ),
+        ]
+        .concat();
+        let scheme = launch_scheme(
+            "",
+            &format!("<CommandLineArguments>{rows}</CommandLineArguments>"),
+        );
+        let settings = settings(&[
+            ("PRODUCT_NAME", "App"),
+            ("TARGET_NAME", "App"),
+            ("SRCROOT", "/src"),
+            ("SPACEY", "p q"),
+            ("QUOTED", r#""u v""#),
+        ]);
+        assert!(scheme.launch_references_settings());
+        assert_eq!(
+            scheme.launch_settings(&settings, no_host).args,
+            [
+                "-Plain",
+                "YES",
+                "-Quoted",
+                "a b",
+                "c d",
+                "e f",
+                "-Expand",
+                "App",
+                "App",
+                "/src/x",
+                "|",
+                "App",
+                "-Spacey",
+                "p",
+                "q",
+                "$NOT_SET_BARE",
+                "app",
+                "$(PRODUCT_NAME)",
+                "p q",
+                "-Edge",
+                "ab cd",
+                "x\"y",
+                "its",
+                "",
+                r"single\q",
+                "dblq",
+                "tab",
+                "sep",
+                "u v",
+                "abc def",
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_environment_expands_values_and_keeps_the_last_row_per_key() {
+        let scheme = launch_scheme(
+            "",
+            r#"<EnvironmentVariables>
+                <EnvironmentVariable key="PLAIN" value="hello world" isEnabled="YES"/>
+                <EnvironmentVariable key="OFF" value="x" isEnabled="NO"/>
+                <EnvironmentVariable key="NOVALUE" isEnabled="YES"/>
+                <EnvironmentVariable key="QUOTES" value="&quot;q r&quot; 's'" isEnabled="YES"/>
+                <EnvironmentVariable key="DUP" value="first" isEnabled="YES"/>
+                <EnvironmentVariable key="K_$(PRODUCT_NAME)" value="k" isEnabled="YES"/>
+                <EnvironmentVariable key="DUP" value="second" isEnabled="YES"/>
+                <EnvironmentVariable key="EXPAND" value="$(PRODUCT_NAME)|$(NOT_SET)|${CONFIGURATION}"/>
+            </EnvironmentVariables>"#,
+        );
+        let settings = settings(&[("PRODUCT_NAME", "App"), ("CONFIGURATION", "Debug")]);
+        let env = scheme.launch_settings(&settings, no_host).env;
+        let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            pairs,
+            [
+                ("PLAIN", "hello world"),
+                ("NOVALUE", ""),
+                ("QUOTES", r#""q r" 's'"#),
+                ("DUP", "second"),
+                ("K_$(PRODUCT_NAME)", "k"),
+                ("EXPAND", "App||Debug"),
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_settings_skip_settings_when_nothing_refers_to_them() {
+        let scheme = launch_scheme(
+            "",
+            &format!(
+                r#"<CommandLineArguments>{}{}</CommandLineArguments>
+                <EnvironmentVariables>
+                   <EnvironmentVariable key="A" value="plain" isEnabled="YES"/>
+                   <EnvironmentVariable key="B" value="$(OFF)" isEnabled="NO"/>
+                </EnvironmentVariables>"#,
+                arg("-Flag YES", true),
+                arg("-Off $(SRCROOT)", false),
+            ),
+        );
+        assert!(!scheme.launch_references_settings());
+        let launch = scheme.launch_settings(&BTreeMap::new(), no_host);
+        assert_eq!(launch.args, ["-Flag", "YES"]);
+        assert_eq!(launch.env, [("A".to_string(), "plain".to_string())]);
+    }
+
+    /// App Language and App Region as `xcodebuild` passes them.
+    #[test]
+    fn launch_language_and_region_flags() {
+        let flags = |attrs: &str| {
+            launch_scheme(attrs, "")
+                .launch_settings(&BTreeMap::new(), || Some("en".into()))
+                .args
+        };
+        assert_eq!(
+            flags(r#"language="he" region="IL""#),
+            [
+                "-AppleLanguages",
+                "(he)",
+                "-AppleTextDirection",
+                "YES",
+                "-AppleLocale",
+                "he_IL"
+            ]
+        );
+        assert_eq!(
+            flags(r#"language="zh-Hans" region="CN""#),
+            [
+                "-AppleLanguages",
+                "(zh-Hans)",
+                "-AppleTextDirection",
+                "NO",
+                "-AppleLocale",
+                "zh-Hans_CN"
+            ]
+        );
+        assert_eq!(
+            flags(r#"language="ar""#),
+            ["-AppleLanguages", "(ar)", "-AppleTextDirection", "YES"]
+        );
+        // A region alone pairs with the host's language.
+        assert_eq!(flags(r#"region="JP""#), ["-AppleLocale", "en_JP"]);
+        let unknown =
+            launch_scheme(r#"region="JP""#, "").launch_settings(&BTreeMap::new(), || None);
+        assert!(unknown.args.is_empty());
+        // The arguments rows come first.
+        let scheme = launch_scheme(
+            r#"language="fr""#,
+            &format!(
+                "<CommandLineArguments>{}</CommandLineArguments>",
+                arg("-X 1", true)
+            ),
+        );
+        assert_eq!(
+            scheme.launch_settings(&BTreeMap::new(), no_host).args,
+            [
+                "-X",
+                "1",
+                "-AppleLanguages",
+                "(fr)",
+                "-AppleTextDirection",
+                "NO"
+            ]
+        );
+    }
+
+    /// The text direction `xcodebuild` reported for each language.
+    #[test]
+    fn right_to_left_languages_match_xcodebuild() {
+        for rtl in [
+            "he", "he-IL", "iw", "ar", "ar-SA", "fa", "ur", "yi", "ckb", "dv", "ps", "ug", "sd",
+            "ks", "mzn", "lrc", "syr", "nqo", "rhg", "pa-Arab", "uz-Arab", "ms-Arab", "ff-Adlm",
+        ] {
+            assert!(is_right_to_left(rtl), "{rtl}");
+        }
+        for ltr in [
+            "fr",
+            "en-GB",
+            "zh-Hans",
+            "ku",
+            "arc",
+            "az-Arab",
+            "sd-Deva",
+            "ks-Deva",
+            "IDELaunchRTLPseudoLanguage",
+        ] {
+            assert!(!is_right_to_left(ltr), "{ltr}");
+        }
+    }
+
+    #[test]
+    fn launch_expansion_target_prefers_the_macro_expansion() {
+        let scheme = launch_scheme("", "");
+        assert_eq!(
+            scheme
+                .launch_expansion_target()
+                .map(|b| b.blueprint_name.as_str()),
+            Some("App")
+        );
+        let scheme = launch_scheme(
+            "",
+            r#"<MacroExpansion>
+                  <BuildableReference BlueprintIdentifier="B2" BuildableName="Other.app"
+                     BlueprintName="Other" ReferencedContainer="container:App.xcodeproj"/>
+               </MacroExpansion>"#,
+        );
+        assert_eq!(
+            scheme
+                .launch_expansion_target()
+                .map(|b| b.blueprint_name.as_str()),
+            Some("Other")
+        );
+    }
+
     #[test]
     fn rejects_non_scheme_root() {
         let element = Element {
@@ -631,17 +1290,13 @@ mod tests {
         assert!(format!("{err}").contains("expected root element"));
     }
 
-    /// A unique scratch container dir under the OS temp dir.
-    fn scratch_container(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "sweetpad-scheme-{tag}-{}-{n}.xcodeproj",
-            std::process::id()
-        ));
+    /// A scratch container in a directory of its own under the OS temp dir,
+    /// which goes when the returned guard drops.
+    fn scratch_container(tag: &str) -> (TempDir, PathBuf) {
+        let root = TempDir::new(&format!("sweetpad-scheme-{tag}"));
+        let dir = root.join("App.xcodeproj");
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        (root, dir)
     }
 
     fn touch(path: &Path) {
@@ -651,7 +1306,7 @@ mod tests {
 
     #[test]
     fn container_schemes_merges_shared_and_user_schemes() {
-        let dir = scratch_container("merge");
+        let (_root, dir) = scratch_container("merge");
         let user = visible_user();
         touch(&dir.join("xcshareddata/xcschemes/Shared.xcscheme"));
         touch(&dir.join(format!(
@@ -666,13 +1321,13 @@ mod tests {
 
     #[test]
     fn container_schemes_empty_without_scheme_files() {
-        let dir = scratch_container("empty");
+        let (_root, dir) = scratch_container("empty");
         assert!(container_schemes(&dir).is_empty());
     }
 
     #[test]
     fn scheme_dirs_scope_to_the_known_user() {
-        let dir = scratch_container("user-scope");
+        let (_root, dir) = scratch_container("user-scope");
         touch(&dir.join("xcshareddata/xcschemes/Shared.xcscheme"));
         touch(&dir.join("xcuserdata/alice.xcuserdatad/xcschemes/Mine.xcscheme"));
         touch(&dir.join("xcuserdata/bob.xcuserdatad/xcschemes/Foreign.xcscheme"));
@@ -695,7 +1350,7 @@ mod tests {
     #[test]
     fn autocreation_allowed_honors_workspace_settings() {
         // Default: no settings file → enabled.
-        let dir = scratch_container("autocreate-default");
+        let (_root, dir) = scratch_container("autocreate-default");
         assert!(autocreation_allowed(&dir));
 
         // Workspace-style container with the key set to false → disabled.
@@ -704,14 +1359,14 @@ mod tests {
             <plist version=\"1.0\">\n<dict>\n\
             \t<key>IDEWorkspaceSharedSettings_AutocreateContextsIfNeeded</key>\n\
             \t<false/>\n</dict>\n</plist>\n";
-        let ws = scratch_container("autocreate-off");
+        let (_ws_root, ws) = scratch_container("autocreate-off");
         std::fs::create_dir_all(ws.join("xcshareddata")).unwrap();
         std::fs::write(ws.join("xcshareddata/WorkspaceSettings.xcsettings"), plist).unwrap();
         assert!(!autocreation_allowed(&ws));
 
         // Project-style container (settings inside the embedded workspace),
         // key explicitly true → enabled.
-        let proj = scratch_container("autocreate-on");
+        let (_proj_root, proj) = scratch_container("autocreate-on");
         let inner = proj.join("project.xcworkspace/xcshareddata");
         std::fs::create_dir_all(&inner).unwrap();
         std::fs::write(
@@ -744,7 +1399,7 @@ mod tests {
 
     #[test]
     fn find_scheme_file_prefers_shared_over_user() {
-        let dir = scratch_container("find");
+        let (_root, dir) = scratch_container("find");
         let user = visible_user();
         let shared = dir.join("xcshareddata/xcschemes/App.xcscheme");
         touch(&shared);
@@ -759,5 +1414,132 @@ mod tests {
         assert_eq!(find_scheme_file(&dir, "App"), Some(shared));
         assert_eq!(find_scheme_file(&dir, "Mine"), Some(user_only));
         assert_eq!(find_scheme_file(&dir, "Nope"), None);
+    }
+
+    /// A workspace holding two projects and a local package, each with
+    /// scheme files of its own.
+    fn scratch_workspace(tag: &str) -> (TempDir, PathBuf) {
+        let root = TempDir::new(&format!("sweetpad-scheme-{tag}"));
+        let ws = root.join("App.xcworkspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("contents.xcworkspacedata"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Workspace version = "1.0">
+   <FileRef location = "group:A.xcodeproj"></FileRef>
+   <FileRef location = "group:B.xcodeproj"></FileRef>
+   <FileRef location = "group:Pkg"></FileRef>
+</Workspace>
+"#,
+        )
+        .unwrap();
+        for dir in ["A.xcodeproj", "B.xcodeproj", "Pkg"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        touch(&root.join("Pkg/Package.swift"));
+        (root, ws)
+    }
+
+    /// `xcodebuild -list -workspace` reads the workspace's schemes, then each
+    /// member's, then each local package's `.swiftpm/xcode`; a lookup by name
+    /// follows the same order and never leaves the workspace it was given.
+    #[test]
+    fn locate_searches_the_workspace_then_its_members_then_its_packages() {
+        let (root, ws) = scratch_workspace("locate-ws");
+        let own = ws.join("xcshareddata/xcschemes/Shared.xcscheme");
+        touch(&own);
+        touch(&root.join("A.xcodeproj/xcshareddata/xcschemes/Shared.xcscheme"));
+        let in_b = root.join("B.xcodeproj/xcshareddata/xcschemes/OnlyInB.xcscheme");
+        touch(&in_b);
+        let in_package = root.join("Pkg/.swiftpm/xcode/xcshareddata/xcschemes/Custom.xcscheme");
+        touch(&in_package);
+        // A same-named scheme in a project the workspace doesn't list.
+        touch(&root.join("Other.xcodeproj/xcshareddata/xcschemes/Stray.xcscheme"));
+
+        assert_eq!(locate(&ws, "Shared"), Some(own.clone()));
+        assert_eq!(
+            locate_all(&ws, "Shared"),
+            [
+                own,
+                root.join("A.xcodeproj/xcshareddata/xcschemes/Shared.xcscheme")
+            ]
+        );
+        assert_eq!(locate(&ws, "OnlyInB"), Some(in_b));
+        assert_eq!(locate(&ws, "Custom"), Some(in_package));
+        assert_eq!(locate(&ws, "Stray"), None);
+    }
+
+    /// A package is named by its manifest or its directory, and keeps its
+    /// schemes in `.swiftpm/xcode`.
+    #[test]
+    fn locate_reads_a_packages_swiftpm_container() {
+        let root = TempDir::new("sweetpad-scheme-locate-package");
+        let scheme = root.join("Pkg/.swiftpm/xcode/xcshareddata/xcschemes/Custom.xcscheme");
+        touch(&scheme);
+        assert_eq!(
+            locate(&root.join("Pkg/Package.swift"), "Custom"),
+            Some(scheme.clone())
+        );
+        assert_eq!(locate(&root.join("Pkg"), "Custom"), Some(scheme));
+    }
+
+    /// Xcode never shows one user another user's personal schemes, so a
+    /// lookup doesn't either.
+    #[test]
+    fn locate_skips_another_users_schemes() {
+        let Some(user) = detected_user() else {
+            eprintln!("skipping: needs a $USER to scope per-user schemes to");
+            return;
+        };
+        let (_root, dir) = scratch_container("locate-user");
+        touch(&dir.join("xcuserdata/someone-else.xcuserdatad/xcschemes/Foreign.xcscheme"));
+        let mine = dir.join(format!(
+            "xcuserdata/{user}.xcuserdatad/xcschemes/Mine.xcscheme"
+        ));
+        touch(&mine);
+        assert_eq!(locate(&dir, "Foreign"), None);
+        assert_eq!(locate(&dir, "Mine"), Some(mine));
+    }
+
+    /// A scheme building `Kit` and running `App`, both in `App.xcodeproj`.
+    const COVERING_SCHEME: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Scheme version = "1.7">
+   <BuildAction>
+      <BuildActionEntries>
+         <BuildActionEntry buildForRunning = "YES">
+            <BuildableReference BuildableIdentifier = "primary" BlueprintIdentifier = "KIT"
+               BuildableName = "Kit.framework" BlueprintName = "Kit" ReferencedContainer = "container:App.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+      </BuildActionEntries>
+   </BuildAction>
+   <LaunchAction>
+      <BuildableProductRunnable>
+         <BuildableReference BuildableIdentifier = "primary" BlueprintIdentifier = "APP"
+            BuildableName = "App.app" BlueprintName = "App" ReferencedContainer = "container:App.xcodeproj">
+         </BuildableReference>
+      </BuildableProductRunnable>
+   </LaunchAction>
+</Scheme>
+"#;
+
+    /// Xcode 27.0 drops a framework's autocreated scheme once a scheme builds
+    /// it, and an app's once a scheme runs it, and a reference only counts
+    /// for the project it names.
+    #[test]
+    fn a_scheme_covers_what_it_runs_or_builds_in_the_project_it_names() {
+        let (_root, dir) = scratch_container("references");
+        let path = dir.join("xcshareddata/xcschemes/Custom.xcscheme");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, COVERING_SCHEME).unwrap();
+        let references = SchemeReferences::of(&dir);
+
+        assert!(references.cover(Some(&dir), "Kit", false));
+        assert!(references.cover(Some(&dir), "App", true));
+        // Building an app doesn't take its scheme's place, running is what does.
+        assert!(!references.cover(Some(&dir), "Kit", true));
+        assert!(!references.cover(Some(&dir), "Other", false));
+        let elsewhere = dir.parent().unwrap().join("Other.xcodeproj");
+        assert!(!references.cover(Some(&elsewhere), "App", true));
     }
 }

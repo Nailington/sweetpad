@@ -13,6 +13,9 @@ Open the folder containing your Xcode project, then open the SweetPad sidebar on
 **Build** section, and click ▶️ next to the scheme name. SweetPad asks you to pick a simulator or device, then builds
 and launches the app on it.
 
+The destination picker lists the destinations the scheme can run on first, under **Supported platforms**. When a
+scheme builds more than one app, SweetPad launches the one the scheme's Run action names, as Xcode does.
+
 For prettier build output, install `xcbeautify`:
 
 ```bash
@@ -279,6 +282,9 @@ override the path:
 }
 ```
 
+A `-derivedDataPath` in `sweetpad.build.args` wins over this setting. Builds, app launches and autocomplete all use
+the same location.
+
 ## Pass extra arguments to xcodebuild
 
 Pass any extra `xcodebuild` flags through `sweetpad.build.args`. For example, to skip Swift macro validation:
@@ -288,6 +294,14 @@ Pass any extra `xcodebuild` flags through `sweetpad.build.args`. For example, to
   "sweetpad.build.args": ["-skipMacroValidation"]
 }
 ```
+
+A flag in this list replaces the one SweetPad passes itself, such as `-destination` or `-derivedDataPath`. Flags that
+`xcodebuild` accepts more than once, such as `-skip-testing` or `-only-testing`, keep every copy in order. For other
+flags, the last copy wins.
+
+SweetPad reads these arguments when it looks for the app to launch, too. A `PRODUCT_NAME=`,
+`PRODUCT_BUNDLE_IDENTIFIER=` or `SYMROOT=` setting, an `-xcconfig`, or a `-configuration` here changes which app gets
+installed and launched, just as it changes what gets built.
 
 You can also pass environment variables to `xcodebuild` itself (not to the launched app) with `sweetpad.build.env`.
 This is useful for forwarding tokens or paths that your project's build scripts read from the environment:
@@ -367,12 +381,14 @@ the same way whether it's launched from Xcode or from VSCode, with no need to co
 
 The mapping:
 
-- Enabled `<CommandLineArgument>` entries → `launchArgs`.
+- Enabled `<CommandLineArgument>` entries → `launchArgs`. Each entry is split into words the way a shell splits
+  it, so `-Name "a b"` becomes two arguments, `-Name` and `a b`.
 - Enabled `<EnvironmentVariable>` entries → `launchEnv`.
-- `language="fr"` → adds `-AppleLanguages (fr)`.
+- SweetPad fills in build settings in either one, like `$(SRCROOT)` or `$(PRODUCT_NAME)`, from the app's build settings.
+- `language="fr"` → adds `-AppleLanguages (fr) -AppleTextDirection NO`. A right-to-left language such as `he`
+  gets `-AppleTextDirection YES`.
 - `language="fr"` + `region="FR"` → also adds `-AppleLocale fr_FR`.
-- `region` on its own is ignored (Xcode pairs it with the device's system language at runtime, which the CLI can't
-  observe; add an explicit `-AppleLocale` flag in `launchArgs` if you need it).
+- `region="FR"` on its own → adds `-AppleLocale` with your Mac's language, such as `en_FR`.
 
 Anything you put in `sweetpad.build.launchArgs` / `sweetpad.build.launchEnv` is **appended** to the values from the
 scheme, so workspace overrides always win over scheme defaults.

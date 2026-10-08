@@ -11,22 +11,25 @@
 
 mod control;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+use crate::app_locator::CommandLineSettings;
 use crate::build_context::BuildContext;
 use crate::build_settings::{self, BuildSettingsOptions};
 use crate::framing::{read_message, write_message};
+use crate::scratch::{ScratchDir, TmpdirLeftovers};
+use crate::xcodebuild_args;
 use control::{LogLevel, TelemetryServer};
-use sweetpad_lib::{compiler_args, project};
+use sweetpad_lib::{compiler_args, derived_data, project, scheme};
 
 /// Write a `buildServer.json` so `sourcekit-lsp` discovers and launches this
 /// server. Its `argv` is the current executable followed by
@@ -46,6 +49,12 @@ pub fn write_config(args: &[String], serve_subcommand: &[&str]) -> Result<(), St
             "config: --project <path.xcodeproj> or --workspace <path.xcworkspace> is required",
         )?;
     let root_abs = std::fs::canonicalize(root).map_err(|e| format!("{root_flag}: {e}"))?;
+    // A project's embedded workspace is the project: the server keys it that
+    // way, and `buildServer.json` belongs beside the `.xcodeproj`, not in it.
+    let (root_flag, root_abs) = match sweetpad_lib::workspace::embedding_project(&root_abs) {
+        Some(project) => ("--project", project.to_path_buf()),
+        None => (root_flag, root_abs),
+    };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
 
     let mut server_argv = vec![exe.to_string_lossy().into_owned()];
@@ -69,15 +78,7 @@ pub fn write_config(args: &[String], serve_subcommand: &[&str]) -> Result<(), St
         "argv": server_argv,
     });
 
-    let out = flags.get("output").map_or_else(
-        || {
-            root_abs
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("buildServer.json")
-        },
-        PathBuf::from,
-    );
+    let out = build_server_json_path(&root_abs, flags.get("output").map(Path::new));
     let body = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     std::fs::write(&out, format!("{body}\n"))
         .map_err(|e| format!("write {}: {e}", out.display()))?;
@@ -85,14 +86,60 @@ pub fn write_config(args: &[String], serve_subcommand: &[&str]) -> Result<(), St
     Ok(())
 }
 
+/// Where sourcekit-lsp finds the `buildServer.json` for `container`: the
+/// explicit `output`, else beside the container. A project's embedded
+/// workspace puts it beside the project, not inside the bundle.
+#[must_use]
+pub fn build_server_json_path(container: &Path, output: Option<&Path>) -> PathBuf {
+    output.map_or_else(
+        || {
+            sweetpad_lib::workspace::normalize_stub_workspace(container)
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("buildServer.json")
+        },
+        Path::to_path_buf,
+    )
+}
+
+/// Build settings the project's builds add above every project layer, from
+/// the command line they run `xcodebuild` with: an `-xcconfig` overlay and
+/// `KEY=VALUE` assignments, in order. The sweetpad CLI reads them from the
+/// project's `sweetpad.toml`; a server started from `bsp.json` reads them
+/// from that file's `buildArgs`, which the extension fills from
+/// `sweetpad.build.args`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CommandLine {
+    pub xcconfig: Option<PathBuf>,
+    pub overrides: Vec<(String, String)>,
+}
+
+/// The settings a command line layers on every resolution. Its
+/// `-derivedDataPath` is left out: the server fixes DerivedData at startup.
+impl From<CommandLineSettings> for CommandLine {
+    fn from(settings: CommandLineSettings) -> Self {
+        Self {
+            xcconfig: settings.xcconfig,
+            overrides: settings.overrides,
+        }
+    }
+}
+
 /// Run the BSP server loop over stdin/stdout until EOF or `build/exit`.
 pub fn run(args: &[String]) -> Result<(), String> {
-    let server = Arc::new(Server::resolve(args)?);
+    run_with(args, CommandLine::default())
+}
+
+/// [`run`], resolving every target's settings with `command_line` on top, so
+/// the editor's compiler arguments and the `buildTarget/prepare` build agree
+/// with the project's own builds.
+pub fn run_with(args: &[String], command_line: CommandLine) -> Result<(), String> {
+    let server = Arc::new(Server::resolve(args, command_line)?);
     let stdin = io::stdin();
     let mut reader = stdin.lock();
-    // Each write locks stdout for one whole frame rather than holding the lock
-    // across the loop, so the worker threads (change-watcher, prepare) can
-    // interleave their messages between requests.
+    // Each write locks the output for one whole frame rather than holding the
+    // lock across the loop, so the worker threads (change-watcher, prepare)
+    // can interleave their messages between requests.
     let mut watching = false;
 
     // `buildTarget/prepare` runs `xcodebuild` (seconds-to-minutes), and
@@ -207,19 +254,25 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
 struct Server {
     /// The root the server was pointed at: a `.xcodeproj` or a `.xcworkspace`.
+    /// A project's embedded workspace is its project here, as it is to Xcode.
     project_path: PathBuf,
     /// The member `.xcodeproj`s — `[project_path]` for a project root, or the
     /// workspace's project refs for a `.xcworkspace`. File→target and settings
     /// resolution iterate these, so each file in a multi-project workspace
     /// resolves against whichever member declares its target.
     projects: Vec<PathBuf>,
-    /// Live-updatable config (configuration + scheme), swapped on `bsp/configChanged`.
+    /// Live-updatable config (configuration, scheme, destination platform),
+    /// swapped when `bsp.json` changes.
     live: Mutex<LiveConfig>,
     /// `--sdk` / `--arch` overrides; `None` means infer the platform per target.
     sdk: Option<String>,
     arch: Option<String>,
     xcode: Option<PathBuf>,
     derived_data_path: Option<PathBuf>,
+    /// The settings the project's builds pass on the command line, from the
+    /// caller, applied to every resolution and to the prepare build above the
+    /// ones `bsp.json` carries (see [`Self::command_line`]).
+    command_line: CommandLine,
     /// Target names in pbxproj order (cached at startup).
     targets: Vec<String>,
     /// Debug log sink — the file named by `SWEETPAD_BSP_LOG`, else nothing.
@@ -236,11 +289,12 @@ struct Server {
     config_path: Option<PathBuf>,
     /// Verbosity of the `bsp/log` stream, retunable live via `bsp/setLogLevel`.
     log_level: Arc<AtomicU8>,
-    /// The in-flight `buildTarget/prepare` xcodebuild, if one is running. Held
-    /// so shutdown can kill it: `build/exit` during a prepare would otherwise
-    /// orphan a minutes-long xcodebuild (reparented to init, still burning CPU
-    /// after every editor restart). The prepare worker reaps it.
-    prepare_child: Mutex<Option<std::process::Child>>,
+    /// Where the protocol goes: stdout, the BSP channel, for a real server.
+    /// [`Self::send`] holds the lock for a whole frame.
+    out: Mutex<Box<dyn Write + Send>>,
+    /// The prepare worker's process and the `TMPDIR` its `swiftc`s get (see
+    /// [`PrepareProcess`]).
+    prepare_process: Mutex<PrepareProcess>,
     /// Work waiting for the prepare worker (see [`PrepareQueue`]).
     prepare_queue: PrepareQueue,
     /// Per-target record of the last prepare, so repeats over unchanged project
@@ -251,6 +305,27 @@ struct Server {
     /// the debug log — and a target that never prepares is a target whose ObjC
     /// files never resolve their imports.
     last_prepare_failure: Mutex<Option<String>>,
+    /// Which targets build as Mac Catalyst for a Mac destination
+    /// ([`Self::builds_as_catalyst`]), against the [`Self::prepare_stamps`]
+    /// they were read at.
+    catalyst: Mutex<CatalystTargets>,
+}
+
+/// [`Server::builds_as_catalyst`]'s answers, and the project and config
+/// stamps they hold for.
+#[derive(Default)]
+struct CatalystTargets {
+    stamps: Vec<Option<(u64, SystemTime)>>,
+    targets: BTreeMap<String, bool>,
+}
+
+/// The platform the editor analyzes a target for ([`Server::editor_platform`]).
+struct EditorPlatform {
+    sdk: String,
+    arch: String,
+    /// Built as Mac Catalyst: iOS code on the macOS SDK, which a Mac run
+    /// destination resolves and an `-sdk macosx` alone does not.
+    catalyst: bool,
 }
 
 const TARGET_SCHEME: &str = "sweetpad://target/";
@@ -332,6 +407,25 @@ impl PrepareQueue {
     }
 }
 
+/// The process a prepare is running, held where shutdown can reach it.
+#[derive(Default)]
+struct PrepareProcess {
+    /// The `xcodebuild` or `swiftc` running now, if any. Held so shutdown can
+    /// kill it: `build/exit` during a prepare would otherwise orphan it
+    /// (reparented to init, a minutes-long xcodebuild still burning CPU after
+    /// every editor restart). The prepare worker reaps it.
+    child: Option<Child>,
+    /// The `TMPDIR` every prepare `swiftc` runs with, made for the first one
+    /// and removed at shutdown. The Swift driver leaves a
+    /// `TemporaryDirectory.*` in its `TMPDIR` whenever it dies before it
+    /// finishes: killed at shutdown, or by its own diagnostics once nobody
+    /// reads its pipe. The server runs under the user's editor, so that would
+    /// be the user's `$TMPDIR`.
+    swiftc_tmp: Option<ScratchDir>,
+    /// Set at shutdown, after which nothing more is spawned.
+    stopped: bool,
+}
+
 /// What the last prepare of a target did, so a repeat over unchanged inputs can
 /// be skipped and a failure can be reported.
 struct PrepareRecord {
@@ -348,13 +442,20 @@ struct PrepareRecord {
 /// file, a source error) often isn't visible in the pbxproj at all.
 const PREPARE_RETRY_AFTER: Duration = Duration::from_secs(60);
 
-/// The portion of config that can change while the server runs — pushed live by
-/// the extension as `bsp/configChanged`. Everything else (project/xcode/derived
-/// data) is fixed at startup; toolchain/DD changes warrant a restart instead.
+/// The portion of config that can change while the server runs — re-read from
+/// `bsp.json` when the extension rewrites it. Everything else (project/xcode/
+/// derived data) is fixed at startup; toolchain/DD changes warrant a restart
+/// instead.
 #[derive(Clone, PartialEq)]
 struct LiveConfig {
     configuration: String,
     scheme: Option<String>,
+    /// The platform of the destination the extension builds for
+    /// (`iphonesimulator`, `watchos`, …), from `bsp.json`'s
+    /// `destinationPlatform`.
+    destination_platform: Option<String>,
+    /// The settings in `bsp.json`'s `buildArgs`.
+    command_line: CommandLine,
 }
 
 /// The inputs the server needs, however they were obtained — from `--project`
@@ -363,6 +464,7 @@ struct ResolvedConfig {
     project_path: PathBuf,
     configuration: String,
     scheme: Option<String>,
+    destination_platform: Option<String>,
     sdk: Option<String>,
     arch: Option<String>,
     xcode: Option<PathBuf>,
@@ -372,6 +474,13 @@ struct ResolvedConfig {
     /// Telemetry socket to bind, assigned by the extension in `bsp.json`. `None`
     /// in `--project` standalone mode (no telemetry).
     socket: Option<PathBuf>,
+    /// The settings in `bsp.json`'s `buildArgs`: what the extension's builds
+    /// pass `xcodebuild` from `sweetpad.build.args`. Empty for a `--project`
+    /// server and for a `bsp.json` without them.
+    command_line: CommandLine,
+    /// What reading the config found wrong but worked around, logged once
+    /// the server starts.
+    warning: Option<String>,
 }
 
 /// The `SWEETPAD_BSP_LOG` env path (used by tests and the standalone paths).
@@ -413,7 +522,7 @@ fn discover_config_from_cwd() -> Result<PathBuf, String> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .ok_or_else(|| {
-            "no --config <bsp.json> given and no bspConfig registered for this directory; the SweetPad extension writes buildServer.json with --config, or use `bsp init` for a standalone config".to_string()
+            "no --config <bsp.json> given and no bspConfig registered for this directory; the SweetPad extension writes buildServer.json with --config, or use 'sweetpad bsp init' for a standalone config".to_string()
         })
 }
 
@@ -426,12 +535,15 @@ impl ResolvedConfig {
                 .cloned()
                 .unwrap_or_else(|| "Debug".into()),
             scheme: flags.get("scheme").cloned(),
+            destination_platform: None,
             sdk: flags.get("sdk").cloned(),
             arch: flags.get("arch").cloned(),
             xcode: flags.get("xcode").map(PathBuf::from),
             derived_data_path: flags.get("derived-data-path").map(PathBuf::from),
             log_path: env_log(),
             socket: None,
+            command_line: CommandLine::default(),
+            warning: None,
         }
     }
 
@@ -464,14 +576,16 @@ impl ResolvedConfig {
                 })
             })
             .ok_or("bsp.json missing projectPath/workspacePath")?;
+        let (command_line, warning) = command_line_of(value, base);
         Ok(ResolvedConfig {
             project_path: resolve(project_path),
             configuration: flags
                 .get("configuration")
                 .cloned()
-                .or_else(|| pull("configuration"))
+                .or_else(|| configuration_of(value))
                 .unwrap_or_else(|| "Debug".into()),
             scheme: flags.get("scheme").cloned().or_else(|| pull("scheme")),
+            destination_platform: pull("destinationPlatform"),
             sdk: flags.get("sdk").cloned(),
             arch: flags.get("arch").cloned(),
             xcode: flags
@@ -486,6 +600,8 @@ impl ResolvedConfig {
                 .map(&resolve),
             log_path: pull("logPath").map(&resolve).or_else(env_log),
             socket: pull("socket").map(&resolve),
+            command_line,
+            warning,
         })
     }
 
@@ -499,19 +615,74 @@ impl ResolvedConfig {
             std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let value: Value =
             serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
-        let base = value
-            .get("workspacePath")
-            .and_then(Value::as_str)
-            .map_or_else(
-                || {
-                    path.parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .to_path_buf()
-                },
-                PathBuf::from,
-            );
-        Self::from_json(&value, &base, flags)
+        Self::from_json(&value, &config_base(&value, path), flags)
     }
+}
+
+/// The directory a relative path in the `bsp.json` at `path` resolves
+/// against: the workspace root it names in `workspacePath`, else its own.
+fn config_base(value: &Value, path: &Path) -> PathBuf {
+    value
+        .get("workspacePath")
+        .and_then(Value::as_str)
+        .map_or_else(
+            || {
+                path.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf()
+            },
+            PathBuf::from,
+        )
+}
+
+/// The command-line settings in a `bsp.json`'s `buildArgs`: the arguments
+/// the extension's builds add to `xcodebuild`, from `sweetpad.build.args`.
+/// They are read as `xcodebuild` running in `base`, the directory those
+/// builds run in, reads them ([`CommandLineSettings::of`], the CLI's reader
+/// too): a relative `-xcconfig` joins the directory's physical path, so
+/// through a symlinked folder `../ci.xcconfig` is the real directory's
+/// sibling. A file without `buildArgs` has none. Its `-derivedDataPath` is
+/// the extension's to resolve into `derivedDataPath`.
+///
+/// The second half is a warning for a flag that ends `buildArgs` without its
+/// value. The extension's builds fail on it, and the index reads the rest
+/// without it, so a half-typed edit doesn't cost autocomplete the settings
+/// before it.
+fn command_line_of(value: &Value, base: &Path) -> (CommandLine, Option<String>) {
+    let args = build_args(value);
+    let warning = xcodebuild_args::dangling_flag(&args).map(|flag| {
+        format!(
+            "ignoring '{flag}' at the end of buildArgs: it has no value, and xcodebuild refuses it"
+        )
+    });
+    (CommandLineSettings::of(&args, Some(base)).into(), warning)
+}
+
+/// A `bsp.json`'s `buildArgs`, the extension's `sweetpad.build.args`.
+fn build_args(value: &Value) -> Vec<String> {
+    value
+        .get("buildArgs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The configuration the extension's builds use: a `-configuration` in
+/// `buildArgs` replaces the one the extension picks on their command line, so
+/// it wins over the file's `configuration`, and the index resolves the
+/// configuration the build compiles.
+fn configuration_of(value: &Value) -> Option<String> {
+    xcodebuild_args::last_value(&build_args(value), "-configuration")
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("configuration")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 impl Server {
@@ -521,14 +692,21 @@ impl Server {
     /// `--config` path `buildServer.json` carries (the extension writes this), or
     /// — when that's absent (an older or hand-written stub) — by discovering it
     /// from the cwd via the host-wide index the extension maintains. Either way it
-    /// is then read and watched for live changes.
-    fn resolve(args: &[String]) -> Result<Self, String> {
+    /// is then read and watched for live changes. `command_line` is layered on
+    /// every resolution either way, above the settings a `bsp.json` carries.
+    fn resolve(args: &[String], command_line: CommandLine) -> Result<Self, String> {
         let flags = parse_flags(args);
         let log_level = Arc::new(AtomicU8::new(LogLevel::Info as u8));
 
         if let Some(root) = flags.get("workspace").or_else(|| flags.get("project")) {
             let config = ResolvedConfig::from_flags(PathBuf::from(root), &flags);
-            return Self::build(config, None, log_level);
+            return Self::build(
+                config,
+                None,
+                log_level,
+                command_line,
+                Box::new(io::stdout()),
+            );
         }
 
         let config_file = match flags.get("config") {
@@ -536,17 +714,29 @@ impl Server {
             None => discover_config_from_cwd()?,
         };
         let config = ResolvedConfig::from_file(&config_file, &flags)?;
-        Self::build(config, Some(config_file), log_level)
+        Self::build(
+            config,
+            Some(config_file),
+            log_level,
+            command_line,
+            Box::new(io::stdout()),
+        )
     }
 
+    /// The server for `config`, sending the protocol to `out`: stdout for a
+    /// real server, a buffer for a test.
     fn build(
         config: ResolvedConfig,
         config_path: Option<PathBuf>,
         log_level: Arc<AtomicU8>,
+        command_line: CommandLine,
+        out: Box<dyn Write + Send>,
     ) -> Result<Self, String> {
         // A `.xcworkspace` root expands to its member projects; a `.xcodeproj`
         // root is a one-element list. Targets are the union across members.
-        let root = config.project_path.clone();
+        // A project's embedded `project.xcworkspace` opens the project, which
+        // is what its DerivedData and its directory are keyed by.
+        let root = sweetpad_lib::workspace::normalize_stub_workspace(&config.project_path);
         let projects: Vec<PathBuf> =
             if root.extension().and_then(|e| e.to_str()) == Some("xcworkspace") {
                 sweetpad_lib::workspace::open(&root)
@@ -578,36 +768,46 @@ impl Server {
             .and_then(open_log)
             .map(Mutex::new);
         let server = Server {
-            project_path: config.project_path,
+            project_path: root,
             projects,
             live: Mutex::new(LiveConfig {
                 configuration: config.configuration,
                 scheme: config.scheme,
+                destination_platform: config.destination_platform,
+                command_line: config.command_line,
             }),
             sdk: config.sdk,
             arch: config.arch,
             xcode: config.xcode,
             derived_data_path: config.derived_data_path,
+            command_line,
             targets,
             log,
             telemetry: Mutex::new(None),
             config_path,
             log_level,
-            prepare_child: Mutex::new(None),
+            out: Mutex::new(out),
+            prepare_process: Mutex::new(PrepareProcess::default()),
             prepare_queue: PrepareQueue::default(),
             prepared: Mutex::new(BTreeMap::new()),
             last_prepare_failure: Mutex::new(None),
+            catalyst: Mutex::new(CatalystTargets::default()),
         };
         server.bind_telemetry(config.socket.as_deref());
         server.log(&format!(
-            "start: project={} xcode={:?} dd={:?} telemetry={} config_watch={:?} targets={:?}",
+            "start: project={} xcode={:?} dd={:?} command_line={:?} telemetry={} \
+             config_watch={:?} targets={:?}",
             server.project_path.display(),
             server.xcode,
             server.derived_data_path,
+            server.command_line(),
             server.telemetry.lock().is_ok_and(|t| t.is_some()),
             server.config_path,
             server.targets,
         ));
+        if let Some(warning) = &config.warning {
+            server.log(warning);
+        }
         Ok(server)
     }
 
@@ -618,10 +818,35 @@ impl Server {
             .map_or_else(|_| "Debug".into(), |c| c.configuration.clone())
     }
 
+    /// The command-line settings every resolution and prepare build take:
+    /// those in `bsp.json` (swapped live when it changes), then the caller's,
+    /// which win. The caller's `-xcconfig` replaces the file's.
+    fn command_line(&self) -> CommandLine {
+        let from_file = self
+            .live
+            .lock()
+            .map(|c| c.command_line.clone())
+            .unwrap_or_default();
+        CommandLine {
+            xcconfig: self.command_line.xcconfig.clone().or(from_file.xcconfig),
+            overrides: from_file
+                .overrides
+                .into_iter()
+                .chain(self.command_line.overrides.iter().cloned())
+                .collect(),
+        }
+    }
+
     /// Swap the live config and, when it actually changed, tell the client to
     /// re-pull options via `buildTarget/didChange`. A missing `configuration`
     /// keeps the current value; the diff prevents redundant refresh storms.
-    fn apply_config(&self, configuration: Option<&str>, scheme: Option<String>) {
+    fn apply_config(
+        &self,
+        configuration: Option<&str>,
+        scheme: Option<String>,
+        destination_platform: Option<String>,
+        command_line: CommandLine,
+    ) {
         let next = {
             let Ok(mut live) = self.live.lock() else {
                 return;
@@ -630,6 +855,8 @@ impl Server {
                 configuration: configuration
                     .map_or_else(|| live.configuration.clone(), str::to_string),
                 scheme,
+                destination_platform,
+                command_line,
             };
             if updated == *live {
                 return;
@@ -638,14 +865,16 @@ impl Server {
             updated
         };
         self.log(&format!(
-            "config changed: configuration={} scheme={:?}",
-            next.configuration, next.scheme
+            "config changed: configuration={} scheme={:?} destination_platform={:?} command_line={:?}",
+            next.configuration, next.scheme, next.destination_platform, next.command_line
         ));
         self.notify_targets_changed();
     }
 
     /// Re-read `bsp.json` after a change: apply the volatile selection
-    /// (configuration + scheme) live via [`Self::apply_config`], and bind the
+    /// (configuration, scheme, destination platform and command-line
+    /// settings) live via
+    /// [`Self::apply_config`], and bind the
     /// telemetry socket if one has just appeared. Immutable fields (project/
     /// xcode/derived data) are deliberately not refreshed — they're fixed at
     /// startup, so a change to them needs a server restart.
@@ -656,12 +885,18 @@ impl Server {
         let Ok(value) = serde_json::from_str::<Value>(&raw) else {
             return;
         };
-        let configuration = value.get("configuration").and_then(Value::as_str);
-        let scheme = value
-            .get("scheme")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        self.apply_config(configuration, scheme);
+        let configuration = configuration_of(&value);
+        let pull = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+        let (command_line, warning) = command_line_of(&value, &config_base(&value, path));
+        if let Some(warning) = &warning {
+            self.log(warning);
+        }
+        self.apply_config(
+            configuration.as_deref(),
+            pull("scheme"),
+            pull("destinationPlatform"),
+            command_line,
+        );
         let socket = value
             .get("socket")
             .and_then(Value::as_str)
@@ -799,7 +1034,7 @@ impl Server {
         // build's DerivedData, also advertise its index store for project-wide
         // navigation from the index-while-building data.
         let mut data = json!({ "sourceKitOptionsProvider": true, "prepareProvider": true });
-        if let Some(dd) = self.derived_data_dir() {
+        if let Some(dd) = self.derived_data().map(|l| l.folder) {
             data["indexStorePath"] = json!(dd.join("Index.noindex/DataStore").to_string_lossy());
             data["indexDatabasePath"] =
                 json!(dd.join("Index.noindex/IndexDatabase").to_string_lossy());
@@ -814,26 +1049,35 @@ impl Server {
         })
     }
 
-    /// The build's DerivedData directory: the `--derived-data-path` override, else
-    /// Xcode's default `~/Library/Developer/Xcode/DerivedData/<name>-<hash>`.
-    fn derived_data_dir(&self) -> Option<PathBuf> {
-        if let Some(dd) = &self.derived_data_path {
-            return Some(dd.clone());
+    /// Where the build's DerivedData lands: under the `--derived-data-path`
+    /// override, else wherever this machine's Xcode settings put it
+    /// (`~/Library/Developer/Xcode/DerivedData/<name>-<hash>` by default). The
+    /// same locator places the editor arguments' build products, since
+    /// [`Self::options_for`] reads the same settings.
+    ///
+    /// The folder is keyed the way `xcodebuild` keys the one it writes
+    /// ([`derived_data::ContainerKey`]): a root reached through a symlink, or
+    /// spelled `/private/tmp/…`, shares the folder of its standardized path.
+    /// The home is the account's, as `xcodebuild` finds it, whatever `$HOME`
+    /// says ([`sweetpad_lib::host::home`]). `None` without a home or an
+    /// override to find it from.
+    fn derived_data(&self) -> Option<derived_data::Locations> {
+        let home = sweetpad_lib::host::home()
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if home.is_empty() && self.derived_data_path.is_none() {
+            return None;
         }
-        // Hash the container path *as opened* (absolute, symlinks intact):
-        // Xcode keys DerivedData by the path it was launched on, so a project
-        // under a symlinked root (`/tmp` → `/private/tmp`) must hash the
-        // symlink spelling — `fs::canonicalize` here would compute a
-        // different DerivedData dir than the one Xcode/xcodebuild populate.
-        let abs = sweetpad_lib::project::absolutize(&self.project_path);
-        let name = abs.file_stem()?.to_string_lossy().into_owned();
-        let hash = sweetpad_lib::xcode_hash::derived_data_hash(&abs.to_string_lossy());
-        let home = std::env::var_os("HOME")?;
-        Some(
-            PathBuf::from(home)
-                .join("Library/Developer/Xcode/DerivedData")
-                .join(format!("{name}-{hash}")),
-        )
+        let key = derived_data::ContainerKey::of(&self.project_path);
+        if key.name.is_empty() {
+            return None;
+        }
+        Some(derived_data::resolve(
+            &key,
+            &home,
+            self.derived_data_path.as_deref(),
+            true,
+        ))
     }
 
     fn build_targets(&self) -> Value {
@@ -900,22 +1144,22 @@ impl Server {
             .ok()
             .and_then(|v| v.parse().ok())
             .map_or(Duration::from_millis(1500), Duration::from_millis);
-        let pbxprojs: Vec<PathBuf> = self
+        let documents: Vec<PathBuf> = self
             .projects
             .iter()
-            .map(|p| p.join("project.pbxproj"))
+            .flat_map(|p| document_paths(p))
             .collect();
         let config = self.config_path.clone();
         std::thread::spawn(move || {
             let stamp_all =
                 |paths: &[PathBuf]| paths.iter().map(|p| file_stamp(p)).collect::<Vec<_>>();
-            let mut last_pbx = stamp_all(&pbxprojs);
+            let mut last_doc = stamp_all(&documents);
             let mut last_cfg = config.as_deref().map(file_stamp);
             loop {
                 std::thread::sleep(interval);
-                let now_pbx = stamp_all(&pbxprojs);
-                if now_pbx != last_pbx {
-                    last_pbx = now_pbx;
+                let now_doc = stamp_all(&documents);
+                if now_doc != last_doc {
+                    last_doc = now_doc;
                     self.notify_targets_changed();
                 }
                 if let (Some(path), Some(prev)) = (config.as_deref(), last_cfg.as_mut()) {
@@ -1006,7 +1250,8 @@ impl Server {
     fn prepare_stamps(&self) -> Vec<Option<(u64, SystemTime)>> {
         self.projects
             .iter()
-            .map(|p| file_stamp(&p.join("project.pbxproj")))
+            .flat_map(|p| document_paths(p))
+            .map(|p| file_stamp(&p))
             .chain(self.config_path.as_deref().map(file_stamp))
             .collect()
     }
@@ -1123,6 +1368,10 @@ impl Server {
         if std::fs::create_dir_all(&products).is_err() {
             return false;
         }
+        let Some(tmp) = self.swiftc_tmp() else {
+            self.log(&format!("prepare: no TMPDIR to emit {module_name} in"));
+            return false;
+        };
         let swiftc = self.developer_dir().map_or_else(
             || PathBuf::from("swiftc"),
             |dev| dev.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"),
@@ -1131,20 +1380,21 @@ impl Server {
         if let Some(dev) = self.developer_dir() {
             cmd.env("DEVELOPER_DIR", dev);
         }
-        cmd.arg("-emit-module")
+        cmd.env("TMPDIR", &tmp)
+            .arg("-emit-module")
             .arg("-emit-module-path")
             .arg(&module_path)
             .args(&args);
-        match cmd.output() {
-            Ok(out) if out.status.success() => {
+        match self.run_prepare_process(&mut cmd) {
+            Ok((Some(status), _)) if status.success() => {
                 self.log(&format!(
                     "prepare: emitted module {module_name} -> {}",
                     module_path.display()
                 ));
                 true
             }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
+            Ok((_, stderr)) => {
+                let stderr = String::from_utf8_lossy(&stderr);
                 let tail: String = stderr.lines().rev().take(6).collect::<Vec<_>>().join(" | ");
                 self.log(&format!("prepare: emit {module_name} failed: {tail}"));
                 false
@@ -1163,7 +1413,7 @@ impl Server {
     fn prepare_command(&self, target: &str) -> (Command, String) {
         let owning = self.project_for_target(target);
         let scheme = project::scheme_for_target(&owning, target);
-        let (sdk, arch) = self.editor_platform(target);
+        let EditorPlatform { sdk, arch, .. } = self.editor_platform(target);
         let developer = self.developer_dir();
         let mut cmd = Command::new(developer.as_ref().map_or_else(
             || PathBuf::from("xcodebuild"),
@@ -1203,14 +1453,27 @@ impl Server {
             }
             format!("target {target} (-sdk {sdk} -arch {arch})")
         };
-        cmd.args(["-configuration", &self.configuration()])
-            // Prepare only needs modules, not a signed/launchable product, and
-            // must not stall on validation prompts in a headless run.
-            .args([
-                "CODE_SIGNING_ALLOWED=NO",
-                "-skipMacroValidation",
-                "-skipPackagePluginValidation",
-            ]);
+        cmd.args(["-configuration", &self.configuration()]);
+        // The settings the project's builds take, so the prepare build writes
+        // what the arguments above resolve against. Before the fixed ones
+        // below, which win: prepare never signs.
+        let command_line = self.command_line();
+        if let Some(xcconfig) = &command_line.xcconfig {
+            cmd.args(["-xcconfig".as_ref(), xcconfig.as_os_str()]);
+        }
+        cmd.args(
+            command_line
+                .overrides
+                .iter()
+                .map(|(k, v)| format!("{k}={v}")),
+        )
+        // Prepare only needs modules, not a signed/launchable product, and
+        // must not stall on validation prompts in a headless run.
+        .args([
+            "CODE_SIGNING_ALLOWED=NO",
+            "-skipMacroValidation",
+            "-skipPackagePluginValidation",
+        ]);
         (cmd, how)
     }
 
@@ -1229,14 +1492,18 @@ impl Server {
     fn xcodebuild_prepare(&self, target: &str, stamps: Vec<Option<(u64, SystemTime)>>) -> bool {
         let (mut cmd, how) = self.prepare_command(target);
         self.log(&format!("prepare: building {how} for target {target}"));
-        // Spawn (rather than `output()`) so the child stays killable: the pipe
-        // handles are taken first, then the child is parked in `prepare_child`
-        // where shutdown can reach it while this thread drains the pipes.
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
+        // The build keeps the server's `TMPDIR`, the user's, where SwiftPM's
+        // locks are shared, and leaves a `TemporaryDirectory.*` there.
+        let leftovers = TmpdirLeftovers::before(&cmd);
+        let ran = self.run_prepare_process(&mut cmd);
+        let removed = leftovers.remove();
+        if removed > 0 {
+            self.log(&format!(
+                "prepare: removed {removed} TemporaryDirectory.* the build left in TMPDIR"
+            ));
+        }
+        let (status, stderr_buf) = match ran {
+            Ok(ran) => ran,
             Err(e) => {
                 let detail = format!("could not launch xcodebuild: {e}");
                 self.log(&format!("prepare: {target} {detail}"));
@@ -1244,34 +1511,6 @@ impl Server {
                 return false;
             }
         };
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-        if let Ok(mut slot) = self.prepare_child.lock() {
-            *slot = Some(child);
-        }
-        // Drain stdout on a helper thread so neither pipe fills and wedges the
-        // build; stderr (the interesting stream on failure) drains here.
-        let stdout_drain = stdout_pipe.map(|mut s| {
-            std::thread::spawn(move || {
-                let mut sink = Vec::new();
-                let _ = s.read_to_end(&mut sink);
-            })
-        });
-        let mut stderr_buf = Vec::new();
-        if let Some(mut s) = stderr_pipe {
-            let _ = s.read_to_end(&mut stderr_buf);
-        }
-        if let Some(t) = stdout_drain {
-            let _ = t.join();
-        }
-        // Reap. Shutdown may have killed the child, but it leaves the handle in
-        // the slot for us — `wait` then just collects the killed status.
-        let status = self
-            .prepare_child
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
-            .and_then(|mut c| c.wait().ok());
         match status {
             Some(st) if st.success() => {
                 self.log(&format!("prepare: {target} build ok"));
@@ -1305,32 +1544,111 @@ impl Server {
     /// against. Empty when that directory can't be located, which leaves
     /// xcodebuild its own defaults rather than a half-pinned tree.
     fn build_roots(&self) -> Vec<(&'static str, PathBuf)> {
-        self.derived_data_dir().map_or_else(Vec::new, |dd| {
-            vec![
-                ("SYMROOT", dd.join("Build/Products")),
-                ("OBJROOT", dd.join("Build/Intermediates.noindex")),
-            ]
+        self.derived_data().map_or_else(Vec::new, |dd| {
+            vec![("SYMROOT", dd.products), ("OBJROOT", dd.intermediates)]
         })
     }
 
-    /// Kill the in-flight prepare build, if any (the prepare worker still owns
-    /// reaping — the handle stays in the slot). Called on shutdown so
-    /// `build/exit` doesn't orphan a running xcodebuild.
-    fn kill_prepare(&self) {
-        if let Ok(mut slot) = self.prepare_child.lock()
-            && let Some(child) = slot.as_mut()
-        {
-            let _ = child.kill();
+    /// Run `cmd` to the end as the prepare worker's process and return how it
+    /// exited (`None` when that can't be read) and what it wrote to stderr.
+    ///
+    /// Spawned rather than run with `output()` so the child stays killable: the
+    /// pipe handles are taken first, then the child is parked in
+    /// [`PrepareProcess::child`], where shutdown can reach it while this thread
+    /// drains the pipes. The spawn happens under the lock shutdown takes, so a
+    /// process is either parked before shutdown kills it or never spawned.
+    ///
+    /// # Errors
+    ///
+    /// When `cmd` can't be spawned, or the server is shutting down.
+    fn run_prepare_process(&self, cmd: &mut Command) -> io::Result<(Option<ExitStatus>, Vec<u8>)> {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (stdout_pipe, stderr_pipe) = {
+            let mut process = self
+                .prepare_process
+                .lock()
+                .map_err(|_| io::Error::other("the prepare lock is poisoned"))?;
+            if process.stopped {
+                return Err(io::Error::other("the server is shutting down"));
+            }
+            let mut child = cmd.spawn()?;
+            let pipes = (child.stdout.take(), child.stderr.take());
+            process.child = Some(child);
+            pipes
+        };
+        // Drain stdout on a helper thread so neither pipe fills and wedges the
+        // process; stderr (the interesting stream on failure) drains here.
+        let stdout_drain = stdout_pipe.map(|mut s| {
+            std::thread::spawn(move || {
+                let mut sink = Vec::new();
+                let _ = s.read_to_end(&mut sink);
+            })
+        });
+        let mut stderr = Vec::new();
+        if let Some(mut s) = stderr_pipe {
+            let _ = s.read_to_end(&mut stderr);
         }
+        if let Some(t) = stdout_drain {
+            let _ = t.join();
+        }
+        // Reap. Shutdown may have killed the child, but it leaves the handle in
+        // the slot for us — `wait` then just collects the killed status.
+        let status = self
+            .prepare_process
+            .lock()
+            .ok()
+            .and_then(|mut process| process.child.take())
+            .and_then(|mut c| c.wait().ok());
+        Ok((status, stderr))
+    }
+
+    /// The `TMPDIR` for a prepare `swiftc` (see [`PrepareProcess::swiftc_tmp`]),
+    /// made on first use. `None` once the server is shutting down, or when the
+    /// directory can't be made.
+    fn swiftc_tmp(&self) -> Option<PathBuf> {
+        let mut process = self.prepare_process.lock().ok()?;
+        if process.stopped {
+            return None;
+        }
+        if process.swiftc_tmp.is_none() {
+            process.swiftc_tmp = ScratchDir::new("sweetpad-bsp-swiftc").ok();
+        }
+        process.swiftc_tmp.as_deref().map(Path::to_path_buf)
+    }
+
+    /// Stop the prepare worker's processes: kill the one running, if any, wait
+    /// for it, and remove the `TMPDIR` the `swiftc`s ran with. Nothing is
+    /// spawned after this. Called on shutdown, so `build/exit` neither orphans
+    /// a running prepare nor leaves what it wrote in `TMPDIR`. The handle
+    /// stays in the slot for the worker to reap, which then collects the
+    /// status this wait already did.
+    fn kill_prepare(&self) {
+        let Ok(mut process) = self.prepare_process.lock() else {
+            return;
+        };
+        process.stopped = true;
+        if let Some(child) = process.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Removed only now that the process is gone: a live one could still
+        // be writing there.
+        process.swiftc_tmp = None;
     }
 
     fn sources(&self, params: Option<&Value>) -> Value {
         let requested = self.requested_targets(params);
+        let listing = self.listed_sources();
         let items: Vec<Value> = requested
             .iter()
             .map(|target| {
-                let sources: Vec<Value> = self
-                    .source_files(target)
+                let files = listing
+                    .iter()
+                    .find(|(t, _)| t == target)
+                    .map_or_else(|| self.source_files(target), |(_, files)| files.clone());
+                let sources: Vec<Value> = files
                     .iter()
                     .map(|p| json!({ "uri": file_uri(p), "kind": 1, "generated": false }))
                     .collect();
@@ -1351,10 +1669,10 @@ impl Server {
         // Re-read the target list (not the startup snapshot) so files in a
         // target added after `buildTarget/didChange` resolve to an owner.
         let owning: Vec<Value> = self
-            .current_targets()
+            .listed_sources()
             .iter()
-            .filter(|t| sources_contain(&self.source_files(t), &path, &standardized))
-            .map(|t| target_id(t))
+            .filter(|(_, files)| sources_contain(files, &path, &standardized))
+            .map(|(t, _)| target_id(t))
             .collect();
         json!({ "targets": owning })
     }
@@ -1379,8 +1697,8 @@ impl Server {
             return self.header_options(&path);
         }
 
-        // The owning target: the request's `target`, else the first whose source
-        // list contains the file.
+        // The owning target: the request's `target`, else the first that lists
+        // the file.
         let standardized = project::standardize(&path);
         let target = params
             .get("target")
@@ -1388,9 +1706,10 @@ impl Server {
             .and_then(Value::as_str)
             .map(target_name_from_uri)
             .or_else(|| {
-                self.current_targets()
+                self.listed_sources()
                     .into_iter()
-                    .find(|t| sources_contain(&self.source_files(t), &path, &standardized))
+                    .find(|(_, files)| sources_contain(files, &path, &standardized))
+                    .map(|(t, _)| t)
             });
 
         let Some(target) = target else {
@@ -1423,8 +1742,7 @@ impl Server {
             ));
             return Value::Null;
         };
-        let (sdk, arch) = self.editor_platform(&target);
-        let opts = self.options_for(&target, &sdk, &arch);
+        let opts = self.editor_options(&target, &self.editor_platform(&target));
         let inv = match build_settings::resolve_file_arguments(&opts, &companion) {
             Ok(inv) => inv,
             Err(e) => {
@@ -1512,6 +1830,77 @@ impl Server {
             )
     }
 
+    /// Every current target with its source files, except that a file several
+    /// targets compile is listed only under the ones [`OwnerRanking`] prefers. sourcekit-lsp reads a file through one of the targets listing
+    /// it, the first by target URI, so without this a file shared by an iOS
+    /// and a watchOS app reads as whichever name sorts first, and the
+    /// `#if os(…)` branch of the app being built goes dead. The arguments for
+    /// each target's other files still name every file it compiles.
+    fn listed_sources(&self) -> Vec<(String, Vec<PathBuf>)> {
+        let mut listing: Vec<(String, Vec<PathBuf>)> = self
+            .current_targets()
+            .into_iter()
+            .map(|target| {
+                let files = self.source_files(&target);
+                (target, files)
+            })
+            .collect();
+        let mut owners: BTreeMap<&Path, Vec<&str>> = BTreeMap::new();
+        for (target, files) in &listing {
+            for file in files {
+                let entry = owners.entry(file).or_default();
+                if !entry.contains(&target.as_str()) {
+                    entry.push(target);
+                }
+            }
+        }
+        let mut ranking = OwnerRanking::new(self);
+        let mut unlisted: BTreeSet<(String, PathBuf)> = BTreeSet::new();
+        for (file, targets) in owners.into_iter().filter(|(_, t)| t.len() > 1) {
+            let keep = ranking.preferred(&targets);
+            for target in targets.into_iter().filter(|t| !keep.iter().any(|k| k == t)) {
+                unlisted.insert((target.to_string(), file.to_path_buf()));
+            }
+        }
+        ranking.log_decisions();
+        if unlisted.is_empty() {
+            return listing;
+        }
+        for (target, files) in &mut listing {
+            files.retain(|f| !unlisted.contains(&(target.clone(), f.clone())));
+        }
+        listing
+    }
+
+    /// The targets the scheme `name` builds: its build entries, then the
+    /// targets those depend on. A scheme with no file is one Xcode
+    /// autocreates, which builds the target it is named after.
+    fn scheme_targets(&self, name: &str) -> (Vec<String>, Vec<String>) {
+        let entries: Vec<String> = match scheme::locate(&self.project_path, name) {
+            Some(path) => scheme::parse_file(&path)
+                .map(|s| {
+                    s.build_entries
+                        .into_iter()
+                        .map(|e| e.buildable.blueprint_name)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => vec![name.to_string()],
+        };
+        let mut built = entries.clone();
+        for target in &entries {
+            let dependencies =
+                project::transitive_dependencies(&self.project_for_target(target), target)
+                    .unwrap_or_default();
+            for dependency in dependencies {
+                if !built.contains(&dependency) {
+                    built.push(dependency);
+                }
+            }
+        }
+        (entries, built)
+    }
+
     fn source_files(&self, target: &str) -> Vec<PathBuf> {
         project::target_source_files(&self.project_for_target(target), target).unwrap_or_default()
     }
@@ -1521,8 +1910,7 @@ impl Server {
     /// file the whole module), reduced to an editor invocation (no build actions
     /// / explicit-module plumbing), with the inputs appended.
     fn compiler_arguments(&self, target: &str, file: &Path) -> Option<Vec<String>> {
-        let (sdk, arch) = self.editor_platform(target);
-        let opts = self.options_for(target, &sdk, &arch);
+        let opts = self.editor_options(target, &self.editor_platform(target));
         let inv = match build_settings::resolve_file_arguments(&opts, file) {
             Ok(inv) => inv,
             Err(e) => {
@@ -1544,21 +1932,134 @@ impl Server {
         Some(args)
     }
 
-    /// The SDK + arch sourcekit-lsp should analyze `target` with. We infer the
-    /// platform from the target's `SUPPORTED_PLATFORMS` and pick the **simulator**
-    /// for device platforms (editor-friendly — no device/signing, and the usual
-    /// dev build), defaulting to macOS. Arch defaults to the host's (simulator
-    /// and macOS builds match the host: arm64 on Apple Silicon, x86_64 on
-    /// Intel). `--sdk`/`--arch` flags override, each independently.
-    fn editor_platform(&self, target: &str) -> (String, String) {
-        let arch = self.arch.clone().unwrap_or_else(|| host_arch().to_string());
+    /// The SDK + arch sourcekit-lsp should analyze `target` with: the
+    /// selected destination's platform when the target builds for it, as a
+    /// target listing `macosx` builds natively for My Mac and a Catalyst one
+    /// builds as Catalyst; otherwise the platform its `SDKROOT` or
+    /// `SUPPORTED_PLATFORMS` names ([`editor_sdk_for`]). Either way a device
+    /// platform reads as its **simulator** (editor-friendly — no
+    /// device/signing, and the usual dev build). Arch defaults to the host's
+    /// (simulator and macOS builds match the host: arm64 on Apple Silicon,
+    /// x86_64 on Intel). `--sdk`/`--arch` flags override, each independently.
+    fn editor_platform(&self, target: &str) -> EditorPlatform {
+        let arch = self.editor_arch();
         if let Some(sdk) = self.sdk.as_deref() {
-            return (sdk.to_string(), arch);
+            return EditorPlatform {
+                sdk: sdk.to_string(),
+                arch,
+                catalyst: false,
+            };
         }
-        // Read the target's *authored* SDKROOT (e.g. `iphoneos`): a real `--sdk`
-        // replaces SDKROOT with that SDK's path, but a sentinel the catalog
-        // doesn't know leaves it untouched. Map the platform to its simulator.
-        let probe = self.options_for(target, "auto", &arch);
+        let (sdkroot, supported) = self.authored_platform(target);
+        let destination = self.destination_family();
+        let native = destination.filter(|d| platform_families(&sdkroot, &supported).contains(d));
+        let catalyst =
+            native.is_none() && destination == Some("macosx") && self.builds_as_catalyst(target);
+        let sdk = native
+            .or(catalyst.then_some("macosx"))
+            .unwrap_or_else(|| editor_sdk_for(&sdkroot, &supported));
+        self.log(&format!(
+            "platform {target}: SDKROOT={sdkroot:?} platforms={supported:?} \
+             destination={destination:?} -> sdk={sdk} catalyst={catalyst} arch={arch}"
+        ));
+        EditorPlatform {
+            sdk: sdk.to_string(),
+            arch,
+            catalyst,
+        }
+    }
+
+    /// The options that resolve `target` for the editor on `platform`. A
+    /// Catalyst target resolves through a Mac run destination.
+    fn editor_options(&self, target: &str, platform: &EditorPlatform) -> BuildSettingsOptions {
+        let mut opts = self.options_for(target, &platform.sdk, &platform.arch);
+        if platform.catalyst {
+            opts.destination = mac_destination(&platform.arch);
+        }
+        opts
+    }
+
+    /// The selected destination's platform, named by the SDK the editor reads
+    /// it with ([`platform_family`]).
+    fn destination_family(&self) -> Option<&'static str> {
+        self.live
+            .lock()
+            .ok()
+            .and_then(|l| l.destination_platform.as_deref().and_then(platform_family))
+    }
+
+    /// Whether `target` builds for the destination platform `destination`
+    /// ([`platform_family`]): natively, or on a Mac as Mac Catalyst.
+    fn builds_for(&self, target: &str, destination: &str) -> bool {
+        let (sdkroot, supported) = self.authored_platform(target);
+        platform_families(&sdkroot, &supported).contains(&destination)
+            || (destination == "macosx" && self.builds_as_catalyst(target))
+    }
+
+    /// Whether `target` builds as Mac Catalyst for a Mac destination, the
+    /// way `xcodebuild -destination platform=macOS` builds it: through the
+    /// selected scheme when it builds the target, since that build takes one
+    /// variant from its apps, and a framework a "Designed for iPad" app
+    /// embeds builds for `iphoneos` although on its own it would take
+    /// Catalyst; otherwise the target alone. Read once per project and
+    /// `bsp.json` stamps.
+    fn builds_as_catalyst(&self, target: &str) -> bool {
+        let stamps = self.prepare_stamps();
+        if let Ok(cache) = self.catalyst.lock()
+            && cache.stamps == stamps
+            && let Some(catalyst) = cache.targets.get(target)
+        {
+            return *catalyst;
+        }
+        let arch = self.editor_arch();
+        let resolve = |scheme: Option<String>| {
+            let mut opts = self.options_for(target, "macosx", &arch);
+            if scheme.is_some() {
+                opts.target = None;
+                opts.scheme = scheme;
+            }
+            opts.destination = mac_destination(&arch);
+            opts.keys = Some(vec!["IS_MACCATALYST".to_string()]);
+            build_settings::resolve_build_settings(&opts)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| {
+                    (
+                        t.target,
+                        t.settings.get("IS_MACCATALYST").is_some_and(|v| v == "YES"),
+                    )
+                })
+                .collect::<BTreeMap<String, bool>>()
+        };
+        let scheme = self.live.lock().ok().and_then(|l| l.scheme.clone());
+        let mut found = scheme.map(|s| resolve(Some(s))).unwrap_or_default();
+        if !found.contains_key(target) {
+            found.extend(resolve(None));
+        }
+        let catalyst = found.get(target).copied().unwrap_or(false);
+        if let Ok(mut cache) = self.catalyst.lock() {
+            if cache.stamps != stamps {
+                *cache = CatalystTargets {
+                    stamps,
+                    targets: BTreeMap::new(),
+                };
+            }
+            cache.targets.extend(found);
+            cache.targets.entry(target.to_string()).or_insert(catalyst);
+        }
+        catalyst
+    }
+
+    fn editor_arch(&self) -> String {
+        self.arch.clone().unwrap_or_else(|| host_arch().to_string())
+    }
+
+    /// `target`'s *authored* `SDKROOT` (e.g. `iphoneos`) and
+    /// `SUPPORTED_PLATFORMS`, lowercased. A real `--sdk` replaces SDKROOT with
+    /// that SDK's path, but a sentinel the catalog doesn't know leaves it
+    /// untouched.
+    fn authored_platform(&self, target: &str) -> (String, String) {
+        let probe = self.options_for(target, "auto", &self.editor_arch());
         let settings = build_settings::resolve_build_settings(&probe)
             .ok()
             .and_then(|mut t| {
@@ -1574,28 +2075,22 @@ impl Server {
                 .unwrap_or_default()
                 .to_lowercase()
         };
-        let sdkroot = read("SDKROOT");
-        let supported = read("SUPPORTED_PLATFORMS");
-        let sdk = editor_sdk_for(&sdkroot, &supported);
-        self.log(&format!(
-            "platform {target}: SDKROOT={sdkroot:?} platforms={supported:?} -> sdk={sdk} arch={arch}"
-        ));
-        (sdk.to_string(), arch)
+        (read("SDKROOT"), read("SUPPORTED_PLATFORMS"))
     }
 
     fn options_for(&self, target: &str, sdk: &str, arch: &str) -> BuildSettingsOptions {
         // For a `.xcworkspace` root, resolve *through the workspace* rather than
         // the owning member project: `xcodebuild_prepare` builds with
         // `-workspace`, so DerivedData is keyed by the workspace path, and the
-        // resolver only hashes that container when the workspace is declared
-        // (container *inference* only finds a workspace in the project's parent
-        // or grandparent dir — a member nested deeper would resolve search
-        // paths in a DerivedData tree the prepare build never populates).
+        // resolver only hashes that container when the workspace is declared.
+        // A project root prepares with `-project`, which keys it by the
+        // project, as the resolver does with no workspace declared.
         let (project, workspace) = if self.is_workspace() {
             (None, Some(self.project_path.clone()))
         } else {
             (Some(self.project_for_target(target)), None)
         };
+        let command_line = self.command_line();
         BuildSettingsOptions {
             project,
             workspace,
@@ -1605,12 +2100,15 @@ impl Server {
             sdk: sdk.to_string(),
             arch: arch.to_string(),
             destination: None,
-            xcconfig: None,
+            // The project's builds pass these on the command line, and the
+            // index has to read the target the way they build it.
+            xcconfig: command_line.xcconfig,
             xcode: self.xcode.clone(),
             xcspec_root: None,
             sdksettings_root: None,
             catalog_cache: None,
             derived_data_path: self.derived_data_path.clone(),
+            overrides: command_line.overrides,
             // The index must point at the same tree the editor's builds write
             // to, so honour whatever this machine's Xcode is configured with.
             read_xcode_locations: true,
@@ -1690,7 +2188,7 @@ fn file_uri(path: &Path) -> String {
     out
 }
 
-fn path_from_uri(uri: &str) -> PathBuf {
+pub(crate) fn path_from_uri(uri: &str) -> PathBuf {
     PathBuf::from(percent_decode(uri.strip_prefix("file://").unwrap_or(uri)))
 }
 
@@ -1787,6 +2285,17 @@ fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Both names an `.xcodeproj` can hold its document under. Stamping the pair
+/// rather than the one that exists right now keeps the fingerprint honest
+/// across a conversion between the two formats, where the file that carries
+/// the project changes name.
+fn document_paths(xcodeproj: &Path) -> [PathBuf; 2] {
+    [
+        xcodeproj.join("project.pbxproj"),
+        xcodeproj.join(sweetpad_lib::xcproj::DOCUMENT_NAME),
+    ]
+}
+
 /// A change fingerprint for a file — `(len, mtime)`, or `None` if it can't be
 /// stat'd. Comparing it across polls detects an edit without a notify dependency.
 fn file_stamp(path: &Path) -> Option<(u64, SystemTime)> {
@@ -1808,17 +2317,10 @@ fn arg_values(args: &[String], flag: &str) -> Vec<String> {
 /// The `xcodebuild -destination 'generic/platform=…'` name for an SDK, used to
 /// build a target for the platform the editor analyzes it as.
 fn platform_name(sdk: &str) -> &'static str {
-    match sdk {
-        s if s.starts_with("iphonesimulator") => "iOS Simulator",
-        s if s.starts_with("iphoneos") => "iOS",
-        s if s.starts_with("appletvsimulator") => "tvOS Simulator",
-        s if s.starts_with("appletvos") => "tvOS",
-        s if s.starts_with("watchsimulator") => "watchOS Simulator",
-        s if s.starts_with("watchos") => "watchOS",
-        s if s.starts_with("xrsimulator") => "visionOS Simulator",
-        s if s.starts_with("xros") => "visionOS",
-        _ => "macOS",
-    }
+    sweetpad_lib::destination::Platform::from_sdk(&sweetpad_lib::project::canonicalize_sdk_base(
+        sdk,
+    ))
+    .map_or("macOS", |p| p.label)
 }
 
 impl Server {
@@ -1835,13 +2337,13 @@ impl Server {
         self.send(&resp)
     }
 
-    /// Write one JSON-RPC message to stdout, holding the lock for the whole frame
-    /// so the request loop and the watcher thread never interleave output.
+    /// Write one JSON-RPC message to the output, holding the lock for the whole
+    /// frame so the request loop and the watcher thread never interleave
+    /// output.
     fn send(&self, msg: &Value) -> Result<(), String> {
         self.trace(&format!("send: {msg}"));
-        let stdout = io::stdout();
-        let mut writer = stdout.lock();
-        write_message(&mut writer, &msg.to_string())
+        let mut out = self.out.lock().unwrap_or_else(PoisonError::into_inner);
+        write_message(&mut *out, &msg.to_string())
     }
 }
 
@@ -1881,9 +2383,793 @@ fn editor_sdk_for(sdkroot: &str, supported_platforms: &str) -> &'static str {
     }
 }
 
+/// The SDK the editor reads `platform` (an SDK or platform name) with, as
+/// [`editor_sdk_for`] picks it, which names a device platform by its
+/// simulator. `None` for a value that names no platform.
+fn platform_family(platform: &str) -> Option<&'static str> {
+    let platform = platform.trim();
+    if platform.is_empty() || platform.eq_ignore_ascii_case("auto") || platform.contains("$(") {
+        return None;
+    }
+    Some(editor_sdk_for(platform, ""))
+}
+
+/// The run destination for this Mac, as a build for My Mac names it.
+fn mac_destination(arch: &str) -> Option<sweetpad_lib::destination::RunDestination> {
+    sweetpad_lib::destination::parse_destination_arg(&format!("platform=macOS,arch={arch}"))
+}
+
+/// The platforms a target with `sdkroot` and `supported_platforms` builds
+/// for, each named by the SDK the editor reads it with ([`platform_family`]).
+fn platform_families(sdkroot: &str, supported_platforms: &str) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for platform in std::iter::once(sdkroot).chain(supported_platforms.split_whitespace()) {
+        if let Some(family) = platform_family(platform)
+            && !out.contains(&family)
+        {
+            out.push(family);
+        }
+    }
+    out
+}
+
+/// Picks which of a shared file's targets list it: the ones the selected
+/// scheme builds, its own entries before the targets they depend on, then of
+/// those left the ones that build for the selected destination's platform.
+/// A rule that matches none of them leaves the set as it was, so with nothing
+/// selected every target keeps the file. The scheme of an iOS app that embeds
+/// its watchOS app builds both, and settles on the iOS app as its own entry.
+struct OwnerRanking<'a> {
+    server: &'a Server,
+    scheme: Option<String>,
+    destination: Option<&'static str>,
+    /// [`Server::scheme_targets`], read on first use.
+    scheme_targets: Option<(Vec<String>, Vec<String>)>,
+    /// [`Server::builds_for`] the destination per target, read on first use.
+    builds: BTreeMap<String, bool>,
+    /// Each set of owners decided, with the targets kept and the number of
+    /// files it decided for.
+    decisions: BTreeMap<Vec<String>, (Vec<String>, usize)>,
+}
+
+impl<'a> OwnerRanking<'a> {
+    fn new(server: &'a Server) -> Self {
+        let (scheme, destination) = server
+            .live
+            .lock()
+            .map(|l| (l.scheme.clone(), l.destination_platform.clone()))
+            .unwrap_or_default();
+        Self {
+            server,
+            scheme,
+            destination: destination.as_deref().and_then(platform_family),
+            scheme_targets: None,
+            builds: BTreeMap::new(),
+            decisions: BTreeMap::new(),
+        }
+    }
+
+    fn preferred(&mut self, owners: &[&str]) -> Vec<String> {
+        let key: Vec<String> = owners.iter().map(|t| (*t).to_string()).collect();
+        if let Some((keep, files)) = self.decisions.get_mut(&key) {
+            *files += 1;
+            return keep.clone();
+        }
+        let mut keep = key.clone();
+        if let Some(scheme) = &self.scheme {
+            let (entries, built) = self
+                .scheme_targets
+                .get_or_insert_with(|| self.server.scheme_targets(scheme));
+            narrow(&mut keep, |t| entries.iter().any(|e| e == t));
+            narrow(&mut keep, |t| built.iter().any(|b| b == t));
+        }
+        if keep.len() > 1
+            && let Some(destination) = self.destination
+        {
+            let (server, builds) = (self.server, &mut self.builds);
+            narrow(&mut keep, |t| {
+                *builds
+                    .entry(t.to_string())
+                    .or_insert_with(|| server.builds_for(t, destination))
+            });
+        }
+        self.decisions.insert(key, (keep.clone(), 1));
+        keep
+    }
+
+    /// Log each set of owners a rule narrowed, once per [`Server::listed_sources`].
+    fn log_decisions(&self) {
+        for (owners, (keep, files)) in &self.decisions {
+            if keep.len() < owners.len() {
+                self.server.log(&format!(
+                    "shared sources: {files} file(s) of {owners:?} listed under {keep:?} \
+                     (scheme={:?} destination={:?})",
+                    self.scheme, self.destination
+                ));
+            }
+        }
+    }
+}
+
+/// Keep the `targets` that `rule` accepts, unless it accepts none of them.
+fn narrow(targets: &mut Vec<String>, mut rule: impl FnMut(&str) -> bool) {
+    let kept: Vec<String> = targets.iter().filter(|t| rule(t)).cloned().collect();
+    if !kept.is_empty() {
+        *targets = kept;
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{editor_sdk_for, path_from_uri};
+    use super::{
+        CommandLine, LogLevel, ResolvedConfig, Server, Value, derived_data, editor_sdk_for,
+        file_uri, parse_flags, path_from_uri, target_name_from_uri, write_config,
+    };
+    use std::collections::BTreeMap;
+    use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicU8;
+    use std::sync::{Arc, Mutex};
+
+    /// The protocol output of a server under test, kept where the test can
+    /// read it. On stdout its frames would run into cargo's test lines.
+    #[derive(Clone, Default)]
+    struct Sent(Arc<Mutex<Vec<u8>>>);
+
+    impl Sent {
+        fn writer(&self) -> Box<dyn Write + Send> {
+            Box::new(self.clone())
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl Write for Sent {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_projects_command_line_reaches_resolution_and_the_prepare_build() {
+        let project = format!(
+            "{}/fixtures/_synthetic-objectversion-110/project/SweetpadCIApp.xcodeproj",
+            env!("SWEETPAD_LIB_DIR")
+        );
+        let flags = parse_flags(&["--project".to_string(), project.clone()]);
+        let command_line = CommandLine {
+            xcconfig: Some(PathBuf::from("/work/ci.xcconfig")),
+            overrides: vec![
+                (
+                    "SWIFT_ACTIVE_COMPILATION_CONDITIONS".into(),
+                    "STAGING".into(),
+                ),
+                ("CODE_SIGNING_ALLOWED".into(), "YES".into()),
+            ],
+        };
+        let server = Server::build(
+            ResolvedConfig::from_flags(PathBuf::from(&project), &flags),
+            None,
+            Arc::new(AtomicU8::new(LogLevel::Info as u8)),
+            command_line.clone(),
+            Sent::default().writer(),
+        )
+        .unwrap();
+
+        let opts = server.options_for("SweetpadCIMac", "macosx", "arm64");
+        assert_eq!(opts.xcconfig, command_line.xcconfig);
+        assert_eq!(opts.overrides, command_line.overrides);
+
+        // The prepare build takes them too, ahead of the settings prepare
+        // fixes for itself: a prepare never signs.
+        let (cmd, _) = server.prepare_command("SweetpadCIMac");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-xcconfig", "/work/ci.xcconfig"]),
+            "{args:?}"
+        );
+        let at = |arg: &str| args.iter().position(|a| a == arg);
+        let staging = at("SWIFT_ACTIVE_COMPILATION_CONDITIONS=STAGING").expect("the setting");
+        let allowed = at("CODE_SIGNING_ALLOWED=YES").expect("the setting");
+        let unsigned = at("CODE_SIGNING_ALLOWED=NO").expect("prepare's own setting");
+        assert!(staging < unsigned && allowed < unsigned, "{args:?}");
+    }
+
+    /// A copy of the synthetic fixture project, with the embedded
+    /// `project.xcworkspace` Xcode writes into every bundle.
+    fn project_with_embedded_workspace(tag: &str) -> (crate::scratch::ScratchDir, PathBuf) {
+        let scratch = crate::scratch::ScratchDir::new(tag).unwrap();
+        let project = scratch.join("SweetpadCIApp.xcodeproj");
+        std::fs::create_dir_all(project.join("project.xcworkspace")).unwrap();
+        std::fs::copy(
+            format!(
+                "{}/fixtures/_synthetic-objectversion-110/project/SweetpadCIApp.xcodeproj/project.pbxproj",
+                env!("SWEETPAD_LIB_DIR")
+            ),
+            project.join("project.pbxproj"),
+        )
+        .unwrap();
+        (scratch, project)
+    }
+
+    /// A server pointed at a project's embedded workspace serves the project:
+    /// its index store is in the `<Project>-<hash of the project>` folder
+    /// `xcodebuild -workspace Foo.xcodeproj/project.xcworkspace` builds into,
+    /// not a `project-<hash>` folder nothing writes.
+    #[test]
+    fn an_embedded_workspace_root_serves_its_project() {
+        let (_scratch, project) = project_with_embedded_workspace("sweetpad-bsp-stub");
+        let stub = project.join("project.xcworkspace");
+        let flags = parse_flags(&["--workspace".to_string(), stub.display().to_string()]);
+        let server = Server::build(
+            ResolvedConfig::from_flags(stub, &flags),
+            None,
+            Arc::new(AtomicU8::new(LogLevel::Info as u8)),
+            CommandLine::default(),
+            Sent::default().writer(),
+        )
+        .unwrap();
+        assert_eq!(server.project_path, project);
+        assert_eq!(server.projects, std::slice::from_ref(&project));
+        assert!(!server.is_workspace());
+        if sweetpad_lib::host::home().is_some() {
+            let store = server.initialize()["data"]["indexStorePath"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let folder = derived_data::ContainerKey::of(&project).folder_name();
+            assert!(store.contains(&format!("/{folder}/")), "{store}");
+        }
+    }
+
+    /// `bsp init` on a project's embedded workspace writes `buildServer.json`
+    /// beside the `.xcodeproj`, where sourcekit-lsp looks, with the server
+    /// pointed at the project.
+    #[test]
+    fn an_embedded_workspace_config_is_written_beside_its_project() {
+        let (scratch, project) = project_with_embedded_workspace("sweetpad-bsp-stub-config");
+        let stub = project.join("project.xcworkspace");
+        write_config(
+            &["--workspace".to_string(), stub.display().to_string()],
+            &["bsp"],
+        )
+        .unwrap();
+        let written: Value = serde_json::from_str(
+            &std::fs::read_to_string(scratch.join("buildServer.json")).unwrap(),
+        )
+        .unwrap();
+        let argv: Vec<&str> = written["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let canonical = std::fs::canonicalize(&project).unwrap();
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--project", &*canonical.to_string_lossy()]),
+            "{argv:?}"
+        );
+        assert!(!project.join("buildServer.json").exists());
+    }
+
+    /// The extension writes `sweetpad.build.args` into `bsp.json` as
+    /// `buildArgs`. Their settings and `-xcconfig` reach resolution and the
+    /// prepare build under the caller's, follow the file when it changes, and
+    /// a file without them has none.
+    #[test]
+    fn the_command_line_in_bsp_json_is_read_and_follows_the_file() {
+        let project = format!(
+            "{}/fixtures/_synthetic-objectversion-110/project/SweetpadCIApp.xcodeproj",
+            env!("SWEETPAD_LIB_DIR")
+        );
+        let scratch = crate::scratch::ScratchDir::new("sweetpad-bsp-json").unwrap();
+        let config = scratch.join("bsp.json");
+        let write = |body: serde_json::Value| {
+            std::fs::write(&config, body.to_string()).unwrap();
+        };
+        write(serde_json::json!({
+            "workspacePath": *scratch,
+            "projectPath": project,
+            "buildArgs": [
+                "SWIFT_ACTIVE_COMPILATION_CONDITIONS=STAGING",
+                "-destination",
+                "platform=macOS",
+                "-xcconfig",
+                "ci.xcconfig",
+                "A=b=c",
+            ],
+        }));
+        let sent = Sent::default();
+        let server = Server::build(
+            ResolvedConfig::from_file(&config, &BTreeMap::new()).unwrap(),
+            Some(config.clone()),
+            Arc::new(AtomicU8::new(LogLevel::Info as u8)),
+            CommandLine {
+                xcconfig: None,
+                overrides: vec![("A".into(), "typed".into())],
+            },
+            sent.writer(),
+        )
+        .unwrap();
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+
+        let opts = server.options_for("SweetpadCIMac", "macosx", "arm64");
+        assert_eq!(
+            opts.xcconfig,
+            Some(sweetpad_lib::project::standardize(&scratch).join("ci.xcconfig"))
+        );
+        assert_eq!(
+            opts.overrides,
+            [
+                pair("SWIFT_ACTIVE_COMPILATION_CONDITIONS", "STAGING"),
+                pair("A", "b=c"),
+                pair("A", "typed"),
+            ]
+        );
+        let (cmd, _) = server.prepare_command("SweetpadCIMac");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter()
+                .any(|a| a == "SWIFT_ACTIVE_COMPILATION_CONDITIONS=STAGING"),
+            "{args:?}"
+        );
+
+        write(serde_json::json!({
+            "workspacePath": *scratch,
+            "projectPath": project,
+            "buildArgs": ["SWIFT_ACTIVE_COMPILATION_CONDITIONS=BETA"],
+        }));
+        server.reload_from_file(&config);
+        let opts = server.options_for("SweetpadCIMac", "macosx", "arm64");
+        assert_eq!(opts.xcconfig, None);
+        assert_eq!(
+            opts.overrides,
+            [
+                pair("SWIFT_ACTIVE_COMPILATION_CONDITIONS", "BETA"),
+                pair("A", "typed"),
+            ]
+        );
+        // The change tells the client to pull the targets' options again.
+        let told = sent.text();
+        assert!(
+            told.starts_with("Content-Length: ") && told.contains(r#""buildTarget/didChange""#),
+            "{told}"
+        );
+
+        write(serde_json::json!({ "workspacePath": *scratch, "projectPath": project }));
+        server.reload_from_file(&config);
+        let opts = server.options_for("SweetpadCIMac", "macosx", "arm64");
+        assert_eq!(opts.overrides, [pair("A", "typed")]);
+    }
+
+    /// The extension's builds run `xcodebuild` in the workspace folder, which
+    /// `xcodebuild` knows by its physical path. Through a symlinked folder, a
+    /// relative `-xcconfig ../ci.xcconfig` in `buildArgs` is the real
+    /// folder's sibling, the way the CLI reads its arguments. A
+    /// `-derivedDataPath` there leaves DerivedData to `derivedDataPath`.
+    #[test]
+    fn build_args_paths_are_read_from_the_physical_workspace_folder() {
+        let project = format!(
+            "{}/fixtures/_synthetic-objectversion-110/project/SweetpadCIApp.xcodeproj",
+            env!("SWEETPAD_LIB_DIR")
+        );
+        let scratch = crate::scratch::ScratchDir::new("sweetpad-bsp-json-link").unwrap();
+        let real = scratch.join("real/app");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(scratch.join("elsewhere")).unwrap();
+        let link = scratch.join("elsewhere/link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let config = scratch.join("bsp.json");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "workspacePath": link,
+                "projectPath": project,
+                "buildArgs": ["-xcconfig", "../ci.xcconfig", "-derivedDataPath", "dd"],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let resolved = ResolvedConfig::from_file(&config, &BTreeMap::new()).unwrap();
+        let physical = sweetpad_lib::project::standardize(&real);
+        assert_eq!(
+            resolved.command_line.xcconfig,
+            Some(physical.parent().unwrap().join("ci.xcconfig"))
+        );
+        assert_eq!(resolved.derived_data_path, None);
+    }
+
+    /// A `buildArgs` that ends with a flag waiting for its value fails the
+    /// extension's builds. The index warns and reads the rest, the copy of the
+    /// flag before it included, the way the CLI reads the same arguments.
+    #[test]
+    fn a_trailing_flag_in_bsp_json_is_warned_about_and_left_out() {
+        let project = format!(
+            "{}/fixtures/_synthetic-objectversion-110/project/SweetpadCIApp.xcodeproj",
+            env!("SWEETPAD_LIB_DIR")
+        );
+        let scratch = crate::scratch::ScratchDir::new("sweetpad-bsp-dangling").unwrap();
+        let config = scratch.join("bsp.json");
+        let log = scratch.join("bsp.log");
+        std::fs::write(
+            &config,
+            serde_json::json!({
+                "workspacePath": *scratch,
+                "projectPath": project,
+                "logPath": log,
+                "buildArgs": ["-xcconfig", "ci.xcconfig", "FOO=1", "-xcconfig"],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let server = Server::build(
+            ResolvedConfig::from_file(&config, &BTreeMap::new()).unwrap(),
+            Some(config.clone()),
+            Arc::new(AtomicU8::new(LogLevel::Info as u8)),
+            CommandLine::default(),
+            Sent::default().writer(),
+        )
+        .unwrap();
+
+        let opts = server.options_for("SweetpadCIMac", "macosx", "arm64");
+        assert_eq!(
+            opts.xcconfig,
+            Some(sweetpad_lib::project::standardize(&scratch).join("ci.xcconfig"))
+        );
+        assert_eq!(opts.overrides, [("FOO".to_string(), "1".to_string())]);
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains(
+                "ignoring '-xcconfig' at the end of buildArgs: it has no value, and \
+                 xcodebuild refuses it"
+            ),
+            "{logged}"
+        );
+    }
+
+    /// A server over the shared-sources fixture, `bsp.json` written with
+    /// `scheme` and `destination`, and the `bsp.json` to rewrite it through.
+    fn shared_sources_server(
+        scratch: &Path,
+        scheme: Option<&str>,
+        destination: Option<&str>,
+    ) -> (Server, Sent, PathBuf) {
+        let config = scratch.join("bsp.json");
+        write_shared_sources_config(&config, scheme, destination);
+        let sent = Sent::default();
+        let server = Server::build(
+            ResolvedConfig::from_file(&config, &BTreeMap::new()).unwrap(),
+            Some(config.clone()),
+            Arc::new(AtomicU8::new(LogLevel::Info as u8)),
+            CommandLine::default(),
+            sent.writer(),
+        )
+        .unwrap();
+        (server, sent, config)
+    }
+
+    fn write_shared_sources_config(config: &Path, scheme: Option<&str>, destination: Option<&str>) {
+        let project = format!(
+            "{}/fixtures/_synthetic-shared-sources/project/SharedSources.xcodeproj",
+            env!("SWEETPAD_LIB_DIR")
+        );
+        let body = serde_json::json!({
+            "workspacePath": config.parent().unwrap(),
+            "projectPath": project,
+            "scheme": scheme,
+            "destinationPlatform": destination,
+        });
+        std::fs::write(config, body.to_string()).unwrap();
+    }
+
+    /// The targets `buildTarget/sources` lists a file ending in `file` under,
+    /// sorted.
+    fn listed_under(server: &Server, file: &str) -> Vec<String> {
+        let reply = server.sources(None);
+        let mut targets: Vec<String> = reply["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| {
+                item["sources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["uri"].as_str().unwrap().ends_with(file))
+            })
+            .map(|item| target_name_from_uri(item["target"]["uri"].as_str().unwrap()))
+            .collect();
+        targets.sort();
+        targets
+    }
+
+    /// sourcekit-lsp reads a file through the first target by URI that lists
+    /// it, so a file an iOS and a watchOS app share is listed only under the
+    /// one being built: the selected scheme's, then the selected
+    /// destination's. A rule that picks neither leaves both.
+    #[test]
+    fn a_shared_file_is_listed_under_the_target_being_built() {
+        let scratch = crate::scratch::ScratchDir::new("sweetpad-bsp-shared").unwrap();
+        let cases: [(Option<&str>, Option<&str>, &[&str]); 7] = [
+            (None, None, &["WatchApp", "iOSApp"]),
+            // Its own entry, over the watchOS app it embeds and so also builds.
+            (Some("iOSApp"), None, &["iOSApp"]),
+            // A scheme Xcode autocreates builds the target it is named after.
+            (Some("WatchApp"), None, &["WatchApp"]),
+            (Some("iOSApp"), Some("watchsimulator"), &["iOSApp"]),
+            (None, Some("watchsimulator"), &["WatchApp"]),
+            // A device destination picks the target its simulator would.
+            (None, Some("iphoneos"), &["iOSApp"]),
+            (Some("Elsewhere"), Some("watchos"), &["WatchApp"]),
+        ];
+        for (scheme, destination, expected) in cases {
+            let (server, _, _) = shared_sources_server(&scratch, scheme, destination);
+            assert_eq!(
+                listed_under(&server, "/Shared/Shared.swift"),
+                expected,
+                "scheme={scheme:?} destination={destination:?}"
+            );
+            // A file only one target compiles stays listed under it.
+            assert_eq!(
+                listed_under(&server, "/Watch/WatchMain.swift"),
+                ["WatchApp"]
+            );
+            assert_eq!(listed_under(&server, "/Phone/PhoneApp.swift"), ["iOSApp"]);
+        }
+    }
+
+    /// A destination picked while the server runs moves the shared file,
+    /// tells the client to pull the targets again, and answers the requests
+    /// that name no target from the target now listing it.
+    #[test]
+    fn a_new_destination_moves_a_shared_file_to_its_target() {
+        let scratch = crate::scratch::ScratchDir::new("sweetpad-bsp-shared-live").unwrap();
+        let (server, sent, config) = shared_sources_server(&scratch, None, Some("iphonesimulator"));
+        assert_eq!(listed_under(&server, "/Shared/Shared.swift"), ["iOSApp"]);
+
+        write_shared_sources_config(&config, None, Some("watchsimulator"));
+        server.reload_from_file(&config);
+        assert!(
+            sent.text().contains(r#""buildTarget/didChange""#),
+            "{}",
+            sent.text()
+        );
+        assert_eq!(listed_under(&server, "/Shared/Shared.swift"), ["WatchApp"]);
+
+        let shared = format!(
+            "{}/fixtures/_synthetic-shared-sources/project/Shared/Shared.swift",
+            env!("SWEETPAD_LIB_DIR")
+        );
+        let document =
+            serde_json::json!({ "textDocument": { "uri": file_uri(Path::new(&shared)) } });
+        let owners = server.inverse_sources(Some(&document));
+        assert_eq!(
+            owners["targets"],
+            serde_json::json!([{ "uri": "sweetpad://target/WatchApp" }])
+        );
+        let options = server.source_kit_options(Some(&document));
+        let args: Vec<&str> = options["compilerArguments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let module = args
+            .iter()
+            .position(|a| *a == "-module-name")
+            .map(|i| args[i + 1]);
+        assert_eq!(module, Some("WatchApp"), "{args:?}");
+    }
+
+    /// A target that builds for several platforms reads as the selected
+    /// destination's platform when it builds for it, as a target listing
+    /// `macosx` builds natively for My Mac, and follows the destination as it
+    /// changes. With a destination it doesn't build for, or none, it reads as
+    /// the platform it authors, and `--sdk` wins over both.
+    #[test]
+    fn a_multiplatform_target_reads_as_the_selected_destination() {
+        let project = format!(
+            "{}/fixtures/_synthetic-multiplatform/project/MultiPlatformApp.xcodeproj",
+            env!("SWEETPAD_LIB_DIR")
+        );
+        let scratch = crate::scratch::ScratchDir::new("sweetpad-bsp-destination").unwrap();
+        let config = scratch.join("bsp.json");
+        let write = |destination: Option<&str>| {
+            let body = serde_json::json!({
+                "workspacePath": *scratch,
+                "projectPath": project,
+                "destinationPlatform": destination,
+            });
+            std::fs::write(&config, body.to_string()).unwrap();
+        };
+        let server_for = |destination: Option<&str>, sdk: Option<&str>| {
+            write(destination);
+            let flags: BTreeMap<String, String> = sdk
+                .map(|s| ("sdk".to_string(), s.to_string()))
+                .into_iter()
+                .collect();
+            Server::build(
+                ResolvedConfig::from_file(&config, &flags).unwrap(),
+                Some(config.clone()),
+                Arc::new(AtomicU8::new(LogLevel::Info as u8)),
+                CommandLine::default(),
+                Sent::default().writer(),
+            )
+            .unwrap()
+        };
+        for (destination, expected) in [
+            (None, "iphonesimulator"),
+            (Some("macosx"), "macosx"),
+            (Some("iphoneos"), "iphonesimulator"),
+            (Some("watchsimulator"), "iphonesimulator"),
+        ] {
+            let sdk = server_for(destination, None)
+                .editor_platform("MultiPlatformApp")
+                .sdk;
+            assert_eq!(sdk, expected, "destination={destination:?}");
+        }
+        let sdk = server_for(Some("macosx"), Some("iphonesimulator"))
+            .editor_platform("MultiPlatformApp")
+            .sdk;
+        assert_eq!(sdk, "iphonesimulator");
+
+        let server = server_for(Some("iphonesimulator"), None);
+        write(Some("macosx"));
+        server.reload_from_file(&config);
+        let probe = format!(
+            "{}/fixtures/_synthetic-multiplatform/project/Sources/Probe.swift",
+            env!("SWEETPAD_LIB_DIR")
+        );
+        let args = server
+            .compiler_arguments("MultiPlatformApp", Path::new(&probe))
+            .unwrap();
+        let triple = args
+            .iter()
+            .position(|a| a == "-target")
+            .map(|i| &args[i + 1]);
+        assert!(
+            triple.is_some_and(|t| t.contains("-apple-macos")),
+            "{args:?}"
+        );
+
+        // An iOS-only target runs on a Mac as Designed for iPad, an iOS build.
+        let (server, _, _) = shared_sources_server(&scratch, None, Some("macosx"));
+        assert_eq!(server.editor_platform("iOSApp").sdk, "iphonesimulator");
+        assert_eq!(server.editor_platform("WatchApp").sdk, "watchsimulator");
+    }
+
+    /// A Catalyst target reads as Catalyst for a Mac destination, iOS code on
+    /// the macOS SDK. Which targets build that way follows the selected
+    /// scheme, as the build does: a framework the "Designed for iPad" app
+    /// embeds builds for `iphoneos` with it, and as Catalyst with the
+    /// Catalyst app or on its own.
+    #[test]
+    fn a_catalyst_target_reads_as_catalyst_for_a_mac_destination() {
+        let root = format!(
+            "{}/fixtures/_synthetic-destination-platforms/xcode-27.0.0/project/DestPlatforms",
+            env!("SWEETPAD_LIB_DIR")
+        );
+        let scratch = crate::scratch::ScratchDir::new("sweetpad-bsp-catalyst").unwrap();
+        let config = scratch.join("bsp.json");
+        let server_for = |scheme: Option<&str>, destination: Option<&str>| {
+            let body = serde_json::json!({
+                "workspacePath": *scratch,
+                "projectPath": format!("{root}/DestPlatforms.xcodeproj"),
+                "scheme": scheme,
+                "destinationPlatform": destination,
+            });
+            std::fs::write(&config, body.to_string()).unwrap();
+            Server::build(
+                ResolvedConfig::from_file(&config, &BTreeMap::new()).unwrap(),
+                Some(config.clone()),
+                Arc::new(AtomicU8::new(LogLevel::Info as u8)),
+                CommandLine::default(),
+                Sent::default().writer(),
+            )
+            .unwrap()
+        };
+        let read = |server: &Server, target: &str| {
+            let platform = server.editor_platform(target);
+            (platform.sdk, platform.catalyst)
+        };
+        let catalyst = ("macosx".to_string(), true);
+        let ios = ("iphonesimulator".to_string(), false);
+
+        let server = server_for(Some("CatApp"), Some("macosx"));
+        assert_eq!(read(&server, "CatApp"), catalyst);
+        assert_eq!(read(&server, "IPadKit"), catalyst);
+        assert_eq!(read(&server, "IPadApp"), ios);
+        assert_eq!(read(&server, "MacHelper"), ("macosx".to_string(), false));
+        let source = format!("{root}/Sources/Kit/Kit.swift");
+        let args = server
+            .compiler_arguments("IPadKit", Path::new(&source))
+            .unwrap();
+        let triple = args
+            .iter()
+            .position(|a| a == "-target")
+            .map(|i| &args[i + 1]);
+        assert!(triple.is_some_and(|t| t.ends_with("-macabi")), "{args:?}");
+
+        let server = server_for(Some("IPadApp"), Some("macosx"));
+        assert_eq!(read(&server, "IPadKit"), ios);
+        assert_eq!(read(&server, "CatApp"), catalyst);
+
+        let server = server_for(None, Some("macosx"));
+        assert_eq!(read(&server, "IPadKit"), catalyst);
+
+        let server = server_for(Some("CatApp"), Some("iphonesimulator"));
+        assert_eq!(read(&server, "CatApp"), ios);
+    }
+
+    /// A `-configuration` in `buildArgs` replaces the one the extension picks
+    /// on its builds' command line, so the index resolves that configuration,
+    /// at startup and when the file changes, and the prepare build takes it.
+    #[test]
+    fn a_configuration_in_build_args_is_the_one_the_index_resolves() {
+        let project = format!(
+            "{}/fixtures/_synthetic-objectversion-110/project/SweetpadCIApp.xcodeproj",
+            env!("SWEETPAD_LIB_DIR")
+        );
+        let scratch = crate::scratch::ScratchDir::new("sweetpad-bsp-json-config").unwrap();
+        let config = scratch.join("bsp.json");
+        let write = |build_args: &[&str]| {
+            let body = serde_json::json!({
+                "workspacePath": *scratch,
+                "projectPath": project,
+                "configuration": "Debug",
+                "buildArgs": build_args,
+            });
+            std::fs::write(&config, body.to_string()).unwrap();
+        };
+        write(&["-quiet", "-configuration", "Release"]);
+        let sent = Sent::default();
+        let server = Server::build(
+            ResolvedConfig::from_file(&config, &BTreeMap::new()).unwrap(),
+            Some(config.clone()),
+            Arc::new(AtomicU8::new(LogLevel::Info as u8)),
+            CommandLine::default(),
+            sent.writer(),
+        )
+        .unwrap();
+        let resolved = |server: &Server| {
+            let opts = server.options_for("SweetpadCIMac", "macosx", "arm64");
+            let settings = crate::build_settings::resolve_build_settings(&opts)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .settings;
+            (opts.configuration, settings["CONFIGURATION"].clone())
+        };
+        assert_eq!(resolved(&server), ("Release".into(), "Release".into()));
+        let (cmd, _) = server.prepare_command("SweetpadCIMac");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2).any(|w| w == ["-configuration", "Release"]),
+            "{args:?}"
+        );
+
+        write(&["-quiet"]);
+        server.reload_from_file(&config);
+        assert_eq!(resolved(&server), ("Debug".into(), "Debug".into()));
+    }
 
     #[test]
     fn path_from_uri_survives_unencoded_non_ascii_after_percent() {

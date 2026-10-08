@@ -16,147 +16,50 @@
 //!
 //! Everything here is pure (no I/O): callers parse the file, mutate the tree,
 //! and serialize/write it — the same contract as the sibling `*_pbxproj`
-//! modules. Removal cleans up after itself: a file reference no build file
-//! uses anymore is deleted, and ancestor groups emptied by that deletion are
-//! pruned (the orphan contract [`crate::sync_pbxproj::remove_root`] set).
+//! modules. Removal cleans up after itself: a file reference nothing names
+//! anymore is deleted, and ancestor groups emptied by that deletion are
+//! pruned (the orphan contract [`crate::sync_pbxproj::remove_root`] set). A
+//! reference that is still a target's product or a configuration's xcconfig
+//! stays.
 
 use std::path::Path;
 
 use crate::pbxproj::{Dict, Value};
+use crate::pbxproj_refs;
+use crate::project::Parents;
 
 /// The objects a `PBXBuildFile` can point at. Variant and version groups stand
 /// in for a file the way a plain reference does.
 const REF_ISAS: [&str; 3] = ["PBXFileReference", "PBXVariantGroup", "XCVersionGroup"];
 
-/// The build phase a classic entry belongs to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Phase {
-    Sources,
-    Resources,
-    Headers,
-    Frameworks,
-    /// A `PBXCopyFilesBuildPhase`, with its display name (e.g.
-    /// `Embed XPC Services`).
-    Copy(String),
-}
+pub use crate::membership::{Addition, FileEntry, Phase, RefKind, Removal};
 
-impl Phase {
-    /// The stable machine name (`sources`, `resources`, `headers`,
-    /// `frameworks`, `copy`).
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Phase::Sources => "sources",
-            Phase::Resources => "resources",
-            Phase::Headers => "headers",
-            Phase::Frameworks => "frameworks",
-            Phase::Copy(_) => "copy",
+/// The phase a build-phase object is, or `None` for one with no file
+/// membership to speak of (a script phase).
+fn phase_of(isa: &str, phase: &Value) -> Option<Phase> {
+    match isa {
+        "PBXSourcesBuildPhase" => Some(Phase::Sources),
+        "PBXResourcesBuildPhase" => Some(Phase::Resources),
+        "PBXHeadersBuildPhase" => Some(Phase::Headers),
+        "PBXFrameworksBuildPhase" => Some(Phase::Frameworks),
+        "PBXCopyFilesBuildPhase" => {
+            let name = phase
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Copy Files");
+            Some(Phase::Copy(name.to_string()))
         }
-    }
-
-    /// The phase a `--phase` flag names. Copy phases are absent on purpose: a
-    /// target can carry several and they are told apart by name, so a kind
-    /// alone does not address one.
-    #[must_use]
-    pub fn parse(kind: &str) -> Option<Phase> {
-        match kind {
-            "sources" => Some(Phase::Sources),
-            "resources" => Some(Phase::Resources),
-            "headers" => Some(Phase::Headers),
-            "frameworks" => Some(Phase::Frameworks),
-            _ => None,
-        }
-    }
-
-    /// Human rendering: the kind, plus the copy phase's name.
-    #[must_use]
-    pub fn display(&self) -> String {
-        match self {
-            Phase::Copy(name) => format!("copy ({name})"),
-            other => other.kind().to_string(),
-        }
-    }
-
-    fn of(isa: &str, phase: &Value) -> Option<Phase> {
-        match isa {
-            "PBXSourcesBuildPhase" => Some(Phase::Sources),
-            "PBXResourcesBuildPhase" => Some(Phase::Resources),
-            "PBXHeadersBuildPhase" => Some(Phase::Headers),
-            "PBXFrameworksBuildPhase" => Some(Phase::Frameworks),
-            "PBXCopyFilesBuildPhase" => {
-                let name = phase
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Copy Files");
-                Some(Phase::Copy(name.to_string()))
-            }
-            // Script phases have no file membership to speak of.
-            _ => None,
-        }
+        _ => None,
     }
 }
 
-/// What kind of node the build file references — files convert to folders;
-/// variant/version groups are the constructs a script leaves classic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefKind {
-    File,
-    VariantGroup,
-    VersionGroup,
-    Other,
-}
-
-impl RefKind {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            RefKind::File => "file",
-            RefKind::VariantGroup => "variantGroup",
-            RefKind::VersionGroup => "versionGroup",
-            RefKind::Other => "other",
-        }
+fn ref_kind_of(isa: &str) -> RefKind {
+    match isa {
+        "PBXFileReference" => RefKind::File,
+        "PBXVariantGroup" => RefKind::VariantGroup,
+        "XCVersionGroup" => RefKind::VersionGroup,
+        _ => RefKind::Other,
     }
-
-    fn of(isa: &str) -> RefKind {
-        match isa {
-            "PBXFileReference" => RefKind::File,
-            "PBXVariantGroup" => RefKind::VariantGroup,
-            "XCVersionGroup" => RefKind::VersionGroup,
-            _ => RefKind::Other,
-        }
-    }
-}
-
-/// One classic membership entry: a file (or variant/version group) a target
-/// builds, with the per-file details its `PBXBuildFile` carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileEntry {
-    /// Project-dir-relative resolved path (group-tree walk).
-    pub path: String,
-    pub phase: Phase,
-    pub kind: RefKind,
-    /// `settings.COMPILER_FLAGS` — per-file compiler flags.
-    pub compiler_flags: Option<String>,
-    /// `settings.ATTRIBUTES` — e.g. `Public`/`Private` header visibility,
-    /// `RemoveHeadersOnCopy`, `CodeSignOnCopy`.
-    pub attributes: Vec<String>,
-    /// `platformFilters` (or the older singular `platformFilter`).
-    pub platform_filters: Vec<String>,
-}
-
-/// The outcome of removing one path's membership from one target. Empty
-/// `removed_phases` records the no-op (the path wasn't a member), so re-run
-/// scripts stay green.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Removal {
-    pub path: String,
-    /// Display names of the phases entries were removed from.
-    pub removed_phases: Vec<String>,
-    /// Set when no build file (of any target) references the file anymore,
-    /// so the reference itself was deleted from the project.
-    pub deleted_reference: bool,
-    /// Ancestor groups deleted because the reference removal emptied them.
-    pub pruned_groups: usize,
 }
 
 /// A target's classic membership entries, in build-phase order.
@@ -166,6 +69,7 @@ pub struct Removal {
 pub fn classic_members(root: &Value, target: &str) -> Result<Vec<FileEntry>, String> {
     let objects = objects(root).ok_or("pbxproj has no objects dict")?;
     let target_guid = find_target_guid(objects, target)?;
+    let parents = Parents::of(objects);
     let mut entries = Vec::new();
     for (phase, build_file_guids) in phases_of(objects, &target_guid) {
         for bf_guid in build_file_guids {
@@ -176,9 +80,9 @@ pub fn classic_members(root: &Value, target: &str) -> Result<Vec<FileEntry>, Str
             let Some(file_ref) = str_field(build_file, "fileRef") else {
                 continue;
             };
-            let kind = RefKind::of(objects.get(file_ref).map_or("", isa));
+            let kind = ref_kind_of(objects.get(file_ref).map_or("", isa));
             entries.push(FileEntry {
-                path: node_path(objects, file_ref),
+                path: node_path(&parents, file_ref),
                 phase: phase.clone(),
                 kind,
                 compiler_flags: build_file
@@ -207,8 +111,8 @@ pub fn classic_members(root: &Value, target: &str) -> Result<Vec<FileEntry>, Str
 }
 
 /// Remove `target`'s classic membership of each path (project-dir-relative):
-/// the build-file entries leave the target's phases; a reference no build
-/// file uses anymore is deleted (variant/version groups take their child
+/// the build-file entries leave the target's phases; a reference nothing
+/// names anymore is deleted (variant/version groups take their child
 /// references with them) and emptied ancestor groups are pruned. A path that
 /// isn't a member is a recorded no-op.
 ///
@@ -219,7 +123,6 @@ pub fn remove_membership(
     target: &str,
     paths: &[String],
 ) -> Result<Vec<Removal>, String> {
-    let (main_group, products_group) = group_guards(root);
     let objects = objects_mut(root)?;
     let target_guid = find_target_guid(objects, target)?;
     let mut removals = Vec::new();
@@ -247,26 +150,19 @@ pub fn remove_membership(
             }
         }
 
-        // Orphan cleanup: a reference nothing builds anymore leaves the tree.
+        // Orphan cleanup: a reference nothing builds anymore leaves the tree,
+        // unless something else still names it, such as a target's product
+        // or the xcconfig a configuration is based on. Another target's build
+        // file is one of those names.
         let mut deleted_reference = false;
         let mut pruned_groups = 0usize;
         for ref_guid in &ref_guids {
-            let still_built = objects.iter().any(|(_, o)| {
-                isa(o) == "PBXBuildFile" && str_field(o, "fileRef") == Some(ref_guid.as_str())
-            });
-            if still_built {
+            if !pbxproj_refs::referrers(objects, ref_guid).is_empty() {
                 continue;
             }
-            let parent = crate::project::parent_group_of(objects, ref_guid);
             delete_node_recursive(objects, ref_guid);
-            if let Some(parent) = parent {
-                remove_child(objects, &parent, ref_guid);
-                pruned_groups += prune_empty_groups(
-                    objects,
-                    &parent,
-                    main_group.as_ref(),
-                    products_group.as_ref(),
-                );
+            for parent in pbxproj_refs::unlist(objects, ref_guid) {
+                pruned_groups += prune_empty_groups(objects, &parent);
             }
             deleted_reference = true;
         }
@@ -279,18 +175,6 @@ pub fn remove_membership(
         });
     }
     Ok(removals)
-}
-
-/// The outcome of adding one path to one target's phase. `already_member`
-/// records the no-op, so re-run scripts stay green.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Addition {
-    pub path: String,
-    /// Display name of the phase the entry joined.
-    pub phase: String,
-    /// The `PBXBuildFile` created, or the existing one on a no-op.
-    pub build_file: String,
-    pub already_member: bool,
 }
 
 /// Give `target` a classic build-file entry for each path, in `phase`.
@@ -332,7 +216,7 @@ pub fn add_membership(
             n => {
                 return Err(format!(
                     "{path} matches {n} file references ({}); pass the one you mean as \
-                     `--fileref <ID>`",
+                     '--fileref <ID>'",
                     hits.join(", ")
                 ));
             }
@@ -379,11 +263,11 @@ pub fn ref_path(root: &Value, id: &str) -> Result<String, String> {
 fn ref_path_in(objects: &Dict, id: &str) -> Result<String, String> {
     let node = objects
         .get(id)
-        .ok_or_else(|| format!("no object with id {id}; `pbxproj fileref list` shows them"))?;
+        .ok_or_else(|| format!("no object with id {id}; 'pbxproj fileref list' shows them"))?;
     if !REF_ISAS.contains(&isa(node)) {
         return Err(format!("{id} is a {}, not a file reference", isa(node)));
     }
-    Ok(node_path(objects, id))
+    Ok(node_path(&Parents::of(objects), id))
 }
 
 /// The `fileref add` invocation that would create the missing reference.
@@ -400,18 +284,19 @@ fn fileref_add_hint(path: &str) -> String {
         .and_then(Path::to_str)
         .filter(|dir| !dir.is_empty())
     {
-        Some(dir) => format!("`pbxproj fileref add {base} --group {dir}`"),
+        Some(dir) => format!("'pbxproj fileref add {base} --group {dir}'"),
         // No directory to name a group with: anchor it at the project instead.
-        None => format!("`pbxproj fileref add {base} --source-tree SOURCE_ROOT`"),
+        None => format!("'pbxproj fileref add {base} --source-tree SOURCE_ROOT'"),
     }
 }
 
 /// Every reference-like object whose resolved path is `path`.
 fn refs_at_path(objects: &Dict, path: &str) -> Vec<String> {
+    let parents = Parents::of(objects);
     objects
         .iter()
         .filter(|(_, o)| REF_ISAS.contains(&isa(o)))
-        .filter(|(guid, _)| node_path(objects, guid) == path)
+        .filter(|(guid, _)| node_path(&parents, guid) == path)
         .map(|(guid, _)| guid.clone())
         .collect()
 }
@@ -441,7 +326,7 @@ fn add_resolved(
             additions.push(Addition {
                 path,
                 phase: phase.display(),
-                build_file: existing,
+                build_file: Some(existing),
                 already_member: true,
             });
             continue;
@@ -472,7 +357,7 @@ fn add_resolved(
         additions.push(Addition {
             path,
             phase: phase.display(),
-            build_file: bf_guid,
+            build_file: Some(bf_guid),
             already_member: false,
         });
     }
@@ -491,7 +376,7 @@ fn phase_guid_of(objects: &Dict, target_guid: &str, want: &Phase) -> Option<Stri
     phase_guids.into_iter().find(|guid| {
         objects
             .get(guid)
-            .and_then(|obj| Phase::of(isa(obj), obj))
+            .and_then(|obj| phase_of(isa(obj), obj))
             .is_some_and(|found| &found == want)
     })
 }
@@ -528,7 +413,7 @@ fn phases_of(objects: &Dict, target_guid: &str) -> Vec<(Phase, Vec<String>)> {
         let Some(phase_obj) = objects.get(guid) else {
             continue;
         };
-        let Some(phase) = Phase::of(isa(phase_obj), phase_obj) else {
+        let Some(phase) = phase_of(isa(phase_obj), phase_obj) else {
             continue;
         };
         let files = phase_obj
@@ -578,80 +463,37 @@ fn delete_node_recursive(objects: &mut Dict, guid: &str) {
     objects.remove(guid);
 }
 
-fn remove_child(objects: &mut Dict, group: &str, child: &str) {
-    if let Some(children) = objects
-        .get_mut(group)
-        .and_then(Value::as_dict_mut)
-        .and_then(|g| g.get_mut("children"))
-        .and_then(Value::as_array_mut)
-    {
-        children.retain(|v| v.as_str() != Some(child));
+/// Delete `group` when a removal emptied it, then each group that listed it,
+/// in turn. A group something else names survives even when empty: the
+/// navigator root, the Products group, a folder an xcconfig is anchored in.
+/// Returns how many groups were pruned.
+fn prune_empty_groups(objects: &mut Dict, group: &str) -> usize {
+    let empty = objects
+        .get(group)
+        .filter(|o| matches!(isa(o), "PBXGroup" | "PBXVariantGroup" | "XCVersionGroup"))
+        .is_some_and(|o| {
+            o.get("children")
+                .and_then(Value::as_array)
+                .is_none_or(<[Value]>::is_empty)
+        });
+    if !empty || !pbxproj_refs::referrers(objects, group).is_empty() {
+        return 0;
     }
-}
-
-/// Walk up from `group`, deleting each group its child-removal emptied.
-/// The main group and Products group survive even when empty — they're
-/// structural. Returns how many groups were pruned.
-fn prune_empty_groups(
-    objects: &mut Dict,
-    group: &str,
-    main_group: Option<&String>,
-    products_group: Option<&String>,
-) -> usize {
-    let mut pruned = 0;
-    let mut current = group.to_string();
-    loop {
-        if Some(&current) == main_group || Some(&current) == products_group {
-            break;
-        }
-        let empty = objects
-            .get(&current)
-            .filter(|o| matches!(isa(o), "PBXGroup" | "PBXVariantGroup" | "XCVersionGroup"))
-            .is_some_and(|o| {
-                o.get("children")
-                    .and_then(Value::as_array)
-                    .is_none_or(<[Value]>::is_empty)
-            });
-        if !empty {
-            break;
-        }
-        let parent = crate::project::parent_group_of(objects, &current);
-        objects.remove(&current);
-        pruned += 1;
-        match parent {
-            Some(parent) => {
-                remove_child(objects, &parent, &current);
-                current = parent;
-            }
-            None => break,
-        }
-    }
-    pruned
+    let listings = pbxproj_refs::unlist(objects, group);
+    objects.remove(group);
+    1 + listings
+        .iter()
+        .map(|parent| prune_empty_groups(objects, parent))
+        .sum::<usize>()
 }
 
 /// The project-dir-relative path of a group-tree node (its own `path` plus
 /// every pathed ancestor), via the shared group walk.
-fn node_path(objects: &Dict, guid: &str) -> String {
-    crate::project::group_dir(objects, guid, Path::new(""), 0)
+fn node_path(parents: &Parents<'_>, guid: &str) -> String {
+    parents
+        .group_dir(guid, Path::new(""))
         .to_string_lossy()
         .into_owned()
-}
-
-fn group_guards(root: &Value) -> (Option<String>, Option<String>) {
-    let project = root
-        .as_dict()
-        .and_then(|d| d.get("rootObject"))
-        .and_then(Value::as_str)
-        .and_then(|g| objects(root).and_then(|o| o.get(g)));
-    let main_group = project
-        .and_then(|p| p.get("mainGroup"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let products_group = project
-        .and_then(|p| p.get("productRefGroup"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    (main_group, products_group)
 }
 
 fn str_items(items: &[Value]) -> Vec<String> {
@@ -682,7 +524,7 @@ fn find_target_guid(objects: &Dict, name: &str) -> Result<String, String> {
                 .filter_map(|(_, o)| str_field(o, "name"))
                 .collect();
             format!(
-                "no target named `{name}` (project has: {})",
+                "no target named '{name}' (project has: {})",
                 known.join(", ")
             )
         })
@@ -919,7 +761,10 @@ mod tests {
 
         let text = round_trips(&root);
         let bf = &added[0].build_file;
-        assert!(text.contains(bf), "the build file exists");
+        assert!(
+            text.contains(bf.as_deref().unwrap()),
+            "the build file exists"
+        );
         // It joined the sources phase, and the resources entry it already had
         // is untouched.
         let members = classic_members(&root, "App").unwrap();
@@ -947,7 +792,8 @@ mod tests {
         .unwrap();
         assert!(added[0].already_member);
         assert_eq!(
-            added[0].build_file, "BF1",
+            added[0].build_file.as_deref(),
+            Some("BF1"),
             "it reports the entry that exists"
         );
         let after = crate::pbxproj_writer::serialize(&root, "Fix");
@@ -1044,6 +890,48 @@ mod tests {
         assert!(text.contains("G1"), "the App group still has children");
     }
 
+    /// The last build file going leaves a reference the project still names
+    /// in place: an embedded product is still its target's product, and
+    /// deleting it would leave that target naming nothing. A reference a
+    /// second group lists leaves both listings when it goes.
+    #[test]
+    fn removing_the_last_membership_keeps_a_reference_the_project_names() {
+        let mut root = parsed();
+        let objects = objects_mut(&mut root).unwrap();
+        let tests = objects.get_mut("T2").and_then(Value::as_dict_mut).unwrap();
+        tests.insert("productReference".into(), Value::String("FR4".into()));
+        // Legacy sits inside App, so App's listing is the one Xcode keeps.
+        let legacy = objects.get_mut("G2").and_then(Value::as_dict_mut).unwrap();
+        legacy.insert(
+            "children".into(),
+            Value::Array(vec![
+                Value::String("FR2".into()),
+                Value::String("FR3".into()),
+            ]),
+        );
+
+        let removals = remove_membership(
+            &mut root,
+            "App",
+            &["Helper.xpc".into(), "App/Logo.png".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            removals[0].removed_phases,
+            vec!["copy (Embed XPC Services)"]
+        );
+        assert!(!removals[0].deleted_reference, "Tests still names it");
+        assert!(removals[1].deleted_reference);
+
+        let text = round_trips(&root);
+        assert!(text.contains("FR4 /* Helper.xpc */ = {"), "{text}");
+        assert!(!text.contains("BF5"), "the build file is gone");
+        assert!(
+            !text.contains("FR3"),
+            "neither group lists Logo.png: {text}"
+        );
+    }
+
     #[test]
     fn batched_removal_dismantles_a_target_in_one_pass() {
         let mut root = parsed();
@@ -1129,7 +1017,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let crate::tree_pbxproj::AddRefOutcome::Created { guid, .. } = loose else {
+        let crate::tree_pbxproj::AddRefOutcome::Created { address: guid, .. } = loose else {
             panic!("expected a fresh reference");
         };
         let additions = add_membership_by_ids(
@@ -1157,7 +1045,7 @@ mod tests {
         let additions =
             add_membership_by_ids(&mut root, "App", &["FR1".into()], &Phase::Sources).unwrap();
         assert!(additions[0].already_member);
-        assert_eq!(additions[0].build_file, "BF1");
+        assert_eq!(additions[0].build_file.as_deref(), Some("BF1"));
         assert_eq!(
             before,
             crate::pbxproj_writer::serialize(&root, "Fix"),
@@ -1190,7 +1078,7 @@ mod tests {
         // Not the whole path: a `<group>`-anchored reference stores the
         // basename, so echoing the input back would resolve to App/App/Nope.swift.
         assert!(
-            err.contains("`pbxproj fileref add Nope.swift --group App`"),
+            err.contains("'pbxproj fileref add Nope.swift --group App'"),
             "{err}"
         );
 

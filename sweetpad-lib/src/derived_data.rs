@@ -30,16 +30,20 @@
 //! DerivedData. App-wide `IDEBuildLocationStyle` is likewise ignored — only
 //! DerivedData has an app-wide setting `xcodebuild` respects.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use crate::file_cache::ParseCache;
-use crate::pbxproj::Value;
 
 /// Where a container's build output lands, with every Xcode location setting
 /// already applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Locations {
+    /// The container's own DerivedData folder — `<root>/<Name>-<hash>` in the
+    /// stock layout. Xcode keeps the container's index, logs and package
+    /// checkouts here even when a custom build location moves its products.
+    pub folder: PathBuf,
     /// `SYMROOT` — and `BUILD_DIR` / `BUILD_ROOT` through it.
     pub products: PathBuf,
     /// `OBJROOT` / `TEMP_ROOT`.
@@ -48,6 +52,76 @@ pub struct Locations {
     /// this container's own folder. Seeds xcspec defaults like
     /// `MODULE_CACHE_DIR = $(DERIVED_DATA_DIR)/ModuleCache.noindex`.
     pub derived_data_root: PathBuf,
+}
+
+/// What Xcode keys a container's DerivedData folder by: the container it
+/// opened, the name the folder starts with, and the hash of its path.
+///
+/// Everything that names a container's DerivedData starts from
+/// [`ContainerKey::of`], so every spelling a caller can hand in lands on the
+/// folder `xcodebuild` writes:
+///
+/// - A project's embedded `Foo.xcodeproj/project.xcworkspace` stands for the
+///   project ([`crate::workspace::normalize_stub_workspace`]).
+/// - A Swift package is keyed by its directory and named for it, so its
+///   `Package.swift` stands for the directory holding it.
+/// - The hash is taken over the standardized path ([`container_hash`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerKey {
+    /// The container, absolute and spelled as the caller spelled it: a
+    /// `.xcworkspace`, a `.xcodeproj`, or a Swift package's directory. Its
+    /// per-user workspace settings are read from here.
+    pub container: PathBuf,
+    /// The container's name, before [`hashed_name`] rewrites its whitespace.
+    pub name: String,
+    /// The 28-char [`container_hash`] of the container.
+    pub hash: String,
+}
+
+impl ContainerKey {
+    /// The key for the container at `path`: a `.xcworkspace` (a project's
+    /// embedded one included), a `.xcodeproj`, a Swift package directory, or
+    /// the `Package.swift` inside one. A relative path anchors at the current
+    /// directory.
+    #[must_use]
+    pub fn of(path: &Path) -> Self {
+        let absolute = crate::project::absolutize(path);
+        let container = if absolute.file_name() == Some(OsStr::new("Package.swift")) {
+            absolute
+                .parent()
+                .map_or_else(|| absolute.clone(), Path::to_path_buf)
+        } else {
+            crate::workspace::normalize_stub_workspace(&absolute)
+        };
+        let name = if is_package(&container) {
+            container.file_name()
+        } else {
+            container.file_stem()
+        }
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+        let hash = container_hash(&container);
+        Self {
+            container,
+            name,
+            hash,
+        }
+    }
+
+    /// The `<Name>-<hash>` folder a hash-keyed location writes.
+    #[must_use]
+    pub fn folder_name(&self) -> String {
+        hashed_folder(&self.name, &self.hash)
+    }
+}
+
+/// Whether `container` is a Swift package directory rather than an Xcode
+/// bundle.
+fn is_package(container: &Path) -> bool {
+    !matches!(
+        container.extension().and_then(OsStr::to_str),
+        Some("xcodeproj" | "xcworkspace")
+    )
 }
 
 /// The per-container `WorkspaceSettings.xcsettings` keys we act on. Absent
@@ -62,35 +136,36 @@ struct WorkspaceSettings {
     intermediates_path: Option<String>,
 }
 
-/// Resolve the output locations for `container`.
+/// Resolve the output locations for the container `key` names.
 ///
-/// `name` / `hash` are the container's stem and its 28-char DerivedData hash
-/// (see [`crate::xcode_hash`]); `home` is the user's home directory, passed in
-/// rather than read so callers can pin it in tests. `derived_data_flag` is
-/// `xcodebuild -derivedDataPath`. `consult_xcode` gates every read of host
-/// state: with it `false` this is a pure function of its arguments and yields
-/// Xcode's stock layout, which is what the oracle suites resolve against.
+/// `home` is the user's home directory, passed in rather than read so callers
+/// can pin it in tests. `derived_data_flag` is `xcodebuild -derivedDataPath`.
+/// `consult_xcode` gates every read of host state: with it `false` this is a
+/// pure function of its arguments and yields Xcode's stock layout, which is
+/// what the oracle suites resolve against.
 #[must_use]
 pub fn resolve(
-    container: &Path,
-    name: &str,
-    hash: &str,
+    key: &ContainerKey,
     home: &str,
     derived_data_flag: Option<&Path>,
     consult_xcode: bool,
 ) -> Locations {
     let settings = if consult_xcode {
-        read_workspace_settings(container)
+        read_workspace_settings(&key.container)
     } else {
         WorkspaceSettings::default()
     };
+    // `xcodebuild` reports a `-derivedDataPath` under `/private/tmp` as
+    // `/tmp/…`, the way it spells the project, with its symlinks resolved once
+    // the directory exists.
+    let derived_data_flag = derived_data_flag.map(crate::project::derived_data_spelling);
     apply(
         &settings,
-        container,
-        name,
-        hash,
+        &key.container,
+        &key.name,
+        &key.hash,
         &app_derived_data_root(home, consult_xcode),
-        derived_data_flag,
+        derived_data_flag.as_deref(),
     )
 }
 
@@ -128,6 +203,7 @@ fn apply(
     // over `-derivedDataPath`.
     if let Some((products, intermediates)) = custom_build_location(settings, container, app_root) {
         return Locations {
+            folder,
             products,
             intermediates,
             derived_data_root: root,
@@ -137,13 +213,32 @@ fn apply(
     Locations {
         products: folder.join("Build/Products"),
         intermediates: folder.join("Build/Intermediates.noindex"),
+        folder,
         derived_data_root: root,
     }
 }
 
-/// The `<Name>-<hash>` folder a hash-keyed DerivedData location writes.
-fn hashed_folder(name: &str, hash: &str) -> String {
+/// The `<Name>-<hash>` folder a hash-keyed DerivedData location writes for a
+/// container named `name` whose path hashes to `hash` (see
+/// [`container_hash`]).
+#[must_use]
+pub fn hashed_folder(name: &str, hash: &str) -> String {
     format!("{}-{hash}", hashed_name(name))
+}
+
+/// The 28-char hash `xcodebuild` keys `container`'s DerivedData folder by: the
+/// [`crate::xcode_hash`] of the container's standardized path (see
+/// [`crate::project::standardize`]). Hashing any other spelling names a folder
+/// `xcodebuild` never writes when the container is reached through a symlink
+/// or spelled `/private/tmp/…`.
+///
+/// `container` is the `.xcodeproj` or `.xcworkspace` the build opened, or a
+/// Swift package's directory.
+#[must_use]
+pub fn container_hash(container: &Path) -> String {
+    crate::xcode_hash::derived_data_hash(
+        &crate::project::standardize(container).display().to_string(),
+    )
 }
 
 /// Xcode's spelling of a container name inside a `<Name>-<hash>` DerivedData
@@ -180,11 +275,17 @@ pub fn hashed_name(name: &str) -> String {
     out
 }
 
-/// The root every per-container folder sits in: the app-wide custom location
-/// when set, else Xcode's stock path. A caller with no `$HOME` (the sandboxed
-/// test harness) gets `/tmp` so paths stay absolute.
-fn app_derived_data_root(home: &str, consult_xcode: bool) -> PathBuf {
-    if consult_xcode && let Some(custom) = read_xcode_pref() {
+/// The root every per-container folder sits in unless the container moves its
+/// own: the app-wide custom location (`IDECustomDerivedDataLocation` in
+/// `<home>`'s Xcode preferences) when `consult_xcode` is set and it is,
+/// else Xcode's stock path. A caller with no `$HOME` (the sandboxed test
+/// harness) gets `/tmp` so paths stay absolute.
+#[must_use]
+pub fn app_derived_data_root(home: &str, consult_xcode: bool) -> PathBuf {
+    if consult_xcode
+        && !home.is_empty()
+        && let Some(custom) = read_xcode_pref(Path::new(home))
+    {
         return custom;
     }
     if home.is_empty() {
@@ -231,9 +332,14 @@ fn custom_build_location(
     Some((base.join(products), base.join(intermediates)))
 }
 
-/// The directory a "relative to workspace" path hangs off: the one holding the
-/// container, not the container itself.
+/// The directory a "relative to workspace" path hangs off: the one holding an
+/// Xcode container, or a Swift package's own directory. Xcode 27 builds a
+/// package whose settings say `WorkspaceRelativePath` `DD` into
+/// `<package>/DD/<package name>`.
 fn container_dir(container: &Path) -> PathBuf {
+    if is_package(container) {
+        return container.to_path_buf();
+    }
     container
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf)
@@ -242,25 +348,21 @@ fn container_dir(container: &Path) -> PathBuf {
 static PREF_CACHE: LazyLock<ParseCache<Option<PathBuf>>> = LazyLock::new(ParseCache::new);
 static SETTINGS_CACHE: LazyLock<ParseCache<WorkspaceSettings>> = LazyLock::new(ParseCache::new);
 
-/// `IDECustomDerivedDataLocation` from the user's Xcode preferences.
+/// `IDECustomDerivedDataLocation` from the Xcode preferences under `home`.
 ///
 /// Read straight off disk rather than through `defaults`: the preferences file
 /// is a binary plist that [`crate::bplist`] already handles, and macOS writes
 /// the key through on change. A value Xcode has set but not yet flushed from
 /// `cfprefsd` is invisible here until it lands, which in practice means a
-/// just-changed setting can take a moment to be seen.
-fn read_xcode_pref() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let path = Path::new(&home).join("Library/Preferences/com.apple.dt.Xcode.plist");
+/// just-changed setting can take a moment to be seen. An XML copy of the file
+/// reads the same.
+fn read_xcode_pref(home: &Path) -> Option<PathBuf> {
+    let path = home.join("Library/Preferences/com.apple.dt.Xcode.plist");
     let parsed = PREF_CACHE
         .get_or_parse(&path, |path| -> Result<_, ()> {
-            let Ok(value) = crate::bplist::parse_file(path) else {
-                return Ok(None);
-            };
-            let location = value
-                .as_dict()
-                .and_then(|dict| dict.get("IDECustomDerivedDataLocation"))
-                .and_then(Value::as_str)
+            let location = plist_strings(path)
+                .into_iter()
+                .find_map(|(key, value)| (key == "IDECustomDerivedDataLocation").then_some(value))
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from);
             Ok(location)
@@ -270,15 +372,16 @@ fn read_xcode_pref() -> Option<PathBuf> {
 }
 
 /// The container's per-user workspace settings. A `.xcodeproj` keeps them in
-/// its embedded `project.xcworkspace`; a `.xcworkspace` holds them directly.
-/// Xcode writes one directory per user, so read whichever matches `$USER` and
-/// fall back to a lone directory when the name doesn't line up (a home moved
-/// between accounts).
+/// its embedded `project.xcworkspace`, a Swift package in
+/// `.swiftpm/xcode/package.xcworkspace`, and a `.xcworkspace` holds them
+/// directly. Xcode writes one directory per user, so read whichever matches
+/// the account's name ([`crate::host::user`]) and fall back to a lone
+/// directory when the name doesn't line up (a home moved between accounts).
 fn read_workspace_settings(container: &Path) -> WorkspaceSettings {
-    let base = if container.extension().is_some_and(|e| e == "xcworkspace") {
-        container.to_path_buf()
-    } else {
-        container.join("project.xcworkspace")
+    let base = match container.extension().and_then(OsStr::to_str) {
+        Some("xcworkspace") => container.to_path_buf(),
+        Some("xcodeproj") => container.join("project.xcworkspace"),
+        _ => crate::workspace::package_scheme_root(container).join("package.xcworkspace"),
     };
     let Some(dir) = user_data_dir(&base.join("xcuserdata")) else {
         return WorkspaceSettings::default();
@@ -295,8 +398,7 @@ fn read_workspace_settings(container: &Path) -> WorkspaceSettings {
 /// The `<user>.xcuserdatad` directory to read: the current user's when it
 /// exists, else the only one present.
 fn user_data_dir(xcuserdata: &Path) -> Option<PathBuf> {
-    let mine = std::env::var_os("USER")
-        .map(|user| xcuserdata.join(format!("{}.xcuserdatad", user.to_string_lossy())));
+    let mine = crate::host::user().map(|user| xcuserdata.join(format!("{user}.xcuserdatad")));
     if let Some(mine) = mine
         && mine.is_dir()
     {
@@ -316,18 +418,7 @@ fn user_data_dir(xcuserdata: &Path) -> Option<PathBuf> {
 /// unreadable yields the stock layout rather than an error — a malformed
 /// settings file shouldn't stop a build from resolving.
 fn parse_workspace_settings(path: &Path) -> WorkspaceSettings {
-    let Ok(bytes) = std::fs::read(path) else {
-        return WorkspaceSettings::default();
-    };
-    let pairs = if bytes.starts_with(b"bplist00") {
-        binary_plist_strings(&bytes)
-    } else {
-        std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|text| crate::xcscheme::parse(text).ok())
-            .map(|root| xml_plist_strings(&root))
-            .unwrap_or_default()
-    };
+    let pairs = plist_strings(path);
     let get = |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
     WorkspaceSettings {
         derived_data_style: get("DerivedDataLocationStyle"),
@@ -336,6 +427,35 @@ fn parse_workspace_settings(path: &Path) -> WorkspaceSettings {
         build_location_type: get("CustomBuildLocationType"),
         products_path: get("CustomBuildProductsPath"),
         intermediates_path: get("CustomBuildIntermediatesPath"),
+    }
+}
+
+/// The container a DerivedData folder was written for: the `WorkspacePath` its
+/// `info.plist` records, spelled the way Xcode hashed it (a standardized
+/// `.xcodeproj`, `.xcworkspace`, or package directory). Xcode writes the file
+/// once it builds, so a folder only ever resolved has none, and `None` then
+/// says nothing about whose folder it is.
+#[must_use]
+pub fn workspace_path(folder: &Path) -> Option<PathBuf> {
+    plist_strings(&folder.join("info.plist"))
+        .into_iter()
+        .find_map(|(key, value)| (key == "WorkspacePath").then(|| PathBuf::from(value)))
+}
+
+/// Every string-valued top-level key of the plist at `path`, XML or binary.
+/// An unreadable or malformed file has none.
+fn plist_strings(path: &Path) -> Vec<(String, String)> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    if bytes.starts_with(b"bplist00") {
+        binary_plist_strings(&bytes)
+    } else {
+        std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| crate::xcscheme::parse(text).ok())
+            .map(|root| xml_plist_strings(&root))
+            .unwrap_or_default()
     }
 }
 
@@ -375,6 +495,7 @@ fn xml_plist_strings(root: &crate::xcscheme::Element) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdir::TempDir;
 
     const NAME: &str = "MyApp";
     const HASH: &str = "hflzcfrhwsudrtecqhfwedxhnshc";
@@ -382,6 +503,14 @@ mod tests {
 
     fn container() -> PathBuf {
         PathBuf::from("/src/wstest/MyApp.xcworkspace")
+    }
+
+    fn key() -> ContainerKey {
+        ContainerKey {
+            container: container(),
+            name: NAME.into(),
+            hash: HASH.into(),
+        }
     }
 
     /// Drive the same resolution [`resolve`] runs, with the settings supplied
@@ -394,14 +523,7 @@ mod tests {
 
     #[test]
     fn stock_layout_when_nothing_is_configured() {
-        let out = resolve(
-            &container(),
-            NAME,
-            HASH,
-            HOME,
-            None,
-            /* consult_xcode */ false,
-        );
+        let out = resolve(&key(), HOME, None, /* consult_xcode */ false);
         assert_eq!(
             out.products,
             PathBuf::from(format!(
@@ -417,6 +539,12 @@ mod tests {
         assert_eq!(
             out.derived_data_root,
             PathBuf::from(format!("{HOME}/Library/Developer/Xcode/DerivedData"))
+        );
+        assert_eq!(
+            out.folder,
+            PathBuf::from(format!(
+                "{HOME}/Library/Developer/Xcode/DerivedData/{NAME}-{HASH}"
+            ))
         );
     }
 
@@ -478,14 +606,12 @@ mod tests {
     /// so resolving `ARTA NYC-…` names a directory that never exists.
     #[test]
     fn stock_layout_collapses_whitespace_in_the_folder_name() {
-        let out = resolve(
-            Path::new("/src/ARTA NYC.xcworkspace"),
-            "ARTA NYC",
-            HASH,
-            HOME,
-            None,
-            /* consult_xcode */ false,
-        );
+        let key = ContainerKey {
+            container: PathBuf::from("/src/ARTA NYC.xcworkspace"),
+            name: "ARTA NYC".into(),
+            hash: HASH.into(),
+        };
+        let out = resolve(&key, HOME, None, /* consult_xcode */ false);
         assert_eq!(
             out.products,
             PathBuf::from(format!(
@@ -537,18 +663,79 @@ mod tests {
         );
     }
 
+    /// A Swift package's "relative to workspace" location hangs off the
+    /// package directory itself: Xcode 27 built a package at `…/spm` whose
+    /// settings said `WorkspaceRelativePath` `DDRel` into `…/spm/DDRel/spm`.
+    #[test]
+    fn a_packages_relative_location_hangs_off_its_own_directory() {
+        let out = apply(
+            &WorkspaceSettings {
+                derived_data_style: Some("WorkspaceRelativePath".into()),
+                derived_data_location: Some("DDRel".into()),
+                ..WorkspaceSettings::default()
+            },
+            Path::new("/src/spm"),
+            "spm",
+            HASH,
+            Path::new("/app-root"),
+            None,
+        );
+        assert_eq!(out.folder, PathBuf::from("/src/spm/DDRel/spm"));
+    }
+
+    /// A project named through its embedded workspace is keyed by the
+    /// project. `xcodebuild -workspace B10PkgApp.xcodeproj/project.xcworkspace`
+    /// on Xcode 27.0 built into this folder, and its `info.plist` recorded the
+    /// `.xcodeproj` as the `WorkspacePath`.
+    #[test]
+    fn an_embedded_workspace_is_keyed_by_its_project() {
+        let project = Path::new(
+            "/tmp/claude-503/-Users-hyzyla-home-Developer-sweetpad/\
+             e7fd5499-ae07-4b48-b81b-2d5c20c73fc0/scratchpad/b10-pkg/app/B10PkgApp.xcodeproj",
+        );
+        let key = ContainerKey::of(&project.join("project.xcworkspace"));
+        assert_eq!(key.container, project);
+        assert_eq!(key.name, "B10PkgApp");
+        assert_eq!(key.folder_name(), "B10PkgApp-ciimrmjrntfnzldgbikhgsjrzxed");
+        assert_eq!(key, ContainerKey::of(project));
+    }
+
+    /// Xcode keys a package's folder by the package directory, not its
+    /// manifest: `xcodebuild -list` in a package at this path wrote
+    /// `HashProbeLib-ddiyxpwzwovtfpgqlinqmouqyzjg`.
+    #[test]
+    fn a_package_is_keyed_by_its_directory() {
+        let dir = Path::new(
+            "/tmp/claude-503/-Users-hyzyla-home-Developer-sweetpad/\
+             e7fd5499-ae07-4b48-b81b-2d5c20c73fc0/scratchpad/spmprobe/HashProbeLib",
+        );
+        let key = ContainerKey::of(&dir.join("Package.swift"));
+        assert_eq!(key.container, dir);
+        assert_eq!(key.name, "HashProbeLib");
+        assert_eq!(
+            key.folder_name(),
+            "HashProbeLib-ddiyxpwzwovtfpgqlinqmouqyzjg"
+        );
+        assert_eq!(key, ContainerKey::of(dir));
+    }
+
+    /// A package directory whose name has a dot is named in full, not by its
+    /// stem, and a workspace is named by its stem.
+    #[test]
+    fn a_container_is_named_for_its_bundle_stem_or_package_directory() {
+        assert_eq!(ContainerKey::of(Path::new("/src/My.Lib")).name, "My.Lib");
+        assert_eq!(
+            ContainerKey::of(Path::new("/src/App.xcworkspace")).name,
+            "App"
+        );
+    }
+
     #[test]
     fn derived_data_path_flag_drops_the_container_segment() {
-        let out = resolve(
-            &container(),
-            NAME,
-            HASH,
-            HOME,
-            Some(Path::new("/flag-dd")),
-            false,
-        );
+        let out = resolve(&key(), HOME, Some(Path::new("/flag-dd")), false);
         assert_eq!(out.products, PathBuf::from("/flag-dd/Build/Products"));
         assert_eq!(out.derived_data_root, PathBuf::from("/flag-dd"));
+        assert_eq!(out.folder, PathBuf::from("/flag-dd"));
     }
 
     #[test]
@@ -566,6 +753,7 @@ mod tests {
             PathBuf::from(format!("/level2/{NAME}-{HASH}/Build/Products"))
         );
         assert_eq!(out.derived_data_root, PathBuf::from("/level2"));
+        assert_eq!(out.folder, PathBuf::from(format!("/level2/{NAME}-{HASH}")));
     }
 
     #[test]
@@ -583,6 +771,10 @@ mod tests {
             PathBuf::from(format!("/src/wstest/MyDD/{NAME}/Build/Products"))
         );
         assert_eq!(out.derived_data_root, PathBuf::from("/src/wstest/MyDD"));
+        assert_eq!(
+            out.folder,
+            PathBuf::from(format!("/src/wstest/MyDD/{NAME}"))
+        );
     }
 
     #[test]
@@ -630,6 +822,13 @@ mod tests {
         let out = resolve_with(&custom_location("Absolute"), None);
         assert_eq!(out.products, PathBuf::from("/abs-prod"));
         assert_eq!(out.intermediates, PathBuf::from("/abs-inter"));
+        // The DerivedData folder itself stays where it was.
+        assert_eq!(
+            out.folder,
+            PathBuf::from(format!(
+                "{HOME}/Library/Developer/Xcode/DerivedData/{NAME}-{HASH}"
+            ))
+        );
     }
 
     #[test]
@@ -698,13 +897,13 @@ mod tests {
     }
 
     /// A container skeleton under a directory unique to this test, so the
-    /// mtime-keyed caches can't serve one case's parse to another.
-    fn scratch_container(case: &str, kind: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("sweetpad-dd-{}-{case}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    /// mtime-keyed caches can't serve one case's parse to another. The
+    /// directory goes when the returned guard drops.
+    fn scratch_container(case: &str, kind: &str) -> (TempDir, PathBuf) {
+        let root = TempDir::new(&format!("sweetpad-dd-{case}"));
         let container = root.join(format!("MyApp.{kind}"));
         std::fs::create_dir_all(&container).expect("create container");
-        container
+        (root, container)
     }
 
     fn write_settings(dir: &Path, body: &str) {
@@ -726,7 +925,7 @@ mod tests {
 
     #[test]
     fn reads_a_workspace_containers_user_settings() {
-        let container = scratch_container("ws-user", "xcworkspace");
+        let (_root, container) = scratch_container("ws-user", "xcworkspace");
         write_settings(
             &container.join("xcuserdata/someone.xcuserdatad"),
             ABSOLUTE_DD,
@@ -738,7 +937,7 @@ mod tests {
 
     #[test]
     fn reads_a_project_containers_settings_through_its_inner_workspace() {
-        let container = scratch_container("proj-user", "xcodeproj");
+        let (_root, container) = scratch_container("proj-user", "xcodeproj");
         write_settings(
             &container.join("project.xcworkspace/xcuserdata/someone.xcuserdatad"),
             ABSOLUTE_DD,
@@ -747,11 +946,25 @@ mod tests {
         assert_eq!(settings.derived_data_style.as_deref(), Some("AbsolutePath"));
     }
 
+    /// Xcode keeps a Swift package's workspace settings in
+    /// `.swiftpm/xcode/package.xcworkspace`, and `xcodebuild` honours them.
+    #[test]
+    fn reads_a_packages_settings_through_its_swiftpm_workspace() {
+        let root = TempDir::new("sweetpad-dd-package-user");
+        let package = root.join("MyLib");
+        write_settings(
+            &package.join(".swiftpm/xcode/package.xcworkspace/xcuserdata/someone.xcuserdatad"),
+            ABSOLUTE_DD,
+        );
+        let settings = read_workspace_settings(&package);
+        assert_eq!(settings.derived_data_style.as_deref(), Some("AbsolutePath"));
+    }
+
     #[test]
     fn ignores_the_shared_settings_copy() {
         // xcodebuild honours these keys only in `xcuserdata`; the shared file
         // carries scheme-autocreation settings and nothing we act on.
-        let container = scratch_container("shared", "xcworkspace");
+        let (_root, container) = scratch_container("shared", "xcworkspace");
         write_settings(&container.join("xcshareddata"), ABSOLUTE_DD);
         assert_eq!(
             read_workspace_settings(&container),
@@ -761,7 +974,7 @@ mod tests {
 
     #[test]
     fn a_container_without_settings_reads_as_stock() {
-        let container = scratch_container("bare", "xcworkspace");
+        let (_root, container) = scratch_container("bare", "xcworkspace");
         assert_eq!(
             read_workspace_settings(&container),
             WorkspaceSettings::default()
@@ -770,7 +983,7 @@ mod tests {
 
     #[test]
     fn a_malformed_settings_file_reads_as_stock() {
-        let container = scratch_container("malformed", "xcworkspace");
+        let (_root, container) = scratch_container("malformed", "xcworkspace");
         let dir = container.join("xcuserdata/someone.xcuserdatad");
         std::fs::create_dir_all(&dir).expect("create settings dir");
         std::fs::write(dir.join("WorkspaceSettings.xcsettings"), "not a plist")
@@ -779,6 +992,114 @@ mod tests {
             read_workspace_settings(&container),
             WorkspaceSettings::default()
         );
+    }
+
+    /// A binary plist holding one top-level dict of string pairs, the format
+    /// macOS writes `com.apple.dt.Xcode.plist` in. Every string is ASCII and
+    /// under 256 bytes, and the file stays under 256 bytes.
+    fn binary_plist(pairs: &[(&str, &str)]) -> Vec<u8> {
+        fn string(out: &mut Vec<u8>, s: &str) {
+            if s.len() < 15 {
+                out.push(0x50 | u8::try_from(s.len()).unwrap());
+            } else {
+                out.extend([0x5F, 0x10, u8::try_from(s.len()).unwrap()]);
+            }
+            out.extend(s.as_bytes());
+        }
+        let count = u8::try_from(pairs.len()).unwrap();
+        let mut out = b"bplist00".to_vec();
+        let mut offsets = vec![out.len()];
+        out.push(0xD0 | count);
+        out.extend((1..=count).chain(count + 1..=2 * count));
+        let strings = pairs
+            .iter()
+            .map(|(k, _)| k)
+            .chain(pairs.iter().map(|(_, v)| v));
+        for s in strings {
+            offsets.push(out.len());
+            string(&mut out, s);
+        }
+        let table = out.len();
+        out.extend(offsets.iter().map(|&o| u8::try_from(o).unwrap()));
+        out.extend([0; 6]);
+        out.extend([1, 1]);
+        out.extend((offsets.len() as u64).to_be_bytes());
+        out.extend(0u64.to_be_bytes());
+        out.extend((table as u64).to_be_bytes());
+        out
+    }
+
+    /// Xcode's Settings → Locations → Derived Data, read out of the
+    /// preferences under the home it's given, in the binary form macOS writes
+    /// and in XML.
+    #[test]
+    fn the_app_wide_root_is_the_custom_location_in_xcodes_preferences() {
+        let home = TempDir::new("sweetpad-dd-prefs");
+        let prefs = home.join("Library/Preferences");
+        std::fs::create_dir_all(&prefs).expect("create prefs dir");
+        let home_str = home.display().to_string();
+        let stock = PathBuf::from(format!("{home_str}/Library/Developer/Xcode/DerivedData"));
+        assert_eq!(app_derived_data_root(&home_str, true), stock);
+
+        let file = prefs.join("com.apple.dt.Xcode.plist");
+        std::fs::write(
+            &file,
+            binary_plist(&[
+                ("IDEBuildLocationStyle", "Unique"),
+                ("IDECustomDerivedDataLocation", "/Volumes/Fast/DD"),
+            ]),
+        )
+        .expect("write prefs");
+        assert_eq!(
+            app_derived_data_root(&home_str, true),
+            PathBuf::from("/Volumes/Fast/DD")
+        );
+        // Without `consult_xcode` the preferences go unread.
+        assert_eq!(app_derived_data_root(&home_str, false), stock);
+
+        // A rewrite is picked up, and XML reads the same.
+        std::fs::write(
+            &file,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>IDECustomDerivedDataLocation</key><string>/Volumes/Other/DerivedData</string>
+</dict></plist>"#,
+        )
+        .expect("rewrite prefs");
+        assert_eq!(
+            app_derived_data_root(&home_str, true),
+            PathBuf::from("/Volumes/Other/DerivedData")
+        );
+    }
+
+    /// The record Xcode writes into a DerivedData folder it built into, as
+    /// captured from one.
+    #[test]
+    fn reads_the_container_a_folder_was_written_for() {
+        let root = TempDir::new("sweetpad-dd-info");
+        let folder = root.join("MacGen-cdprgyivuobbvbdieefufitplmbl");
+        std::fs::create_dir_all(&folder).expect("create folder");
+        std::fs::write(
+            folder.join("info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>LastAccessedDate</key>
+	<date>2026-09-26T19:00:39Z</date>
+	<key>WorkspacePath</key>
+	<string>/tmp/R&amp;D/MacGen/MacGen.xcodeproj</string>
+</dict>
+</plist>
+"#,
+        )
+        .expect("write info.plist");
+        assert_eq!(
+            workspace_path(&folder),
+            Some(PathBuf::from("/tmp/R&D/MacGen/MacGen.xcodeproj"))
+        );
+        std::fs::remove_file(folder.join("info.plist")).expect("remove info.plist");
+        assert_eq!(workspace_path(&folder), None);
     }
 
     #[test]

@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Subcommand;
+use sweetpad_core::xcodebuild_args;
+use sweetpad_lib::destination::DestinationSpec;
 
+pub(crate) mod adapter;
 #[cfg(target_os = "macos")]
 mod ax;
 #[cfg(not(target_os = "macos"))]
@@ -20,6 +23,7 @@ mod macwin;
 #[cfg(not(target_os = "macos"))]
 #[path = "app/macwin_stub.rs"]
 mod macwin;
+mod sample;
 
 use crate::cli::inject::recompiler::{Mode, Recompiler};
 use crate::cli::inject::server::{InjectServer, Logger};
@@ -30,7 +34,7 @@ use crate::cli::state::LastLaunchedApp;
 use crate::cli::xcodebuild::{self, AppBundle};
 use crate::cli::{
     CliError, CliResult, CommandResult, Context, ErrorContext, ErrorKind, Render, Rendered,
-    buildlog, devicectl, oslog, process, pymobiledevice3, rawmode, simctl,
+    buildlog, devicectl, exits, oslog, process, pymobiledevice3, rawmode, simctl,
 };
 
 /// The `app run` flags — also the top-level `sweetpad run`'s, so the flagship
@@ -45,15 +49,19 @@ pub struct RunArgs {
     /// ('--on device' is the same thing). Conflicts with a *typed* '--on'
     /// post-parse — a clap-level conflict would also fire on an env-sourced
     /// SWEETPAD_ON, breaking flag-beats-env.
-    #[arg(long)]
+    #[arg(long, help_heading = crate::cli::TARGET_SELECTION)]
     pub device: bool,
 
     /// Specific device UDID/name to target (implies --device).
-    #[arg(long = "device-id")]
+    #[arg(long = "device-id", help_heading = crate::cli::TARGET_SELECTION)]
     pub device_id: Option<String>,
 
     /// Build and run as a native macOS app ('--on mac' is the same thing).
-    #[arg(long, conflicts_with_all = ["device", "device_id"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["device", "device_id"],
+        help_heading = crate::cli::TARGET_SELECTION
+    )]
     pub mac: bool,
 
     /// Don't stream the app's logs after launching (logs follow by default
@@ -71,9 +79,12 @@ pub struct RunArgs {
 
     /// Enable hot reload (iOS Simulator and native macOS apps): on each Swift
     /// save the file is recompiled and injected into the running app — no
-    /// relaunch, state preserved. Requires the injection client (see
-    /// CLI_DESIGN §9d). A project can default this on via '[run] hot = true'
-    /// in sweetpad.toml.
+    /// relaunch, state preserved. Release builds of sweetpad include the
+    /// injection client; a build from source needs
+    /// 'sweetpad-cli/vendor/injection-client/build.sh' run first ('sweetpad
+    /// help hot-reload'). A project can default this on via '[run] hot =
+    /// true' in sweetpad.toml.
+    // How the client ships and injects: CLI_DESIGN §9d.
     #[arg(long)]
     pub hot: bool,
 
@@ -132,12 +143,23 @@ pub struct XcodebuildArgs {
 }
 
 /// Launch inputs shared by `run` and `launch`: process arguments,
-/// environment, and wait-for-debugger. Simulator, macOS, and physical-device
-/// launches honor all three; physical-device attachment still needs a debugger.
+/// environment, and wait-for-debugger. All three apply to simulator, macOS,
+/// and physical-device launches. Arguments and environment follow the scheme
+/// defaults ([`add_scheme_launch`]); `--restore-state` is macOS-only.
 #[derive(Debug, Clone, Default, clap::Args)]
 pub struct LaunchArgs {
-    /// Argument passed to the app process (repeatable).
-    #[arg(long = "arg", value_name = "ARG")]
+    /// Argument passed to the app process (repeatable). A value may start with
+    /// '-', as user-defaults arguments do: '--arg -MyFlag --arg YES'.
+    // Hyphen values: without them clap reads `--arg -MyFlag` as a flag cluster
+    // and points at the xcodebuild `--` tail, the wrong escape. Each `--arg`
+    // still takes exactly one value, so the flag after it parses as a flag;
+    // only a bare `--` is refused, so it keeps starting the tail.
+    #[arg(
+        long = "arg",
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        value_parser = parse_launch_arg
+    )]
     pub args: Vec<String>,
 
     /// Environment variable for the app process, KEY=VALUE (repeatable).
@@ -147,6 +169,43 @@ pub struct LaunchArgs {
     /// Launch suspended, waiting for a debugger to attach ('lldb -p <pid>').
     #[arg(long = "wait-for-debugger")]
     pub wait_for_debugger: bool,
+
+    /// Let the app restore its previous windows and state on launch (sweetpad
+    /// launches macOS apps with '-ApplePersistenceIgnoreState YES' otherwise).
+    #[arg(long = "restore-state")]
+    pub restore_state: bool,
+}
+
+/// The user-defaults argument that stops a macOS app from restoring its
+/// previous windows. After a crash AppKit asks whether to reopen them, in a
+/// modal alert that holds the main queue, so a relaunch from the terminal
+/// comes up idle behind a dialog nobody asked for.
+const IGNORE_PERSISTENCE: [&str; 2] = ["-ApplePersistenceIgnoreState", "YES"];
+
+/// The process arguments for a macOS app sweetpad launches: the
+/// [`IGNORE_PERSISTENCE`] pair ahead of `args` (the scheme's and the caller's),
+/// unless `--restore-state` asked for the app's own behavior or `args` already
+/// set the key.
+fn mac_launch_args(args: &[String], restore_state: bool) -> Vec<String> {
+    if restore_state || args.iter().any(|a| a == IGNORE_PERSISTENCE[0]) {
+        return args.to_vec();
+    }
+    IGNORE_PERSISTENCE
+        .iter()
+        .map(|a| (*a).to_string())
+        .chain(args.iter().cloned())
+        .collect()
+}
+
+/// An `--arg` value: anything but a bare `--`, which `--arg` would otherwise
+/// swallow when it is typed without a value right before the xcodebuild tail.
+fn parse_launch_arg(value: &str) -> Result<String, String> {
+    if value == "--" {
+        return Err(
+            "'--arg' needs a value before '--', which starts the xcodebuild arguments".into(),
+        );
+    }
+    Ok(value.to_string())
 }
 
 impl LaunchArgs {
@@ -158,7 +217,10 @@ impl LaunchArgs {
             .map(|pair| {
                 pair.split_once('=')
                     .map(|(k, v)| (format!("{prefix}{k}"), v.to_string()))
-                    .ok_or_else(|| CliError::new(format!("--env takes KEY=VALUE (got {pair:?})")))
+                    .ok_or_else(|| {
+                        CliError::new(format!("--env takes KEY=VALUE (got {pair:?})"))
+                            .kind(ErrorKind::Usage)
+                    })
             })
             .collect()
     }
@@ -170,8 +232,11 @@ impl LaunchArgs {
 pub struct DebugBatchArgs {
     /// Run lldb non-interactively: execute the '--cmd' commands, then let the
     /// session end, instead of handing over an interactive prompt. The exit
-    /// code reflects whether the session launched, not what lldb found — parse
-    /// the streamed output for the result, or use 'app diagnose' for a report.
+    /// code says whether the session ran, not what lldb found: it is 0 even
+    /// when lldb stops at a failed command (such as 'bt' after the app has
+    /// exited), and non-zero when the build or launch fails or '--timeout'
+    /// ends the session. Parse the streamed output for the result, or use
+    /// 'app diagnose' for a report.
     #[arg(long)]
     pub batch: bool,
 
@@ -198,10 +263,11 @@ pub struct DebugBatchArgs {
 /// two never overlap — following only one would silently miss the other.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum LogChannel {
-    /// The app's unified log (`os_log`/`Logger`), via `log stream`/`log show`.
+    /// The app's unified log ('os_log'/'Logger'), via 'log stream'/'log show'.
     Oslog,
-    /// The stdout/stderr a detached launch captured to a file (see
-    /// [`detached_log_path`]); `print`, `NSLog`'s stderr leg, C `printf`.
+    /// The stdout/stderr a detached launch captured to a file under sweetpad's
+    /// state directory: 'print', NSLog's stderr leg, C 'printf'.
+    // The file is the one `detached_log_path` names.
     Stdout,
     /// Both, interleaved by arrival (the default).
     #[default]
@@ -262,6 +328,20 @@ pub struct LogFilterArgs {
     /// match, and missing it exits non-zero.
     #[arg(long, value_name = "DUR", conflicts_with = "last", value_parser = parse_duration)]
     pub timeout: Option<Duration>,
+
+    /// List the app's recent terminations instead of its logs: when each
+    /// process ended and why, read from launchd's exit records and the
+    /// system's crash reports, and on macOS from sweetpad's own record of the
+    /// apps it ran attached. A crash shows its signal, a watchdog or host kill
+    /// its reason code and explanation, an exit its status. Covers the last 10m
+    /// unless '--last' says otherwise. Simulator and macOS only. On macOS, a
+    /// detached launch that exits cleanly or is killed from outside leaves no
+    /// record.
+    #[arg(
+        long,
+        conflicts_with_all = ["until", "timeout", "subsystem", "category", "predicate", "level", "source"]
+    )]
+    pub exits: bool,
 }
 
 /// Parse a `30s` / `2m` / `1h` duration; a bare number is seconds.
@@ -322,16 +402,44 @@ impl UntilWatch {
 #[derive(Debug, Clone, Default, clap::Args)]
 pub struct StageTargetArgs {
     /// Act on a connected physical device instead of a simulator.
-    #[arg(long)]
+    #[arg(long, help_heading = crate::cli::TARGET_SELECTION)]
     pub device: bool,
 
     /// Specific device UDID/name (implies --device).
-    #[arg(long = "device-id")]
+    #[arg(long = "device-id", help_heading = crate::cli::TARGET_SELECTION)]
     pub device_id: Option<String>,
 
     /// Act on the native macOS app ('--on mac' is the same thing).
-    #[arg(long, conflicts_with_all = ["device", "device_id"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["device", "device_id"],
+        help_heading = crate::cli::TARGET_SELECTION
+    )]
     pub mac: bool,
+}
+
+/// Which of the app's containers `app container` prints.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ContainerKind {
+    /// The app's data container, holding Documents, Library, and tmp (the
+    /// default).
+    #[default]
+    Data,
+    /// The installed '.app' bundle.
+    App,
+    /// Every App Group container the app is entitled to.
+    Groups,
+}
+
+impl ContainerKind {
+    /// The name `simctl get_app_container` and the JSON payload both use.
+    fn as_str(self) -> &'static str {
+        match self {
+            ContainerKind::Data => "data",
+            ContainerKind::App => "app",
+            ContainerKind::Groups => "groups",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -356,9 +464,14 @@ pub enum Action {
         stage: StageTargetArgs,
         #[command(flatten)]
         launch: LaunchArgs,
+        /// Where the build put its products, for a build that ran with
+        /// '-- -derivedDataPath DIR'. A relative DIR resolves the way the
+        /// build's did, against the directory holding the project.
+        #[arg(long = "derived-data-path", value_name = "DIR")]
+        derived_data_path: Option<std::path::PathBuf>,
     },
     /// Debug under lldb: on a simulator, launch suspended and attach; on
-    /// macOS, hand the executable to lldb and `run` it. '--batch' drives lldb
+    /// macOS, hand the executable to lldb and 'run' it. '--batch' drives lldb
     /// non-interactively from '--cmd' commands, for scripts and agents.
     Debug {
         #[command(flatten)]
@@ -375,7 +488,8 @@ pub enum Action {
     /// Run the app under lldb, catch the first Objective-C exception or crash,
     /// print a structured report, and quit. Built for unattended/agent use:
     /// bounded by '--timeout', and the result is the report ('-o json' for the
-    /// machine-readable form), not the exit code. Simulator and macOS only.
+    /// machine-readable form), not the exit code, which is 0 for any report,
+    /// a crash as much as a clean exit. Simulator and macOS only.
     Diagnose {
         #[command(flatten)]
         target: crate::cli::BuildTargetArgs,
@@ -401,8 +515,9 @@ pub enum Action {
     /// last-launched app when one is recorded; otherwise resolves the build
     /// target. On macOS it follows both the app's os_log and the stdout/stderr a
     /// detached launch captured ('--source' narrows this); '--last <dur>' prints
-    /// recent history and exits instead of following. With --json, emits one
-    /// JSON object per line instead of the rendered text.
+    /// recent history and exits instead of following, and '--exits' lists when
+    /// the app's processes ended and why. With --json, emits one JSON object
+    /// per line instead of the rendered text ('--exits' emits one report).
     Logs {
         #[command(flatten)]
         target: crate::cli::BuildTargetArgs,
@@ -426,9 +541,29 @@ pub enum Action {
         #[arg(long)]
         simulator: Option<String>,
     },
+    /// Print the path of the app's data container, its installed '.app', or
+    /// its App Group containers, on a simulator or for a sandboxed macOS app.
+    /// Only the path goes to stdout, so 'cd "$(sweetpad app container)"'
+    /// works. Uses the last-launched app when one is recorded; otherwise
+    /// resolves the build target.
+    Container {
+        #[command(flatten)]
+        target: crate::cli::BuildTargetArgs,
+        #[command(flatten)]
+        stage: StageTargetArgs,
+        /// Which container to print. 'groups' prints one 'id  path' line per
+        /// App Group.
+        #[arg(long, value_enum, default_value_t = ContainerKind::Data)]
+        kind: ContainerKind,
+    },
     /// Save a PNG screenshot of the running app: a macOS app's window, or
     /// the simulator it launched on.
     Screenshot(ScreenshotArgs),
+    /// Sample the running app for a few seconds and say what its main thread
+    /// was doing: idle in its run loop, blocked on a lock or queue, or busy
+    /// running code. The full 'sample' report is saved too. macOS and
+    /// simulator apps.
+    Sample(SampleArgs),
     /// Inspect or drive a running macOS app's UI through accessibility
     /// ('ui' alone runs 'ui tree').
     Ui {
@@ -541,6 +676,32 @@ pub struct ScreenshotArgs {
     pub clipboard: bool,
 }
 
+/// Flags for `app sample` (CLI_DESIGN §9r).
+#[derive(Debug, clap::Args)]
+pub struct SampleArgs {
+    #[command(flatten)]
+    pub target: crate::cli::BuildTargetArgs,
+
+    /// How long to sample for, in seconds (1 to 60).
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 3,
+        value_parser = clap::value_parser!(u64).range(1..=60)
+    )]
+    pub seconds: u64,
+
+    /// File to write the full 'sample' report to (default: a timestamped file
+    /// under sweetpad's state directory).
+    #[arg(long = "output-file")]
+    pub output_file: Option<std::path::PathBuf>,
+
+    /// Sample this process directly, skipping app resolution (for processes
+    /// sweetpad didn't launch).
+    #[arg(long, value_name = "PID")]
+    pub pid: Option<i32>,
+}
+
 impl Action {
     /// The default action for a bare `sweetpad app`: `app run` with no flags.
     /// clap never parses `RunArgs` on this path, so its `env = …` attrs never
@@ -624,12 +785,10 @@ pub fn run(ctx: &mut Context, action: &Action) -> CommandResult {
     match action {
         Action::Run(args) => {
             ctx.targeting = args.target.clone().into();
-            crate::cli::settle_on_vs_mode(
-                &mut ctx.targeting,
-                args.mac || args.device || args.device_id.is_some(),
-            )?;
+            settle_mode(ctx, args.mac, args.device, args.device_id.as_deref())?;
             let (hot, hot_mode) = hot_settings(ctx, args);
-            let passthrough = ctx.xcodebuild_args(&args.xcodebuild.passthrough)?;
+            let passthrough =
+                ctx.xcodebuild_args(xcodebuild::Action::Build, &args.xcodebuild.passthrough)?;
             // The live build-and-run session streams its own output until you quit.
             run_app(
                 ctx,
@@ -657,23 +816,28 @@ pub fn run(ctx: &mut Context, action: &Action) -> CommandResult {
         } => {
             ctx.targeting = target.clone().into();
             settle_stage_mode(ctx, stage)?;
-            let passthrough = ctx.xcodebuild_args(&xcodebuild.passthrough)?;
             simple(
                 ctx,
                 Stage::Install,
                 &LaunchArgs::default(),
                 stage,
-                &passthrough,
+                &xcodebuild.passthrough,
             )
         }
         Action::Launch {
             target,
             stage,
             launch,
+            derived_data_path,
         } => {
             ctx.targeting = target.clone().into();
             settle_stage_mode(ctx, stage)?;
-            simple(ctx, Stage::Launch, launch, stage, &[])
+            // Planned with, never passed on: `launch` spawns no xcodebuild.
+            let located: Vec<String> = derived_data_path
+                .iter()
+                .flat_map(|dir| ["-derivedDataPath".to_string(), dir.display().to_string()])
+                .collect();
+            simple(ctx, Stage::Launch, launch, stage, &located)
         }
         Action::Debug {
             target,
@@ -684,7 +848,8 @@ pub fn run(ctx: &mut Context, action: &Action) -> CommandResult {
         } => {
             ctx.targeting = target.clone().into();
             settle_stage_mode(ctx, stage)?;
-            let passthrough = ctx.xcodebuild_args(&xcodebuild.passthrough)?;
+            let passthrough =
+                ctx.xcodebuild_args(xcodebuild::Action::Build, &xcodebuild.passthrough)?;
             debug(ctx, stage, launch, batch, &passthrough)
         }
         Action::Diagnose {
@@ -696,7 +861,8 @@ pub fn run(ctx: &mut Context, action: &Action) -> CommandResult {
         } => {
             ctx.targeting = target.clone().into();
             settle_stage_mode(ctx, stage)?;
-            let passthrough = ctx.xcodebuild_args(&xcodebuild.passthrough)?;
+            let passthrough =
+                ctx.xcodebuild_args(xcodebuild::Action::Build, &xcodebuild.passthrough)?;
             diagnose(ctx, stage, launch, *timeout, &passthrough)
         }
         Action::Uninstall { target, stage } => {
@@ -719,23 +885,53 @@ pub fn run(ctx: &mut Context, action: &Action) -> CommandResult {
             simple(ctx, Stage::Stop, &LaunchArgs::default(), stage, &[])
         }
         Action::OpenUrl { url, simulator } => open_url(ctx, url, simulator.as_deref()),
+        Action::Container {
+            target,
+            stage,
+            kind,
+        } => {
+            ctx.targeting = target.clone().into();
+            settle_stage_mode(ctx, stage)?;
+            container(ctx, stage, *kind)
+        }
         Action::Screenshot(args) => {
             ctx.targeting = args.target.clone().into();
             screenshot(ctx, args)
+        }
+        Action::Sample(args) => {
+            ctx.targeting = args.target.clone().into();
+            sample(ctx, args)
         }
         Action::Ui { action } => ui(ctx, action.as_ref()),
     }
 }
 
-/// One mode-vs-`--on` policy for the lifecycle stages, matching `app run`:
-/// a typed `--device`/`--device-id` beats an env-sourced `SWEETPAD_ON`
-/// (instead of silently losing to it), and a typed `--on` alongside them is
-/// rejected.
+/// One mode-flag policy for every `app` verb that takes the mode flags, `run`
+/// and the lifecycle stages alike: a typed `--mac`, `--device` or
+/// `--device-id` beats an env-sourced `SWEETPAD_ON` or `SWEETPAD_DESTINATION`
+/// (instead of silently losing to it), and a typed `--on` or `--destination`
+/// alongside one is rejected before any project is looked for.
+fn settle_mode(
+    ctx: &mut Context,
+    mac: bool,
+    device: bool,
+    device_id: Option<&str>,
+) -> Result<(), CliError> {
+    let mode = if mac {
+        Some("--mac")
+    } else if device_id.is_some() {
+        Some("--device-id")
+    } else if device {
+        Some("--device")
+    } else {
+        None
+    };
+    crate::cli::settle_mode_flag(&mut ctx.targeting, mode)
+}
+
+/// [`settle_mode`] for the verbs that take [`StageTargetArgs`].
 fn settle_stage_mode(ctx: &mut Context, stage: &StageTargetArgs) -> Result<(), CliError> {
-    crate::cli::settle_on_vs_mode(
-        &mut ctx.targeting,
-        stage.device || stage.device_id.is_some(),
-    )
+    settle_mode(ctx, stage.mac, stage.device, stage.device_id.as_deref())
 }
 
 /// Open a URL on a simulator. Unlike the install/launch lifecycle, this needs
@@ -785,8 +981,9 @@ struct RunOpts<'a> {
     detach: bool,
     hot: bool,
     /// Whether `--hot` was typed (vs. the `[run] hot` config default) — a
-    /// config default is silently ignored for non-simulator targets instead
-    /// of erroring on a committed file.
+    /// config default is silently ignored for non-simulator targets, and
+    /// yields to the flags a hot session refuses, instead of erroring on a
+    /// committed file.
     hot_explicit: bool,
     hot_mode: Mode,
     hot_selfcheck: Option<&'a Path>,
@@ -826,6 +1023,13 @@ struct RunPlan {
     hot_entitlements: Option<std::path::PathBuf>,
     /// Launch args/env/wait-for-debugger for the app process.
     launch: LaunchArgs,
+    /// Whether sweetpad put [`IGNORE_PERSISTENCE`] into `launch.args`
+    /// itself, rather than the caller or the scheme. AppKit's note that the
+    /// key took effect is then about sweetpad's launch, not the app, and the
+    /// session leaves it out of the app's output ([`is_persistence_note`]).
+    /// A detached launch records it in its captured file's header, so `app
+    /// logs` leaves it out there too ([`CapturedLog`]).
+    added_ignore_persistence: bool,
     /// Extra xcodebuild arguments (after `--`), passed through verbatim.
     passthrough: Vec<String>,
 }
@@ -847,6 +1051,7 @@ impl RunPlan {
 impl RunPlan {
     fn build_plan(&self) -> xcodebuild::BuildPlan<'_> {
         xcodebuild::BuildPlan {
+            action: xcodebuild::BuildAction::Build,
             container: &self.resolved.container,
             scheme: &self.scheme,
             configuration: &self.configuration,
@@ -860,22 +1065,19 @@ impl RunPlan {
         }
     }
 
-    /// Resolve every target's build settings for this plan — the same
-    /// [`xcodebuild::resolved_settings`] the build side reports its product
-    /// from, so the two can't disagree about where the `.app` landed. Swift
-    /// packages never reach here: they run via `swift run`, not a
-    /// build/install/launch.
-    fn resolved_settings(&self) -> Result<Vec<xcodebuild::TargetBuildSettings>, CliError> {
-        xcodebuild::resolved_settings(&self.build_plan())
+    /// Locate the app this plan builds: the same [`xcodebuild::located`] the
+    /// build side reports its product from, so the two can't disagree about
+    /// where the `.app` landed. The scheme's Run action and the destination
+    /// narrow multi-app schemes (iOS + watch companion, a helper app) to the
+    /// app that actually runs there. Swift packages never reach here: they run
+    /// via `swift run`, not a build/install/launch.
+    fn located(&self) -> Result<xcodebuild::Located, CliError> {
+        xcodebuild::located(&self.build_plan())
     }
 
-    /// Locate the built `.app`: [`resolved_settings`](Self::resolved_settings)
-    /// computes the same TARGET_BUILD_DIR/product the build produced. The
-    /// destination narrows multi-app schemes (iOS + watch companion) to the
-    /// app that actually runs there.
+    /// The built `.app`: [`located`](Self::located)'s bundle.
     fn app_bundle(&self) -> Result<AppBundle, CliError> {
-        let settings = self.resolved_settings()?;
-        xcodebuild::app_bundle(&settings, Some(&self.destination))
+        Ok(self.located()?.app)
     }
 }
 
@@ -890,6 +1092,50 @@ fn session_hot(hot: bool, explicit: bool, target: &Target) -> bool {
     hot && (explicit || matches!(target, Target::Simulator(_)))
 }
 
+/// Refuse `flag`, which a typed `--hot` session can't honor, with `why`: the
+/// reason or the fix. The `[run] hot = true` default never gets here; it
+/// yields to these flags instead ([`hot_default_yields_to`]).
+fn refuse_under_hot(flag: &str, why: &str) -> CliError {
+    CliError::new(format!("{flag} isn't supported with --hot; {why}")).kind(ErrorKind::Usage)
+}
+
+/// The note for a `[run] hot = true` default that yields to the run's own
+/// flags, or `None` when none of them asks for a run a hot session can't be:
+/// `--no-logs` and `--detach` launch and return, and `--wait-for-debugger`
+/// starts the app suspended. The flags were typed for this run and the
+/// default was not, so the run they ask for wins, as it does over a busy
+/// port or a missing injection client.
+fn hot_default_yields_to(no_logs: bool, detach: bool, wait_for_debugger: bool) -> Option<String> {
+    let flags: Vec<&str> = [
+        (no_logs, "'--no-logs'"),
+        (detach, "'--detach'"),
+        (wait_for_debugger, "'--wait-for-debugger'"),
+    ]
+    .into_iter()
+    .filter_map(|(set, flag)| set.then_some(flag))
+    .collect();
+    (!flags.is_empty()).then(|| {
+        format!(
+            "hot reload off for this run: the '[run] hot = true' default yields to {}",
+            flags.join(" and ")
+        )
+    })
+}
+
+/// Why a hot session of `plan` would have no injection client, found without
+/// building. `None` when there is one, or when the destination isn't one hot
+/// reload injects into ([`run_hot_session`] refuses those itself).
+fn missing_hot_client(plan: &RunPlan) -> Option<String> {
+    let sdk = inject::sdk_for_destination(&plan.destination)?;
+    inject::client::check_available(sdk, hot_dylib_override().as_deref()).err()
+}
+
+/// `SWEETPAD_HOTRELOAD_DYLIB`: the injection client to use in place of the
+/// bundled one.
+fn hot_dylib_override() -> Option<std::path::PathBuf> {
+    std::env::var_os("SWEETPAD_HOTRELOAD_DYLIB").map(std::path::PathBuf::from)
+}
+
 /// Whether machine-readable output was asked for, and this invocation streams —
 /// so there is no coherent one-shot payload to emit. `--no-logs` and `--detach`
 /// deploy and return, so they *do* have one; the session forms print logs until
@@ -898,11 +1144,12 @@ fn session_hot(hot: bool, explicit: bool, target: &Target) -> bool {
 fn streaming_under_machine_output(out: &Output, streams: bool) -> Option<CliError> {
     (streams && (out.is_json() || out.is_ndjson())).then(|| {
         CliError::new(
-            "this `app run` streams a live session and has no machine-readable form; add \
-             `--no-logs` (build, install, launch, and exit) or `--detach`, or use \
-             `build start -o ndjson`, `app install`/`app launch --json`, and \
-             `app logs -o ndjson` as separate steps",
+            "this 'app run' streams a live session and has no machine-readable form; add \
+             '--no-logs' (build, install, launch, and exit) or '--detach', or use \
+             'build start -o ndjson', 'app install'/'app launch --json', and \
+             'app logs -o ndjson' as separate steps",
         )
+        .kind(ErrorKind::Usage)
     })
 }
 
@@ -921,6 +1168,18 @@ fn run_app(ctx: &mut Context, opts: &RunOpts) -> CommandResult {
     // reload on" tag.
     let mut hot = session_hot(opts.hot, opts.hot_explicit, &plan.target);
 
+    // A committed default yields to the flags that ask for a run a hot
+    // session can't be, so the agent-facing `--no-logs` works in any
+    // project. Only a typed `--hot` refuses them, below.
+    if hot
+        && !opts.hot_explicit
+        && let Some(note) =
+            hot_default_yields_to(opts.no_logs, opts.detach, plan.launch.wait_for_debugger)
+    {
+        ctx.out.note(&note);
+        hot = false;
+    }
+
     // The same rule applied to a busy injection port: one `--hot` session owns
     // `:8887`, and a committed default must not turn "another session is
     // already running" into a failed run. A typed `--hot` still fails loudly
@@ -930,7 +1189,19 @@ fn run_app(ctx: &mut Context, opts: &RunOpts) -> CommandResult {
             .map_or_else(|| "another session".to_string(), |pid| format!("pid {pid}"));
         ctx.out.warn(&format!(
             "hot reload off for this run: {who} holds 127.0.0.1:8887. The \
-             `[run] hot = true` default yields; type `--hot` to fail instead"
+             '[run] hot = true' default yields; type '--hot' to fail instead"
+        ));
+        hot = false;
+    }
+    // And to a sweetpad with no injection client, such as a build from source
+    // that never ran the client's build script.
+    if hot
+        && !opts.hot_explicit
+        && let Some(why) = missing_hot_client(&plan)
+    {
+        ctx.out.warn(&format!(
+            "hot reload off for this run: {why}. The '[run] hot = true' default yields; \
+             type '--hot' to fail instead"
         ));
         hot = false;
     }
@@ -938,18 +1209,18 @@ fn run_app(ctx: &mut Context, opts: &RunOpts) -> CommandResult {
     let plan = plan;
 
     // The hot session launches without debugger suspension and owns the log
-    // stream as part of its UI — reject the flags it can't honor instead of
-    // silently dropping them.
+    // stream as part of its UI. A typed `--hot` is refused the flags it can't
+    // honor instead of silently dropping them; the default yielded above.
     if hot && plan.launch.wait_for_debugger {
-        return Err(CliError::new(
-            "--wait-for-debugger isn't supported with --hot; run without --hot to \
-             attach a debugger at launch",
+        return Err(refuse_under_hot(
+            "--wait-for-debugger",
+            "run without --hot to attach a debugger at launch",
         ));
     }
     if hot && opts.no_logs {
-        return Err(CliError::new(
-            "--no-logs isn't supported with --hot; the hot session streams logs \
-             as part of its UI",
+        return Err(refuse_under_hot(
+            "--no-logs",
+            "the hot session streams logs as part of its UI",
         ));
     }
     if (opts.keep_sandbox || opts.hot_entitlements.is_some()) && !matches!(plan.target, Target::Mac)
@@ -960,9 +1231,10 @@ fn run_app(ctx: &mut Context, opts: &RunOpts) -> CommandResult {
         ));
     }
     if hot && opts.detach {
-        return Err(CliError::new(
-            "--detach isn't supported with --hot; hot reload has to stay attached to \
-             recompile and inject (press `d` in the session to detach and leave it running)",
+        return Err(refuse_under_hot(
+            "--detach",
+            "hot reload has to stay attached to recompile and inject (press 'd' in the \
+             session to detach and leave it running)",
         ));
     }
 
@@ -973,6 +1245,12 @@ fn run_app(ctx: &mut Context, opts: &RunOpts) -> CommandResult {
         streaming_under_machine_output(&ctx.out, hot || matches!(plan.target, Target::SpmRun(_)))
     {
         return Err(e);
+    }
+
+    // A typed `--hot` with no client to inject fails here, before a build
+    // is spent on an app the session couldn't hot reload.
+    if hot && let Some(why) = missing_hot_client(&plan) {
+        return Err(CliError::new(why).kind(ErrorKind::ToolMissing));
     }
 
     print_summary(ctx, &plan);
@@ -1013,30 +1291,6 @@ fn run_app(ctx: &mut Context, opts: &RunOpts) -> CommandResult {
         record_last_launched(ctx, &plan);
     }
     result
-}
-
-/// The first passthrough flag that moves xcodebuild's output past where the
-/// in-process app locator looks, if any. `-derivedDataPath` is not one of
-/// them — [`xcodebuild::passthrough_derived_data`] follows it, and refuses the
-/// relocating build settings outright — so this is the pair the locator can
-/// neither follow nor recognize: a `TARGET_BUILD_DIR=` override, and an
-/// `-xcconfig` free to set any of them from a file.
-fn passthrough_moves_output(passthrough: &[String]) -> Option<&String> {
-    passthrough
-        .iter()
-        .find(|t| *t == "-xcconfig" || t.starts_with("TARGET_BUILD_DIR="))
-}
-
-/// Say so when the build's products land somewhere the install step won't
-/// look: installing a stale bundle from default DerivedData would silently
-/// run old code.
-fn warn_if_passthrough_moves_output(ctx: &Context, passthrough: &[String]) {
-    if let Some(flag) = passthrough_moves_output(passthrough) {
-        ctx.out.warn(&format!(
-            "{flag} can move the build output, but the app is installed from the \
-             default build location — the launched bundle may be stale or missing"
-        ));
-    }
 }
 
 /// Resolve a full run plan, choosing a simulator (default), a device, or macOS.
@@ -1092,15 +1346,7 @@ fn plan(ctx: &mut Context, opts: &RunOpts) -> Result<RunPlan, CliError> {
                     CliError::new("device not found").kind(ErrorKind::TargetResolution)
                 })?
         };
-        let platform = if dev.platform.is_empty() {
-            "iOS"
-        } else {
-            &dev.platform
-        };
-        (
-            format!("platform={platform},id={}", dev.udid),
-            Target::Device(dev.udid.clone()),
-        )
+        (dev.destination(), Target::Device(dev.udid.clone()))
     } else {
         // Scheme and configuration are already settled above; resolve only the
         // destination here so the scheme picker doesn't run a second time. A
@@ -1121,13 +1367,13 @@ fn plan(ctx: &mut Context, opts: &RunOpts) -> Result<RunPlan, CliError> {
             .unwrap_or(d),
             None => resolve::pick_destination_for(ctx, &resolved, &scheme, &configuration, true)?,
         };
-        let platform = destination_platform(&destination).unwrap_or_default();
-        if platform.eq_ignore_ascii_case("macOS") {
+        let spec = DestinationSpec::parse(&destination);
+        if spec.is_macos() {
             // The picker's "My Mac" row (or a config/remembered macOS
             // destination, with or without extra keys like arch=) runs the
             // native-app flow, not a simulator.
             (destination, Target::Mac)
-        } else if !platform.is_empty() && !platform.to_ascii_lowercase().contains("simulator") {
+        } else if spec.is_device() {
             // A physical-device destination (platform=iOS,id=…) routes to
             // devicectl — handing its udid to simctl would fail with an
             // unrelated "Invalid device" much later.
@@ -1144,8 +1390,6 @@ fn plan(ctx: &mut Context, opts: &RunOpts) -> Result<RunPlan, CliError> {
         }
     };
 
-    warn_if_passthrough_moves_output(ctx, opts.passthrough);
-
     let mut plan = RunPlan {
         resolved,
         scheme,
@@ -1155,11 +1399,23 @@ fn plan(ctx: &mut Context, opts: &RunOpts) -> Result<RunPlan, CliError> {
         hot: opts.hot,
         hot_entitlements: None,
         launch: opts.launch.clone(),
+        added_ignore_persistence: false,
         passthrough: opts.passthrough.to_vec(),
     };
-    // A product-relocating passthrough the app locator can't follow fails
-    // here, before a build is spent on it.
-    xcodebuild::passthrough_derived_data(&plan.passthrough)?;
+    // Settled on the plan, like the macOS pair below, so every launch it
+    // drives carries them: a session's relaunches, a detached launch, and
+    // lldb's. `swift run` has no scheme to read them from.
+    if !matches!(plan.target, Target::SpmRun(_)) {
+        add_scheme_launch(&mut plan)?;
+        add_xcode_launch_env(&mut plan.launch);
+    }
+    if matches!(plan.target, Target::Mac) {
+        let args = mac_launch_args(&plan.launch.args, plan.launch.restore_state);
+        // `mac_launch_args` only ever prepends the pair, so a longer list
+        // means sweetpad added it.
+        plan.added_ignore_persistence = args.len() > plan.launch.args.len();
+        plan.launch.args = args;
+    }
     // A hot macOS build may need to sign with an ephemeral sandbox-stripped
     // entitlements file (§9d zero-config sandbox stripping) — settled here so
     // every session build (including `r` rebuilds) carries the override.
@@ -1182,6 +1438,77 @@ fn plan(ctx: &mut Context, opts: &RunOpts) -> Result<RunPlan, CliError> {
         && !matches!(plan.target, Target::SpmRun(_));
     resolve::remember(ctx, &plan.resolved, &bt, picker_sourced);
     Ok(plan)
+}
+
+/// Add what the plan's scheme launches the app with, as Xcode's Run applies
+/// it ([`sweetpad_lib::scheme::Scheme::launch_settings`]): arguments,
+/// environment, and the App Language and App Region flags. Build settings are
+/// resolved only when a row refers to one. A scheme with no file adds nothing.
+fn add_scheme_launch(plan: &mut RunPlan) -> Result<(), CliError> {
+    let Some(scheme) = resolve::parse_scheme(&plan.resolved.container, &plan.scheme) else {
+        return Ok(());
+    };
+    let settings = if scheme.launch_references_settings() {
+        expansion_settings(plan, &scheme)?
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    let launch = scheme.launch_settings(&settings, sweetpad_lib::scheme::host_language);
+    merge_scheme_launch(&mut plan.launch, launch);
+    Ok(())
+}
+
+/// The build settings `$(VAR)` in the scheme's launch rows expands against:
+/// those of the app the plan launches, which the locator picks from the same
+/// Run action, unless the Run action's `MacroExpansion` names another target
+/// the build resolves.
+fn expansion_settings(
+    plan: &RunPlan,
+    scheme: &sweetpad_lib::scheme::Scheme,
+) -> Result<std::collections::BTreeMap<String, String>, CliError> {
+    let located = plan.located()?.settings;
+    if let Some(other) = scheme
+        .launch_macro_expansion
+        .as_ref()
+        .filter(|m| m.blueprint_name != located.target)
+        && let Some(settings) =
+            xcodebuild::target_settings(&plan.build_plan(), &other.blueprint_name)?
+    {
+        return Ok(settings);
+    }
+    Ok(located.settings)
+}
+
+/// The environment Xcode launches every app with, whatever the scheme says:
+/// `NSUnbufferedIO=YES` has Foundation leave stdout unbuffered, so a `print`
+/// reaches a pipe or a file as it happens. Buffered, it waits for 4 KB to pile
+/// up, and a macOS app's output goes through a pipe or file on every launch
+/// but a terminal session's.
+const XCODE_LAUNCH_ENV: [(&str, &str); 1] = [("NSUnbufferedIO", "YES")];
+
+/// Put [`XCODE_LAUNCH_ENV`] ahead of the scheme's variables and the `--env`s,
+/// so either can still set it.
+fn add_xcode_launch_env(launch: &mut LaunchArgs) {
+    launch.env.splice(
+        0..0,
+        XCODE_LAUNCH_ENV
+            .iter()
+            .map(|(key, value)| format!("{key}={value}")),
+    );
+}
+
+/// Put the scheme's arguments ahead of the `--arg`s and its environment ahead
+/// of the `--env`s, so a value typed for this run wins a clash with the
+/// scheme's.
+fn merge_scheme_launch(launch: &mut LaunchArgs, scheme: sweetpad_lib::scheme::LaunchSettings) {
+    launch.args.splice(0..0, scheme.args);
+    launch.env.splice(
+        0..0,
+        scheme
+            .env
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}")),
+    );
 }
 
 /// Settle the entitlements story for a hot macOS build (§9d zero-config
@@ -1213,8 +1540,7 @@ fn hot_sandbox_override(
     // already applied. A relative value is SRCROOT-relative (how the signer
     // reads it).
     let effective = || -> Result<Option<std::path::PathBuf>, CliError> {
-        let settings = plan.resolved_settings()?;
-        let target = xcodebuild::app_target(&settings, Some(&plan.destination))?;
+        let target = plan.located()?.settings;
         let Some(value) = target
             .settings
             .get("CODE_SIGN_ENTITLEMENTS")
@@ -1322,10 +1648,20 @@ impl BgBoot {
 /// Build and install onto the target, returning the launchable app. Shared by
 /// every flow; the launch step is chosen by the caller.
 fn build_and_install(plan: &RunPlan, out: &Output) -> Result<AppBundle, CliError> {
+    install_built(plan, out, || plan.build_plan().run(out).map(|_| ()))
+}
+
+/// [`build_and_install`] with the build step given, for the debug adapter,
+/// which streams the build to the editor and can cancel it.
+fn install_built(
+    plan: &RunPlan,
+    out: &Output,
+    build: impl FnOnce() -> CliResult,
+) -> Result<AppBundle, CliError> {
     // Boot the simulator while the build runs; joined at the boot step below so it's
     // ready for install without the boot serializing after the build.
     let mut boot = BgBoot::start(&plan.target);
-    plan.build_plan().run(out)?;
+    build()?;
     let app = plan.app_bundle()?;
     let app_path = app.path.display().to_string();
     match &plan.target {
@@ -1358,7 +1694,7 @@ fn record_last_launched(ctx: &mut Context, plan: &RunPlan) {
             "device",
             None,
             Some(id.clone()),
-            destination_platform(&plan.destination),
+            DestinationSpec::parse(&plan.destination).platform_label,
         ),
         Target::Mac => ("macos", None, None, None),
         Target::SpmRun(_) => return,
@@ -1376,6 +1712,9 @@ fn record_last_launched(ctx: &mut Context, plan: &RunPlan) {
         simulator_udid,
         destination_id,
         destination_type,
+        scheme: Some(plan.scheme.clone()),
+        configuration: Some(plan.configuration.clone()),
+        destination: Some(plan.destination.clone()),
     };
     let key = plan.resolved.container.key();
     ctx.state.project_mut(&key).last_launched_app = Some(last);
@@ -1389,13 +1728,6 @@ fn predicate_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// The `platform=` value from a `-destination` specifier, e.g. `iOS`.
-fn destination_platform(spec: &str) -> Option<String> {
-    spec.split(',')
-        .find_map(|kv| kv.trim().strip_prefix("platform="))
-        .map(str::to_string)
-}
-
 /// `swift run <product>` in the package directory: builds and runs the
 /// executable, streaming its output until it exits. `--arg` rides after the
 /// product name (SwiftPM passes everything there to the program) and `--env`
@@ -1405,13 +1737,13 @@ fn spm_run(ctx: &Context, plan: &RunPlan, product: &str) -> CliResult {
     if plan.launch.wait_for_debugger {
         return Err(CliError::new(
             "--wait-for-debugger isn't supported for a Swift package executable; \
-             use `swift build` and attach lldb to the binary directly",
+             use 'swift build' and attach lldb to the binary directly",
         ));
     }
     if !plan.passthrough.is_empty() {
         return Err(CliError::new(
-            "`--` passthrough args are xcodebuild flags; a Swift package runs via \
-             `swift run` (use --arg for program arguments)",
+            "'--' passthrough args are xcodebuild flags; a Swift package runs via \
+             'swift run' (use --arg for program arguments)",
         ));
     }
     let cwd = plan
@@ -1602,16 +1934,18 @@ fn run_session(ctx: &Context, plan: &RunPlan) -> CliResult {
     // threshold, set live by the 1/2/3 keys.
     let filter = Arc::new(AtomicU8::new(default_filter(&ctx.out).threshold()));
     // Boot the simulator on a background thread so it comes up while the project
-    // builds. Joined below before install — or, on a failed build, before the log
-    // stream so it attaches to a booted device instead of failing with "device is
-    // not booted". A no-op for device/macOS targets.
+    // builds. Joined below before install, or on a failed build right away, so
+    // the next `r` finds it booted. A no-op for device/macOS targets.
     let mut boot = BgBoot::start(&plan.target);
     // Build + launch. A failure keeps the session (nothing running) so you can fix
     // the error and press `r`, instead of being dropped back to the shell.
     let started = Instant::now();
     let mut ever_launched = false;
+    let mut last_build;
+    let mut logs = SessionLogs::default();
     let mut running = match build(plan, &ctx.out, None) {
         BuildOutcome::Ok => {
+            last_build = LastBuild::Succeeded;
             // Finish the background boot before installing; start_app's own boot then
             // confirms it (a fast no-op now the device is already up).
             let _ = boot.wait();
@@ -1619,6 +1953,7 @@ fn run_session(ctx: &Context, plan: &RunPlan) -> CliResult {
                 Ok(r) => {
                     note_launch(ctx, "Launched", started);
                     ever_launched = true;
+                    logs.launched(ctx, plan, &filter);
                     Some(r)
                 }
                 Err(e) => {
@@ -1628,46 +1963,44 @@ fn run_session(ctx: &Context, plan: &RunPlan) -> CliResult {
             }
         }
         BuildOutcome::Failed(e) => {
+            last_build = LastBuild::Failed;
             ctx.out.error(&e);
             // Nothing launched, but the session stays open to fix and rebuild. Finish
-            // the boot so the log stream ([`start_logs`]) attaches to a booted device
-            // and it's ready for the next `r`. Best-effort.
+            // the boot so the simulator is ready for the next `r`. Best-effort.
             let _ = boot.wait();
             None
         }
-        // Ctrl-C during the initial build cancels the whole run before anything
-        // launched — exit as a user cancel (6), not success. The background
-        // `simctl boot` is joined first, or its child outlives the CLI and
-        // boots the simulator the user just cancelled.
+        // Ctrl-C during the initial build cancels the whole run (see
+        // [`session_result`]). The background `simctl boot` is joined first,
+        // or its child outlives the CLI and boots the simulator the user just
+        // cancelled.
         BuildOutcome::Aborted => {
             let _ = boot.wait();
-            return Err(CliError::new("cancelled").kind(ErrorKind::UserCancel));
+            return session_result(false, LastBuild::Cancelled);
         }
     };
-    // The log stream is session-scoped: started once and kept across rebuilds (its
-    // name-based predicate follows the relaunched app), so rebuilds never tear it
-    // down. Dropped on exit.
-    let logs = start_logs(ctx, plan, &filter);
-    // The level keys are meaningful only when there's an os_log stream to filter
-    // (the simulator, a macOS app, or a device with pymobiledevice3) — not a device
-    // on its raw console.
-    let filterable = logs.is_some();
-    session_hint(ctx, filterable);
+    session_hint(ctx, logs.filterable());
 
     let mut detach = false;
     loop {
         match rawmode::poll_key() {
             rawmode::Input::Key(ch) => match classify_key(ch) {
-                SessionKey::Rebuild => match do_rebuild(ctx, plan, &mut running, &filter) {
-                    RebuildOutcome::Continue { launched } => {
-                        ever_launched |= launched;
-                        session_hint(ctx, filterable);
+                SessionKey::Rebuild => {
+                    match do_rebuild(ctx, plan, &mut running, &mut logs, &filter) {
+                        RebuildOutcome::Continue { build, launched } => {
+                            last_build = build;
+                            ever_launched |= launched;
+                            session_hint(ctx, logs.filterable());
+                        }
+                        // Ctrl-C during the rebuild cancels the whole run, whether
+                        // or not the app ran before it; fall through to the shared
+                        // teardown.
+                        RebuildOutcome::Cancelled => {
+                            last_build = LastBuild::Cancelled;
+                            break;
+                        }
                     }
-                    // Ctrl-C during the rebuild cancels the whole run; fall
-                    // through to the shared teardown so a session that never
-                    // launched anything still exits non-zero.
-                    RebuildOutcome::Quit => break,
-                },
+                }
                 SessionKey::Quit => break,
                 // `d`: stop watching but leave the app running.
                 SessionKey::Detach => {
@@ -1675,15 +2008,13 @@ fn run_session(ctx: &Context, plan: &RunPlan) -> CliResult {
                     break;
                 }
                 SessionKey::Screenshot => session_screenshot(ctx, plan),
-                SessionKey::Foreground => {
-                    let _ = simctl::open_app();
-                }
+                SessionKey::Foreground => session_foreground(ctx, plan, running.as_mut()),
                 SessionKey::Clear => ctx.out.line("\x1b[2J\x1b[H"),
-                SessionKey::Help => session_keys_help(ctx, filterable),
+                SessionKey::Help => session_keys_help(ctx, &plan.target, logs.filterable()),
                 // Inert unless an os_log stream is actually being filtered (see
-                // `filterable`).
+                // [`SessionLogs::filterable`]).
                 SessionKey::Filter(level) => {
-                    if filterable {
+                    if logs.filterable() {
                         set_filter(ctx, &filter, level);
                     }
                 }
@@ -1692,7 +2023,7 @@ fn run_session(ctx: &Context, plan: &RunPlan) -> CliResult {
                     // shell; SIGCONT re-asserts raw mode on `fg`.
                     crate::cli::signals::suspend_self();
                     ctx.out.note("resumed");
-                    session_hint(ctx, filterable);
+                    session_hint(ctx, logs.filterable());
                 }
                 SessionKey::Ignore => {}
             },
@@ -1704,30 +2035,66 @@ fn run_session(ctx: &Context, plan: &RunPlan) -> CliResult {
             check_exit(ctx, r);
         }
     }
-    if let Some(r) = running.take() {
-        if detach {
-            ctx.out
-                .note(&format!("detached — {} keeps running", r.name));
-            if matches!(r.kind, RunningKind::Mac) {
-                ctx.out.warn(
-                    "the macOS app's output pipes close when sweetpad exits — its next \
-                     print may terminate it; relaunch from Finder for a long-lived detach",
-                );
-            }
-            detach_app(r);
-        } else {
-            terminate_app(r);
+    let outcome = session_result(ever_launched, last_build);
+    end_session(ctx, running, detach, outcome)
+}
+
+/// The plain session's teardown: a detach leaves the app running, and any
+/// other ending stops it. The session exits with `outcome` unless that stop
+/// failed ([`quit_result`]).
+fn end_session(
+    ctx: &Context,
+    running: Option<Running>,
+    detach: bool,
+    outcome: CliResult,
+) -> CliResult {
+    let Some(r) = running else {
+        return outcome;
+    };
+    if detach {
+        ctx.out
+            .note(&format!("detached — {} keeps running", r.name));
+        if matches!(r.kind, RunningKind::Mac { .. }) {
+            ctx.out.warn(
+                "the macOS app's output pipes close when sweetpad exits — its next \
+                 print may terminate it; relaunch from Finder for a long-lived detach",
+            );
         }
+        detach_app(r);
+        return outcome;
     }
-    // A session that never produced a running app (the build kept failing) exits
-    // non-zero, so a script or wrapper around `app run` sees the failure even
-    // though the session stayed open for you to retry.
-    if ever_launched {
-        Ok(())
-    } else {
-        Err(CliError::new(
-            "app run ended without a successful build — nothing was launched",
-        ))
+    let name = r.name.clone();
+    let stopped = terminate_app(ctx, r);
+    quit_result(outcome, &name, stopped, |e| ctx.out.error(e))
+}
+
+/// How the session's most recent build ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastBuild {
+    Succeeded,
+    Failed,
+    /// Ctrl-C during the build.
+    Cancelled,
+}
+
+/// The session's exit, plain or `--hot`. Ctrl-C while a build runs cancels
+/// the session: exit 6, whether or not the app ran earlier. Every other ending
+/// (`q`, Ctrl-C or Ctrl-D at the prompt, `d`, stdin closing) is a quit: 0 once
+/// the app has run, and otherwise non-zero, so a script or wrapper around
+/// `app run` sees the failure even though the session stayed open for a
+/// retry. That code follows the last build: 3 if it failed (the code `build`
+/// uses), 1 if it succeeded but the launch failed.
+fn session_result(ever_launched: bool, last_build: LastBuild) -> CliResult {
+    match (last_build, ever_launched) {
+        (LastBuild::Cancelled, _) => Err(CliError::new("cancelled").kind(ErrorKind::UserCancel)),
+        (_, true) => Ok(()),
+        (LastBuild::Failed, false) => Err(CliError::new(
+            "the last build failed, so nothing was launched",
+        )
+        .kind(ErrorKind::BuildFailure)),
+        (LastBuild::Succeeded, false) => {
+            Err(CliError::new("the app was built but failed to launch"))
+        }
     }
 }
 
@@ -1835,12 +2202,12 @@ fn run_hot_session(
     match build(plan, &ctx.out, Some(&build_log)) {
         BuildOutcome::Ok => {}
         BuildOutcome::Failed(e) => return Err(e),
-        // Ctrl-C during the build cancels the hot session before it starts —
-        // a user cancel (exit 6), not a success. Join the background boot
-        // first so its `simctl boot` child doesn't outlive the cancel.
+        // Ctrl-C during the build cancels the hot session before it starts
+        // (see [`session_result`]). Join the background boot first so its
+        // `simctl boot` child doesn't outlive the cancel.
         BuildOutcome::Aborted => {
             let _ = boot.wait();
-            return Err(CliError::new("cancelled").kind(ErrorKind::UserCancel));
+            return session_result(false, LastBuild::Cancelled);
         }
     }
     let app = plan.app_bundle()?;
@@ -1854,17 +2221,18 @@ fn run_hot_session(
 
     // Resolve the injection client dylib + the launch env: SIMCTL_CHILD_-
     // prefixed for a simctl launch (stripped as it's forwarded into the
-    // simulated process), raw for the direct mac spawn.
+    // simulated process), raw for the direct mac spawn. `run_app` checked
+    // before the build that there is a client to find.
     // `SWEETPAD_HOTRELOAD_DYLIB` overrides the lookup (used by CI to point at a
     // downloaded client matching the active Xcode).
     let client_opts = inject::client::ClientOptions {
         developer_dir: developer_dir.clone(),
         sdk: sdk.to_string(),
         project_root: project_root.clone(),
-        override_path: std::env::var_os("SWEETPAD_HOTRELOAD_DYLIB").map(std::path::PathBuf::from),
+        override_path: hot_dylib_override(),
     };
     let dylib = inject::client::resolve_dylib(&client_opts, &|msg| ctx.out.note(msg))
-        .map_err(CliError::new)?;
+        .map_err(|e| CliError::new(e).kind(ErrorKind::ToolMissing))?;
     let env_prefix = match &plan.target {
         Target::Simulator(_) => "SIMCTL_CHILD_",
         _ => "",
@@ -1881,6 +2249,7 @@ fn run_hot_session(
         &plan.resolved.container,
         plan.scheme.clone(),
         plan.configuration.clone(),
+        xcodebuild::command_line_settings(&plan.passthrough, &plan.resolved.container),
         sdk.to_string(),
         inject::host_arch(),
         developer_dir,
@@ -1895,7 +2264,7 @@ fn run_hot_session(
     // if it's absent (UIKit apps don't need it, so this is advisory only).
     if inject::inject_dependency_present(&project_root) == Some(false) {
         ctx.out.note(
-            "hot reload: the `Inject` package isn't in Package.resolved — SwiftUI views \
+            "hot reload: the 'Inject' package isn't in Package.resolved — SwiftUI views \
              won't redraw on save until you add https://github.com/krzysztofzablocki/Inject \
              and annotate them with @ObserveInjection + .enableInjection() (UIKit apps can ignore this)",
         );
@@ -1908,7 +2277,7 @@ fn run_hot_session(
     // Hot reload has no live filter UI; use the default threshold, never cycled.
     let filter = Arc::new(AtomicU8::new(default_filter(&ctx.out).threshold()));
     let mut hot_app = HotApp::new(&plan.target, Arc::clone(&filter));
-    hot_app.launch(ctx, &app, &launch_env, &plan.launch.args)?;
+    hot_app.launch(ctx, plan, &app, &launch_env)?;
 
     // A mac app that never dials back is running uninjected (something undid
     // the insert env); surface that instead of leaving a silently dead session.
@@ -1926,7 +2295,7 @@ fn run_hot_session(
                 log(
                     "hot reload: the app hasn't connected to :8887 — it's likely running \
                      uninjected. A run-script phase may be re-signing the product; \
-                     `codesign -d -vv --entitlements - <app>` shows what it carries.",
+                     'codesign -d -vv --entitlements - <app>' shows what it carries.",
                 );
             }
         });
@@ -1938,11 +2307,11 @@ fn run_hot_session(
 
     // CI self-check: edit a file once, assert `.injected`, exit. Otherwise the
     // interactive key loop (`r`/`q`), or — non-TTY — follow logs until Ctrl-C.
-    let mut terminate_on_exit = true;
+    let mut end = HotLoopEnd::Quit;
     let outcome = if let Some(file) = selfcheck {
         hot_selfcheck(ctx, &server, file, &plan.target)
     } else if ctx.out.is_interactive() {
-        terminate_on_exit = hot_key_loop(
+        end = hot_key_loop(
             ctx,
             plan,
             &mut hot_app,
@@ -1951,7 +2320,14 @@ fn run_hot_session(
             &mut logs,
             &build_log,
         );
-        Ok(())
+        // The app launched above, so only a cancelled rebuild fails the
+        // session.
+        let last_build = if end == HotLoopEnd::Cancelled {
+            LastBuild::Cancelled
+        } else {
+            LastBuild::Succeeded
+        };
+        session_result(true, last_build)
     } else {
         ctx.out
             .note("hot reload: watching for Swift changes (Ctrl-C to stop)");
@@ -1966,11 +2342,13 @@ fn run_hot_session(
     session_done.store(true, Ordering::Relaxed);
     session.shutdown();
     server.shutdown();
-    if terminate_on_exit {
-        hot_app.terminate(&app);
-    } else {
+    let outcome = if end == HotLoopEnd::Detach {
         hot_app.detach();
-    }
+        outcome
+    } else {
+        let stopped = hot_app.terminate(ctx, &app);
+        quit_result(outcome, &app.bundle_id, stopped, |e| ctx.out.error(e))
+    };
     drop(logs);
     outcome
 }
@@ -2010,6 +2388,7 @@ fn hot_selfcheck(
         ));
     }
     let baseline = server.result_counts();
+    let steps = server.progress();
 
     // A signal can kill the process anywhere in the (long) wait below, after
     // the nonce write but before the restore — so the pristine source is
@@ -2040,7 +2419,7 @@ fn hot_selfcheck(
         .map_err(|e| CliError::new(format!("self-check: read {}: {e}", file.display())))?;
     if !original.contains(SELFCHECK_MARKER) {
         return Err(CliError::new(format!(
-            "self-check: {} has no `{SELFCHECK_MARKER}` marker (expected the hot-reload fixture)",
+            "self-check: {} has no '{SELFCHECK_MARKER}' marker (expected the hot-reload fixture)",
             file.display()
         )));
     }
@@ -2057,6 +2436,8 @@ fn hot_selfcheck(
     // Be generous so a slow/contended CI runner doesn't flake (the real watcher
     // loop has no such deadline — this bound only guards the self-check).
     let result = server.wait_for_result(baseline, Duration::from_secs(180));
+    // Read before the restore below, which is a save of its own.
+    let stalled = server.progress().stalled_since(&steps);
     // Restore the fixture regardless of outcome, and drop the backup only
     // once the pristine content is verifiably back in place — a failed
     // restore must keep the backup so the next run can self-heal.
@@ -2075,9 +2456,9 @@ fn hot_selfcheck(
         Some(true) => ctx.out.note("hot reload self-check: ✅ .injected"),
         Some(false) => return Err(CliError::new("hot reload self-check: ❌ injection failed")),
         None => {
-            return Err(CliError::new(
-                "hot reload self-check: ❌ timed out waiting for .injected",
-            ));
+            return Err(CliError::new(format!(
+                "hot reload self-check: ❌ timed out waiting for .injected: {stalled}"
+            )));
         }
     }
 
@@ -2193,8 +2574,9 @@ enum HotApp<'a> {
         udid: &'a str,
     },
     Mac {
-        child: Option<Child>,
-        reap_slot: Option<usize>,
+        /// Held as the plain session holds its app, so the same
+        /// [`check_exit`] notices and records the app's exit.
+        running: Option<Running>,
         filter: Arc<AtomicU8>,
     },
 }
@@ -2204,8 +2586,7 @@ impl HotApp<'_> {
         match target {
             Target::Simulator(udid) => HotApp::Sim { udid },
             Target::Mac => HotApp::Mac {
-                child: None,
-                reap_slot: None,
+                running: None,
                 filter,
             },
             Target::Device(_) | Target::SpmRun(_) => {
@@ -2219,32 +2600,44 @@ impl HotApp<'_> {
     fn launch(
         &mut self,
         ctx: &Context,
+        plan: &RunPlan,
         app: &AppBundle,
         env: &[(String, String)],
-        args: &[String],
     ) -> CliResult {
+        let args = &plan.launch.args;
         match self {
             HotApp::Sim { udid } => launch_hot(ctx, udid, app, env, args),
-            HotApp::Mac {
-                child,
-                reap_slot,
-                filter,
-            } => {
-                terminate_mac_child(child, reap_slot);
+            HotApp::Mac { running, filter } => {
+                if let Some(old) = running.take() {
+                    report_stop(ctx, terminate_app(ctx, old));
+                }
                 let mut cmd = std::process::Command::new(app.executable.as_os_str());
                 cmd.args(args)
                     .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
-                let mut c = ctx.out.step("Launching app", || {
+                let recorder = ExitRecorder::new(plan, app);
+                let mut child = ctx.out.step("Launching app", || {
                     cmd.spawn().map_err(|e| {
-                        CliError::new(format!("failed to run `{}`: {e}", app.executable.display()))
+                        CliError::new(format!("failed to run '{}': {e}", app.executable.display()))
                     })
                 })?;
-                render_console(&mut c, ctx.out.use_color(), filter);
-                *reap_slot = crate::cli::signals::register_child(c.id());
-                *child = Some(c);
+                // The client is sweetpad's, so its note that the session's
+                // server went away is too.
+                let own = OwnLines {
+                    injection_disconnect: true,
+                    ..OwnLines::of(plan)
+                };
+                render_console(&mut child, ctx.out.use_color(), filter, own);
+                let reap_slot = crate::cli::signals::register_child(child.id());
+                *running = Some(Running {
+                    stream: Some(child),
+                    kind: RunningKind::Mac { recorder },
+                    name: app.bundle_id.clone(),
+                    reported_exit: false,
+                    reap_slot,
+                });
                 ctx.out.note(&format!("Launched {}", app.bundle_id));
                 Ok(())
             }
@@ -2252,14 +2645,23 @@ impl HotApp<'_> {
     }
 
     /// Terminate the running app (before each relaunch and on quit).
-    fn terminate(&mut self, app: &AppBundle) {
+    fn terminate(&mut self, ctx: &Context, app: &AppBundle) -> CliResult {
         match self {
-            HotApp::Sim { udid } => {
-                let _ = simctl::terminate(udid, &app.bundle_id);
-            }
-            HotApp::Mac {
-                child, reap_slot, ..
-            } => terminate_mac_child(child, reap_slot),
+            HotApp::Sim { udid } => terminate_on_simulator(ctx, udid, &app.bundle_id),
+            HotApp::Mac { running, .. } => running.take().map_or(Ok(()), |r| terminate_app(ctx, r)),
+        }
+    }
+
+    /// Say that the mac app exited on its own and record the exit, through the
+    /// plain session's [`check_exit`]. Polled while the session idles, so the
+    /// record carries the time the app ended. A simulator app isn't sweetpad's
+    /// child, so there is nothing to poll.
+    fn poll_exit(&mut self, ctx: &Context) {
+        if let HotApp::Mac {
+            running: Some(r), ..
+        } = self
+        {
+            check_exit(ctx, r);
         }
     }
 
@@ -2267,12 +2669,10 @@ impl HotApp<'_> {
     /// handle is dropped without killing; it leaves the signal registry so a
     /// SIGTERM to the CLI no longer reaps it.
     fn detach(&mut self) {
-        if let HotApp::Mac {
-            child, reap_slot, ..
-        } = self
+        if let HotApp::Mac { running, .. } = self
+            && let Some(r) = running.take()
         {
-            crate::cli::signals::unregister_child(reap_slot.take());
-            drop(child.take());
+            detach_app(r);
         }
     }
 
@@ -2290,14 +2690,17 @@ impl HotApp<'_> {
     }
 
     /// Bring the app's UI forward (the `o` key): the Simulator window, or the
-    /// mac app itself (`open` on the bundle activates the running instance).
-    fn foreground(&self, app: &AppBundle) {
+    /// mac app itself while it is still running (`open` on the bundle
+    /// activates the running instance, and would launch a stopped one).
+    fn foreground(&mut self, ctx: &Context, app: &AppBundle) {
         match self {
             HotApp::Sim { .. } => {
                 let _ = simctl::open_app();
             }
-            HotApp::Mac { .. } => {
-                let _ = process::run("open", &[&app.path.display().to_string()], None, true);
+            HotApp::Mac { running, .. } => {
+                if mac_app_still_running(ctx, running.as_mut()) {
+                    focus_mac_app(&app.path);
+                }
             }
         }
     }
@@ -2316,21 +2719,23 @@ impl HotApp<'_> {
     }
 }
 
-/// Kill and reap a mac hot-session child, deregistering it first so the signal
-/// handler never signals a recycled pid.
-fn terminate_mac_child(child: &mut Option<Child>, reap_slot: &mut Option<usize>) {
-    crate::cli::signals::unregister_child(reap_slot.take());
-    if let Some(mut c) = child.take() {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
+/// How the `--hot` key loop ended, which decides what teardown does with the
+/// app and how the session exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotLoopEnd {
+    /// `q`, Ctrl-C or Ctrl-D at the prompt, or stdin closing: the app is
+    /// terminated.
+    Quit,
+    /// `d`: the app keeps running.
+    Detach,
+    /// Ctrl-C during an `r` rebuild.
+    Cancelled,
 }
 
 /// The `--hot` keypress loop: `r` full rebuild+relaunch (the client
 /// reconnects), `s`/`o`/`c`/`h` as in the plain session, `d` detaches (the app
 /// keeps running), `q`/Ctrl-C/Ctrl-D quit. Injection happens out-of-band via
-/// the watcher. Returns whether the app should be terminated on teardown
-/// (false after a detach).
+/// the watcher.
 fn hot_key_loop(
     ctx: &Context,
     plan: &RunPlan,
@@ -2339,13 +2744,13 @@ fn hot_key_loop(
     env: &[(String, String)],
     logs: &mut Option<LogStream>,
     build_log: &Path,
-) -> bool {
+) -> HotLoopEnd {
     let Ok(_raw) = rawmode::RawMode::enable() else {
         // No TTY for raw mode — just follow the log stream until Ctrl-C.
         if let Some(logs) = logs.as_mut() {
             logs.wait();
         }
-        return true;
+        return HotLoopEnd::Quit;
     };
     ctx.out
         .note("hot reload ready · edit a Swift file to inject · r rebuilds · d detaches · q quits");
@@ -2365,25 +2770,25 @@ fn hot_key_loop(
                     // left running — just terminate, rebuild, and relaunch.
                     // Re-tee the transcript so the build-log recompiler keeps
                     // seeing current frontend commands after the rebuild.
-                    hot_app.terminate(&app);
+                    report_stop(ctx, hot_app.terminate(ctx, &app));
                     match build(plan, &ctx.out, Some(build_log)) {
                         BuildOutcome::Ok => {
-                            if let Err(e) = hot_app.launch(ctx, &app, env, &plan.launch.args) {
+                            if let Err(e) = hot_app.launch(ctx, plan, &app, env) {
                                 ctx.out.error(&e);
                             }
                         }
                         BuildOutcome::Failed(e) => ctx.out.error(&e),
-                        // Ctrl-C during the rebuild quits the hot session.
-                        BuildOutcome::Aborted => break,
+                        // Ctrl-C during the rebuild cancels the hot session.
+                        BuildOutcome::Aborted => return HotLoopEnd::Cancelled,
                     }
                 }
                 SessionKey::Quit => break,
                 SessionKey::Detach => {
                     ctx.out.note(hot_app.detach_note());
-                    return false;
+                    return HotLoopEnd::Detach;
                 }
                 SessionKey::Screenshot => session_screenshot(ctx, plan),
-                SessionKey::Foreground => hot_app.foreground(app),
+                SessionKey::Foreground => hot_app.foreground(ctx, app),
                 SessionKey::Clear => ctx.out.line("\x1b[2J\x1b[H"),
                 SessionKey::Help => ctx.out.note(hot_app.help_note()),
                 SessionKey::Suspend => {
@@ -2393,18 +2798,79 @@ fn hot_key_loop(
                 // The hot session has no in-session filter keys — ignore them.
                 SessionKey::Filter(_) | SessionKey::Ignore => {}
             },
-            rawmode::Input::Idle => {}
+            rawmode::Input::Idle => hot_app.poll_exit(ctx),
             rawmode::Input::Closed => break,
         }
     }
-    true
+    HotLoopEnd::Quit
+}
+
+/// What sweetpad needs to record how a macOS app process it spawned ended.
+/// launchd keeps no exit record for a process it didn't start, so for an app
+/// `app run --mac` runs attached, this is what `app logs --exits` reads.
+struct ExitRecorder {
+    project: String,
+    bundle_id: String,
+    started: std::time::SystemTime,
+}
+
+impl ExitRecorder {
+    /// Start the clock for a process of `app` about to be spawned.
+    fn new(plan: &RunPlan, app: &AppBundle) -> Self {
+        ExitRecorder {
+            project: plan.resolved.container.key(),
+            bundle_id: app.bundle_id.clone(),
+            started: std::time::SystemTime::now(),
+        }
+    }
+
+    /// Record that `pid` ended with `status`, `killed` when the signal was
+    /// sweetpad's own. Best effort: a record that can't be written costs only
+    /// a line of `--exits`.
+    fn record(&self, pid: u32, status: std::process::ExitStatus, killed: bool) {
+        use std::os::unix::process::ExitStatusExt as _;
+        let epoch = |t: std::time::SystemTime| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64())
+        };
+        let signal = status.signal();
+        let _ = crate::cli::state::ExitLog::record(
+            &self.project,
+            crate::cli::state::RecordedExit {
+                bundle_identifier: self.bundle_id.clone(),
+                pid,
+                started: epoch(self.started),
+                ended: epoch(std::time::SystemTime::now()),
+                status: status.code(),
+                signal,
+                sent_by: (killed && signal.is_some()).then(|| "sweetpad".to_string()),
+            },
+        );
+    }
+}
+
+/// Stop and reap a macOS app child sweetpad spawned, recording how it ended
+/// when `recorder` is given: on its own if it already had, else by the
+/// SIGKILL sent here.
+fn reap_mac_child(child: &mut Child, recorder: Option<&ExitRecorder>) {
+    let pid = child.id();
+    let (status, killed) = if let Ok(Some(status)) = child.try_wait() {
+        (Some(status), false)
+    } else {
+        let _ = child.kill();
+        (child.wait().ok(), true)
+    };
+    if let (Some(recorder), Some(status)) = (recorder, status) {
+        recorder.record(pid, status, killed);
+    }
 }
 
 /// A launched app in the interactive session, plus what's needed to terminate it
 /// between rebuilds and on quit. `stream` is the child whose stdout/stderr *is* the
 /// app's console output: the simulator's `simctl launch --console-pty`, the device
 /// console, or (macOS) the app process itself. Its exit signals the app's own exit
-/// ([`check_exit`]); os_log is streamed separately ([`LogStream`]).
+/// ([`check_exit`]); os_log is streamed separately ([`LogStream`]). The `--hot`
+/// session holds its macOS app as one too ([`HotApp`]).
 struct Running {
     stream: Option<Child>,
     kind: RunningKind,
@@ -2426,7 +2892,7 @@ enum RunningKind {
     /// path (there is no terminate-by-bundle-id).
     Device { id: String, app_dir: String },
     /// The streamed child *is* the macOS app; killing it stops the app.
-    Mac,
+    Mac { recorder: ExitRecorder },
 }
 
 /// The session's os_log stream — the simulator's (via `simctl spawn`) or a macOS
@@ -2445,6 +2911,35 @@ struct LogStream {
     /// Slot in the signal handler's child registry, so a SIGTERM mid-session
     /// still kills the stream child.
     reap_slot: Option<usize>,
+}
+
+/// The plain session's os_log stream. It starts at the first launch, since
+/// until an app runs there is nothing it could show, and then stays up across
+/// rebuilds: its predicate follows the relaunched app by name. It is tried
+/// once, so a target with no stream (a device without `pymobiledevice3`)
+/// isn't retried and re-reported at every relaunch. Dropping it stops it.
+#[derive(Default)]
+struct SessionLogs {
+    /// Set at the first launch, whether or not a stream came up then.
+    started: bool,
+    stream: Option<LogStream>,
+}
+
+impl SessionLogs {
+    /// An app just launched: start the stream if this is the first launch.
+    fn launched(&mut self, ctx: &Context, plan: &RunPlan, filter: &Arc<AtomicU8>) {
+        if !self.started {
+            self.started = true;
+            self.stream = start_logs(ctx, plan, filter);
+        }
+    }
+
+    /// Whether there is an os_log stream for the level keys to filter: the
+    /// simulator's, a macOS app's, or a device's through `pymobiledevice3`,
+    /// never a device's raw console.
+    fn filterable(&self) -> bool {
+        self.stream.is_some()
+    }
 }
 
 impl LogStream {
@@ -2486,15 +2981,13 @@ fn start_app(ctx: &Context, plan: &RunPlan, filter: &Arc<AtomicU8>) -> Result<Ru
             ctx.out.step("Booting simulator", || simctl::boot(udid))?;
             ctx.out
                 .step("Installing app", || simctl::install(udid, &app_path))?;
-            // `--console-pty` keeps the launch attached, so this child's stdout/stderr
-            // are the app's; its exit means the app exited.
-            let env = plan.launch.env_pairs("SIMCTL_CHILD_")?;
-            let opts = plan.simctl_launch(&env);
-            let mut child = ctx.out.step("Launching app", || {
-                simctl::spawn_console(udid, &app.bundle_id, &opts)
-            })?;
-            render_console(&mut child, ctx.out.use_color(), filter);
-            let reap_slot = crate::cli::signals::register_child(child.id());
+            let (mut child, _) = launch_sim_console(ctx, plan, &app, udid, filter)?;
+            // A console child that already ended was reaped by the wait, and
+            // its pid may belong to someone else by now.
+            let reap_slot = match child.try_wait() {
+                Ok(None) => crate::cli::signals::register_child(child.id()),
+                _ => None,
+            };
             Ok(Running {
                 stream: Some(child),
                 kind: RunningKind::Simulator {
@@ -2517,7 +3010,7 @@ fn start_app(ctx: &Context, plan: &RunPlan, filter: &Arc<AtomicU8>) -> Result<Ru
                 &plan.launch.env_pairs("DEVICECTL_CHILD_")?,
                 plan.launch.wait_for_debugger,
             )?;
-            render_console(&mut child, ctx.out.use_color(), filter);
+            render_console(&mut child, ctx.out.use_color(), filter, OwnLines::of(plan));
             let reap_slot = crate::cli::signals::register_child(child.id());
             Ok(Running {
                 stream: Some(child),
@@ -2540,17 +3033,18 @@ fn start_app(ctx: &Context, plan: &RunPlan, filter: &Arc<AtomicU8>) -> Result<Ru
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            let recorder = ExitRecorder::new(plan, &app);
             let mut child = cmd.spawn().map_err(|e| {
-                CliError::new(format!("failed to run `{}`: {e}", app.executable.display()))
+                CliError::new(format!("failed to run '{}': {e}", app.executable.display()))
             })?;
             if plan.launch.wait_for_debugger {
                 stop_for_debugger(ctx, child.id());
             }
-            render_console(&mut child, ctx.out.use_color(), filter);
+            render_console(&mut child, ctx.out.use_color(), filter, OwnLines::of(plan));
             let reap_slot = crate::cli::signals::register_child(child.id());
             Ok(Running {
                 stream: Some(child),
-                kind: RunningKind::Mac,
+                kind: RunningKind::Mac { recorder },
                 name: app.bundle_id,
                 reported_exit: false,
                 reap_slot,
@@ -2558,6 +3052,42 @@ fn start_app(ctx: &Context, plan: &RunPlan, filter: &Arc<AtomicU8>) -> Result<Ru
         }
         Target::SpmRun(_) => unreachable!("SPM run does not use the interactive session"),
     }
+}
+
+/// Launch the installed app on `udid` with its console attached, rendering
+/// what the app writes to stdout and stderr (`print`, NSLog's stderr leg) as it
+/// arrives, which a plain `simctl launch` drops. Returns the console child,
+/// which lives as long as the app does, and the app's pid once its process
+/// shows up.
+///
+/// `--console-pty` keeps the launch attached, so the child's stdout/stderr are
+/// the app's and its exit means the app exited. Its start is bounded like any
+/// other launch. A process of the app already running (one a stuck terminate
+/// left behind) doesn't count as this one starting.
+fn launch_sim_console(
+    ctx: &Context,
+    plan: &RunPlan,
+    app: &AppBundle,
+    udid: &str,
+    filter: &Arc<AtomicU8>,
+) -> Result<(Child, Option<u32>), CliError> {
+    let env = plan.launch.env_pairs("SIMCTL_CHILD_")?;
+    let opts = plan.simctl_launch(&env);
+    let app_dir = app_dir_name(&app.path);
+    let exe = process_name(app).to_string();
+    let before = simctl::app_pids(udid, &app_dir, &exe);
+    let started = || {
+        simctl::app_pids(udid, &app_dir, &exe)
+            .into_iter()
+            .find(|pid| !before.contains(pid))
+    };
+    let mut child = ctx.out.step("Launching app", || {
+        let mut child = simctl::spawn_console(udid, &app.bundle_id, &opts)?;
+        simctl::await_console_start(&mut child, udid, || started().is_some())?;
+        Ok::<_, CliError>(child)
+    })?;
+    render_console(&mut child, ctx.out.use_color(), filter, OwnLines::of(plan));
+    Ok((child, started()))
 }
 
 /// Detach from the running app: stop watching without stopping the app (the
@@ -2575,7 +3105,7 @@ fn detach_app(running: Running) {
     } = running;
     crate::cli::signals::unregister_child(reap_slot);
     match kind {
-        RunningKind::Mac => drop(stream),
+        RunningKind::Mac { .. } => drop(stream),
         RunningKind::Simulator { .. } | RunningKind::Device { .. } => {
             if let Some(mut stream) = stream {
                 let _ = stream.kill();
@@ -2585,8 +3115,6 @@ fn detach_app(running: Running) {
     }
 }
 
-/// Terminate the running app and stop its output stream. The session-scoped
-/// simulator log stream is left running — it's torn down once, at session end.
 /// The `.app` directory name of a built bundle (`/…/My.app` → `My.app`) — the
 /// key [`devicectl::terminate`] matches running processes by.
 fn app_dir_name(path: &Path) -> String {
@@ -2595,29 +3123,83 @@ fn app_dir_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn terminate_app(running: Running) {
+/// Terminate the running app and stop its output stream. The session-scoped
+/// simulator log stream is left running — it's torn down once, at session end.
+/// A terminate that fails, or runs out its bound on a wedged simulator, comes
+/// back as the error, since the app may still be running: a relaunch reports
+/// it and carries on, and a quit exits with it ([`quit_result`]).
+fn terminate_app(ctx: &Context, running: Running) -> CliResult {
     let Running {
         stream,
         kind,
         reap_slot,
+        reported_exit,
         ..
     } = running;
     crate::cli::signals::unregister_child(reap_slot);
-    match kind {
+    let stopped = match kind {
         RunningKind::Simulator {
             udid, bundle_id, ..
-        } => {
-            let _ = simctl::terminate(&udid, &bundle_id);
+        } => terminate_on_simulator(ctx, &udid, &bundle_id),
+        RunningKind::Device { id, app_dir } => ctx
+            .out
+            .step("Terminating app on device", || {
+                devicectl::terminate(&id, &app_dir)
+            })
+            .context("terminating the app on the device"),
+        // The macOS app *is* the streamed child, so reaping it stops it; an
+        // exit `check_exit` already recorded isn't recorded twice.
+        RunningKind::Mac { recorder } => {
+            if let Some(mut stream) = stream {
+                reap_mac_child(&mut stream, (!reported_exit).then_some(&recorder));
+            }
+            return Ok(());
         }
-        RunningKind::Device { id, app_dir } => {
-            let _ = devicectl::terminate(&id, &app_dir);
-        }
-        // The macOS app *is* the streamed child — killing it below stops it.
-        RunningKind::Mac => {}
-    }
+    };
     if let Some(mut stream) = stream {
         let _ = stream.kill();
         let _ = stream.wait();
+    }
+    stopped
+}
+
+/// Stop a session's simulator app. `simctl terminate` gets two minutes
+/// before the simulator counts as stuck, and the caller reports a failure,
+/// since one dropped here reads as the session hanging after 'q' or 'r'.
+fn terminate_on_simulator(ctx: &Context, udid: &str, bundle_id: &str) -> CliResult {
+    ctx.out
+        .step("Terminating app", || simctl::terminate(udid, bundle_id))
+}
+
+/// Report a relaunch's failed stop and carry on: the rebuild goes ahead, and
+/// the launch after it takes over from whatever is left running.
+fn report_stop(ctx: &Context, stopped: CliResult) {
+    if let Err(e) = stopped {
+        ctx.out.error(&e);
+    }
+}
+
+/// A session's exit once its quit has stopped the app. A stop that failed
+/// leaves the app possibly running, so a quit that would exit 0 exits 1
+/// with it instead, and a session already failing keeps its own code with
+/// the stop's error handed to `report` ahead of it. The sessions report it
+/// with [`Output::error`].
+fn quit_result(
+    outcome: CliResult,
+    name: &str,
+    stopped: CliResult,
+    report: impl FnOnce(&CliError),
+) -> CliResult {
+    let Err(e) = stopped else {
+        return outcome;
+    };
+    let e = e.context(format!("couldn't stop {name}, so it may still be running"));
+    match outcome {
+        Ok(()) => Err(e),
+        Err(session) => {
+            report(&e);
+            Err(session)
+        }
     }
 }
 
@@ -2647,11 +3229,11 @@ fn build(plan: &RunPlan, out: &Output, capture: Option<&std::path::Path>) -> Bui
     build_plan.prepare_result_bundle();
     let (parts, cwd) = build_plan.command();
     let args: Vec<&str> = parts.iter().map(String::as_str).collect();
-    let (mut child, reader) = match process::spawn_piped_group("xcodebuild", &args, cwd.as_deref())
-    {
-        Ok(pair) => pair,
-        Err(e) => return BuildOutcome::Failed(e),
-    };
+    let (mut child, reader, leftovers) =
+        match process::spawn_piped_group("xcodebuild", &args, cwd.as_deref()) {
+            Ok(spawned) => spawned,
+            Err(e) => return BuildOutcome::Failed(e),
+        };
     let pid = child.id();
     // The child leads its own process group, so a SIGINT delivered to *us*
     // (e.g. Ctrl-C during the `--hot` initial build, before raw mode is on)
@@ -2690,27 +3272,31 @@ fn build(plan: &RunPlan, out: &Output, capture: Option<&std::path::Path>) -> Bui
 
     // Beautify xcodebuild's merged output on this thread (the same path as
     // [`buildlog::run`], inlined so we own the child for the watcher), also
-    // collecting diagnostics for the last-build artifact. Lossy decoding —
-    // one bad byte from a run-script must not end the stream and SIGPIPE a
-    // still-writing xcodebuild.
+    // collecting diagnostics for the last-build artifact and watching for a
+    // build blocked on plugin approval. Lossy decoding — one bad byte from a
+    // run-script must not end the stream and SIGPIPE a still-writing
+    // xcodebuild.
     let mut diagnostics: Vec<serde_json::Value> = Vec::new();
+    let mut blocker = buildlog::BlockerWatch::default();
+    let mut parser = buildlog::LogParser::default();
+    let mut show = |parsed: &buildlog::Parsed| {
+        if matches!(parsed.event, buildlog::Event::Diagnostic { .. })
+            && let Some(json) = buildlog::event_json(&parsed.event)
+        {
+            diagnostics.push(json);
+        }
+        if let Some(rendered) = progress.parsed(parsed) {
+            out.line(rendered.as_str());
+        }
+    };
     process::read_lines_lossy(reader, &mut |line: &str| {
         if let Some(file) = capture_file.as_mut() {
             let _ = writeln!(file, "{line}");
         }
-        let event = buildlog::parse_line(line);
-        if matches!(event, buildlog::Event::Diagnostic { .. })
-            && let Some(json) = buildlog::event_json(&event)
-        {
-            diagnostics.push(json);
-        }
-        if let Some(rendered) = progress.line(line) {
-            out.line(rendered.as_str());
-        }
+        blocker.line(line);
+        parser.push(line).iter().for_each(&mut show);
     });
-    // Erase the spinner before the post-build notes in case nothing ever
-    // rendered (e.g. Ctrl-C during the silent prelude).
-    drop(progress);
+    parser.finish().iter().for_each(&mut show);
 
     // The output stream has ended, so the build is exiting: clear the forward
     // target *before* the reap, or a signal in the gap could target a recycled
@@ -2721,6 +3307,19 @@ fn build(plan: &RunPlan, out: &Output, capture: Option<&std::path::Path>) -> Bui
     done.store(true, Ordering::Relaxed);
     let _ = watcher.join();
     let status = child.wait();
+    drop(leftovers);
+
+    // A build that failed without xcodebuild's own banner (a destination
+    // error) closes on one, as `BuildPlan::run`'s stream does.
+    if !aborted.load(Ordering::Relaxed)
+        && matches!(&status, Ok(s) if !s.success())
+        && let Some(banner) = progress.close_failed(buildlog::ResultKind::BuildFailed)
+    {
+        out.line(&banner);
+    }
+    // Erase the spinner before the post-build notes in case nothing ever
+    // rendered (e.g. Ctrl-C during the silent prelude).
+    drop(progress);
 
     if aborted.load(Ordering::Relaxed) {
         out.note("Build cancelled");
@@ -2733,10 +3332,19 @@ fn build(plan: &RunPlan, out: &Output, capture: Option<&std::path::Path>) -> Bui
     );
     match status {
         Ok(s) if s.success() => BuildOutcome::Ok,
+        // The stream above already closed on `✗ Build failed` under the errors
+        // that caused it, as `BuildPlan::run`'s does, and the failure reads the
+        // same as there.
         Ok(_) => BuildOutcome::Failed(
-            CliError::new("xcodebuild exited with a non-zero status")
-                .context("building the app")
-                .kind(ErrorKind::BuildFailure),
+            xcodebuild::build_failure(
+                &parts,
+                diagnostics,
+                blocker.hint(),
+                true,
+                !Output::streams_share_a_file(),
+                "",
+            )
+            .context("building the app"),
         ),
         Err(e) => BuildOutcome::Failed(
             CliError::new(format!("failed to wait for xcodebuild: {e}"))
@@ -2762,16 +3370,30 @@ fn follow_once(ctx: &Context, plan: &RunPlan) -> CliResult {
     let app = build_and_install(plan, &ctx.out)?;
     match &plan.target {
         Target::Simulator(udid) => {
-            let env = plan.launch.env_pairs("SIMCTL_CHILD_")?;
-            let launched = simctl::launch_opts(udid, &app.bundle_id, &plan.simctl_launch(&env))?;
-            ctx.out
-                .note(&format!("Launched {} → {}", app.bundle_id, launched.trim()));
-            stream_logs(
+            // Launched with its console, as the session launches it, so the
+            // app's own stdout and stderr show next to its os_log stream.
+            let filter = Arc::new(AtomicU8::new(default_filter(&ctx.out).threshold()));
+            let (mut console, pid) = launch_sim_console(ctx, plan, &app, udid, &filter)?;
+            ctx.out.note(&match pid {
+                Some(pid) => format!("Launched {} (pid {pid})", app.bundle_id),
+                None => format!("Launched {}", app.bundle_id),
+            });
+            let reap_slot = match console.try_wait() {
+                Ok(None) => crate::cli::signals::register_child(console.id()),
+                _ => None,
+            };
+            let streamed = stream_logs(
                 ctx,
                 &LogSource::Simulator(udid),
                 &app,
                 &LogFilterArgs::default(),
-            )
+            );
+            // The console only watches the app, which keeps running, as it
+            // does after a plain launch.
+            crate::cli::signals::unregister_child(reap_slot);
+            let _ = console.kill();
+            let _ = console.wait();
+            streamed
         }
         Target::Device(id) => {
             ctx.out.note(&format!(
@@ -2802,20 +3424,24 @@ fn follow_once(ctx: &Context, plan: &RunPlan) -> CliResult {
             // attach to. Refuse rather than accept and ignore.
             if plan.launch.wait_for_debugger {
                 return Err(CliError::new(
-                    "--wait-for-debugger needs a launch that returns: use `app launch --mac \
-                     --wait-for-debugger` (it reports the stopped pid), or run at an \
+                    "--wait-for-debugger needs a launch that returns: use 'app launch --mac \
+                     --wait-for-debugger' (it reports the stopped pid), or run at an \
                      interactive terminal",
                 ));
             }
             // Direct spawn (inherited stdio) so --arg/--env reach the process.
             let env = plan.launch.env_pairs("")?;
-            let status = std::process::Command::new(app.executable.as_os_str())
+            let recorder = ExitRecorder::new(plan, &app);
+            let failed = |e: std::io::Error| {
+                CliError::new(format!("failed to run '{}': {e}", app.executable.display()))
+            };
+            let mut child = std::process::Command::new(app.executable.as_os_str())
                 .args(&plan.launch.args)
                 .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                .status()
-                .map_err(|e| {
-                    CliError::new(format!("failed to run `{}`: {e}", app.executable.display()))
-                })?;
+                .spawn()
+                .map_err(failed)?;
+            let status = child.wait().map_err(failed)?;
+            recorder.record(child.id(), status, false);
             if status.success() {
                 Ok(())
             } else {
@@ -2838,7 +3464,7 @@ enum SessionKey {
     Detach,
     /// Save a simulator screenshot into ./sweetpad-shots/.
     Screenshot,
-    /// Bring Simulator.app to the foreground.
+    /// Bring the app forward: the Simulator window, or the macOS app.
     Foreground,
     /// Clear the terminal.
     Clear,
@@ -2852,8 +3478,8 @@ enum SessionKey {
 }
 
 /// Map a keystroke to a session action (the flutter-run keymap): `r`/`R`
-/// rebuild; `d` detaches (app keeps running); `s` screenshot; `o` foregrounds
-/// the simulator; `c` clears; `h` lists keys; `q`, Ctrl-C, and Ctrl-D quit;
+/// rebuild; `d` detaches (app keeps running); `s` screenshot; `o` brings the
+/// app forward; `c` clears; `h` lists keys; `q`, Ctrl-C, and Ctrl-D quit;
 /// `1`–`4` set the log filter (debug/info/error/off); everything else is
 /// ignored. The key is first folded to the Latin letter on its physical position
 /// ([`map_key_to_latin`]), so the shortcuts work on non-Latin layouts (Cyrillic
@@ -2952,15 +3578,75 @@ fn session_hint(ctx: &Context, _filterable: bool) {
 
 /// The full keymap, on `h`. The log-level keys are shown only when there's an
 /// os_log stream to filter (the simulator or a macOS app).
-fn session_keys_help(ctx: &Context, filterable: bool) {
-    ctx.out.note(
-        "r rebuild+relaunch · s screenshot · o focus simulator · c clear · \
-         d detach (leave the app running) · q quit (terminate the app)",
-    );
+fn session_keys_help(ctx: &Context, target: &Target, filterable: bool) {
+    ctx.out.note(&session_keys(target));
     if filterable {
         ctx.out
             .note("log level: 1 debug · 2 info · 3 error · 4 off");
     }
+}
+
+/// The plain session's key list for `target`. `s` and `o` are listed only
+/// where there is a window to capture or bring forward: a simulator, or a
+/// macOS app.
+fn session_keys(target: &Target) -> String {
+    let window = match target {
+        Target::Simulator(_) => " · s screenshot · o focus simulator",
+        Target::Mac => " · s screenshot · o focus app",
+        Target::Device(_) | Target::SpmRun(_) => "",
+    };
+    format!(
+        "r rebuild+relaunch{window} · c clear · d detach (leave the app running) · \
+         q quit (terminate the app)"
+    )
+}
+
+/// The `o` key: bring the Simulator window forward, or the running macOS app.
+/// A device's screen isn't on this Mac, so there it only says so.
+fn session_foreground(ctx: &Context, plan: &RunPlan, running: Option<&mut Running>) {
+    match &plan.target {
+        Target::Simulator(_) => {
+            let _ = simctl::open_app();
+        }
+        Target::Mac => {
+            if !mac_app_still_running(ctx, running) {
+                return;
+            }
+            match plan.app_bundle() {
+                Ok(app) => focus_mac_app(&app.path),
+                Err(e) => ctx.out.error(&e),
+            }
+        }
+        Target::Device(_) | Target::SpmRun(_) => {
+            ctx.out.note(
+                "'o' brings a simulator or macOS app forward; a device has no window on this Mac",
+            );
+        }
+    }
+}
+
+/// Whether the session's macOS app is still running, checked before `o`
+/// brings it forward. `open` on a bundle that isn't running launches it,
+/// outside the session and without its launch arguments, so an app that has
+/// exited gets a note instead, and its exit is reported through
+/// [`check_exit`] if the idle poll hasn't reported it yet. Shared by the
+/// plain session and the `--hot` one.
+fn mac_app_still_running(ctx: &Context, running: Option<&mut Running>) -> bool {
+    let live = running.is_some_and(|r| {
+        check_exit(ctx, r);
+        !r.reported_exit
+    });
+    if !live {
+        ctx.out
+            .note("the app isn't running; press 'r' to rebuild and launch it");
+    }
+    live
+}
+
+/// Bring a running macOS app forward. `open` on its bundle activates the
+/// running instance rather than starting another.
+fn focus_mac_app(app: &Path) {
+    let _ = process::run("open", &[&app.display().to_string()], None, true);
 }
 
 /// The `s` key: screenshot a simulator or macOS target into ./sweetpad-shots/.
@@ -2975,7 +3661,7 @@ fn session_screenshot(ctx: &Context, plan: &RunPlan) {
             simctl::screenshot(udid, &path.display().to_string()).map(|()| path)
         }
         Target::Mac => plan.app_bundle().and_then(|app| {
-            let shot = mac_shot_for(&app.executable, &app.bundle_id)?;
+            let shot = mac_shot_for(ctx, &app.executable, &app.bundle_id)?;
             let path = super::simulator::default_screenshot_path(&shot.name);
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 let _ = std::fs::create_dir_all(parent);
@@ -3047,25 +3733,28 @@ fn set_filter(ctx: &Context, filter: &AtomicU8, choice: LogFilter) {
 
 /// What an `r` rebuild asks the session to do next.
 enum RebuildOutcome {
-    /// Carry on; `launched` records whether the app came back up (a failed build
-    /// keeps the session open with nothing running).
-    Continue { launched: bool },
+    /// Carry on; `build` records how the build ended and `launched` whether the
+    /// app came back up (a failed build keeps the session open with nothing
+    /// running).
+    Continue { build: LastBuild, launched: bool },
     /// Ctrl-C during the rebuild: cancel the whole session.
-    Quit,
+    Cancelled,
 }
 
 /// Stop the running app, rebuild, and relaunch (the `r` key). The session log
-/// stream is left running; it follows the relaunched app by process name. Ctrl-C
-/// during the rebuild returns [`RebuildOutcome::Quit`] so the session ends.
+/// stream is left running, since it follows the relaunched app by process
+/// name, or starts here when this is the session's first launch. Ctrl-C
+/// during the rebuild returns [`RebuildOutcome::Cancelled`] so the session ends.
 fn do_rebuild(
     ctx: &Context,
     plan: &RunPlan,
     running: &mut Option<Running>,
+    logs: &mut SessionLogs,
     filter: &Arc<AtomicU8>,
 ) -> RebuildOutcome {
     ctx.out.note("»  Restarting — rebuilding…");
     if let Some(old) = running.take() {
-        terminate_app(old);
+        report_stop(ctx, terminate_app(ctx, old));
     }
     let started = Instant::now();
     match build(plan, &ctx.out, None) {
@@ -3073,19 +3762,29 @@ fn do_rebuild(
             Ok(r) => {
                 *running = Some(r);
                 note_launch(ctx, "Relaunched", started);
-                RebuildOutcome::Continue { launched: true }
+                logs.launched(ctx, plan, filter);
+                RebuildOutcome::Continue {
+                    build: LastBuild::Succeeded,
+                    launched: true,
+                }
             }
             Err(e) => {
                 ctx.out.error(&e);
-                RebuildOutcome::Continue { launched: false }
+                RebuildOutcome::Continue {
+                    build: LastBuild::Succeeded,
+                    launched: false,
+                }
             }
         },
         // Failed build: nothing runs until the next rebuild; the session stays open.
         BuildOutcome::Failed(e) => {
             ctx.out.error(&e);
-            RebuildOutcome::Continue { launched: false }
+            RebuildOutcome::Continue {
+                build: LastBuild::Failed,
+                launched: false,
+            }
         }
-        BuildOutcome::Aborted => RebuildOutcome::Quit,
+        BuildOutcome::Aborted => RebuildOutcome::Cancelled,
     }
 }
 
@@ -3147,9 +3846,12 @@ fn check_exit(ctx: &Context, running: &mut Running) {
     // for the pid space to wrap. Not-exited re-registers (a microsecond
     // window, same class as the accepted spawn→register gap).
     crate::cli::signals::unregister_child(running.reap_slot.take());
-    if matches!(child.try_wait(), Ok(Some(_))) {
+    if let Ok(Some(status)) = child.try_wait() {
         ctx.out.alert(&format!("✗ {} exited", running.name));
         running.reported_exit = true;
+        if let RunningKind::Mac { recorder } = &running.kind {
+            recorder.record(child.id(), status, false);
+        }
     } else {
         running.reap_slot = crate::cli::signals::register_child(child.id());
     }
@@ -3324,8 +4026,9 @@ fn render_logs(child: &mut Child, color: bool, filter: Arc<AtomicU8>) {
         // Lossy line reads: one invalid-UTF-8 byte must not end the thread —
         // dropping the pipe's read end SIGPIPEs the still-writing child.
         process::read_lines_lossy(stdout, &mut |line| {
-            let rendered = oslog::render_ndjson_line(line, color);
-            if rendered.level.as_u8() >= filter.load(Ordering::Relaxed) {
+            if let Some(rendered) = oslog::render_ndjson_line(line, color)
+                && rendered.level.as_u8() >= filter.load(Ordering::Relaxed)
+            {
                 println!("{}", rendered.text);
             }
         });
@@ -3337,27 +4040,37 @@ fn render_logs(child: &mut Child, color: bool, filter: Arc<AtomicU8>) {
 /// with the local arrival time, distinct from os_log ([`render_logs`]). Both pipes
 /// are drained so neither blocks the app; known
 /// boot noise ([`is_boot_noise`]) is dropped, and lines obey the live `filter` like
-/// os_log, so `4 off` silences them too.
+/// os_log, so `4 off` silences them too. `own` names the stderr lines that are
+/// about sweetpad's launch rather than the app, which are dropped too.
 #[allow(clippy::print_stdout)] // live app stdout/stderr stream on detached threads
-fn render_console(child: &mut Child, color: bool, filter: &Arc<AtomicU8>) {
-    let pipes: [Option<Box<dyn std::io::Read + Send>>; 2] = [
-        child
-            .stdout
-            .take()
-            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-        child
-            .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+fn render_console(child: &mut Child, color: bool, filter: &Arc<AtomicU8>, own: OwnLines) {
+    let pipes: [(Option<Box<dyn std::io::Read + Send>>, OwnLines); 2] = [
+        (
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            OwnLines::default(),
+        ),
+        (
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            own,
+        ),
     ];
-    for pipe in pipes.into_iter().flatten() {
+    for (pipe, own) in pipes {
+        let Some(pipe) = pipe else {
+            continue;
+        };
         let filter = Arc::clone(filter);
         std::thread::spawn(move || {
             // Lossy line reads: a binary dump on the app's own stdout must
             // not end this thread — on the Mac target the streamed child *is*
             // the app, and a dropped read end SIGPIPE-kills it mid-session.
             process::read_lines_lossy(pipe, &mut |line| {
-                if is_boot_noise(line) {
+                if is_boot_noise(line) || own.covers(line) {
                     return;
                 }
                 // Console output has no timestamp of its own; stamp it with the local
@@ -3403,6 +4116,59 @@ fn render_log_stderr(child: &mut Child, color: bool, filter: Arc<AtomicU8>) {
 /// genuine diagnostics fall through to their renderer.
 fn is_boot_noise(line: &str) -> bool {
     line.contains("getpwuid_r did not find a match for uid")
+}
+
+/// Whether a line is AppKit's note that [`IGNORE_PERSISTENCE`] took effect,
+/// which it writes to stderr at every launch that carries the pair, after
+/// the usual `<date> <App>[<pid>:<tid>] ` log prefix:
+/// `ApplePersistenceIgnoreState: Existing state will not be touched. New
+/// state will be written to <path>`. The message has to open the line, so an
+/// app's own line that merely quotes it still shows.
+fn is_persistence_note(line: &str) -> bool {
+    const NOTE: &str = "ApplePersistenceIgnoreState: Existing state will not be touched";
+    let message = line.split_once("] ").map_or(line, |(_, rest)| rest);
+    message.starts_with(NOTE)
+}
+
+/// Whether a line is the hot-reload client's note that its connection ended
+/// while it waited for the next command, which it logs through NSLog when the
+/// session's injection server closes at quit or detach, after the usual log
+/// prefix: `[<InjectionNext: 0x…> readInt:0x… length:4] error: 0 Operation
+/// not supported`. Zero bytes read is the connection ending between commands;
+/// a read cut off partway reports a count and still shows.
+fn is_injection_disconnect(line: &str) -> bool {
+    let message = line.split_once("] ").map_or(line, |(_, rest)| rest);
+    message.starts_with("[<InjectionNext: ")
+        && message.contains(" readInt:")
+        && message.contains(" length:4] error: 0 ")
+}
+
+/// The stderr lines of a launched app that are about sweetpad's own doing
+/// rather than the app, which the session leaves out of the app's output.
+#[derive(Debug, Clone, Copy, Default)]
+struct OwnLines {
+    /// AppKit's note about an `-ApplePersistenceIgnoreState` sweetpad added
+    /// ([`RunPlan::added_ignore_persistence`], [`is_persistence_note`]).
+    persistence_note: bool,
+    /// The injection client's line for the hot session's server going away
+    /// ([`is_injection_disconnect`]).
+    injection_disconnect: bool,
+}
+
+impl OwnLines {
+    /// The lines a plain session leaves out of `plan`'s app.
+    fn of(plan: &RunPlan) -> Self {
+        OwnLines {
+            persistence_note: plan.added_ignore_persistence,
+            injection_disconnect: false,
+        }
+    }
+
+    /// Whether `line` is one of these.
+    fn covers(self, line: &str) -> bool {
+        (self.persistence_note && is_persistence_note(line))
+            || (self.injection_disconnect && is_injection_disconnect(line))
+    }
 }
 
 /// Render a device's `pymobiledevice3` syslog stdout on a detached thread, mirroring
@@ -3528,27 +4294,41 @@ enum Stage {
     Stop,
 }
 
+/// The passthrough for a verb that finds an already-built product instead of
+/// building one: the project's `[xcodebuild] args`, since it takes no `--`
+/// tail. Those arguments decide where the build put the `.app`, so a plan
+/// without them looks somewhere other than where `build` wrote it, or runs a
+/// stale product that `build` and `app run` refuse to go near.
+fn project_xcodebuild_args(ctx: &Context) -> Result<Vec<String>, CliError> {
+    ctx.xcodebuild_args(xcodebuild::Action::Build, &[])
+}
+
+/// `tail` is what this invocation adds to the project's arguments: the `--`
+/// passthrough `install` builds with, or the `-derivedDataPath` that `launch
+/// --derived-data-path` locates the product by.
 fn simple(
     ctx: &mut Context,
     stage: Stage,
     launch: &LaunchArgs,
     stage_target: &StageTargetArgs,
-    passthrough: &[String],
+    tail: &[String],
 ) -> CommandResult {
     let on_device = stage_target.device || stage_target.device_id.is_some();
     // `stop` acts on the *running* app: when a launch is recorded, use it
     // directly instead of resolving (and possibly prompting for, and
-    // remembering) a whole build target just to kill a process. Explicit
-    // targeting flags opt out — `app stop --scheme Other` means that scheme's
-    // app, not whatever launched last.
+    // remembering) a whole build target just to kill a process. Targeting
+    // flags that name another app opt out: `app stop --scheme Other` means
+    // that scheme's app, not whatever launched last.
     if matches!(stage, Stage::Stop)
-        && !on_device
-        && !explicit_targeting(ctx)
-        && let Some(result) = simple_from_last_launched(ctx, stage)
+        && let Some(last) = matching_last_launch(ctx, stage_target)
+        && let Some(result) = stop_recorded(ctx, &last)
     {
         return result;
     }
 
+    // Every stage plans with the project's `[xcodebuild] args`, not only the
+    // one that builds (see `project_xcodebuild_args`).
+    let passthrough = ctx.xcodebuild_args(xcodebuild::Action::Build, tail)?;
     // Simulator by default (the common headless case); --device/--device-id
     // switch every stage to devicectl.
     let opts = RunOpts {
@@ -3564,7 +4344,7 @@ fn simple(
         keep_sandbox: false,
         hot_entitlements: None,
         launch,
-        passthrough,
+        passthrough: &passthrough,
     };
     let plan = plan(ctx, &opts)?;
     let app = plan.app_bundle()?;
@@ -3581,7 +4361,7 @@ fn simple(
         Target::Mac | Target::SpmRun(_) => {
             return Err(CliError::new(
                 "app install/uninstall act on a simulator or device — a macOS app is built \
-                 in place; use `app launch --mac` to start it or `app run --mac` to follow it",
+                 in place; use 'app launch --mac' to start it or 'app run --mac' to follow it",
             ));
         }
     };
@@ -3621,20 +4401,120 @@ fn open_detached_log(
         .truncate(true)
         .open(path)
         .ok()?;
-    let args = plan.launch.args.join(" ");
-    let suffix = if args.is_empty() {
-        String::new()
-    } else {
-        format!(" — args: {args}")
-    };
     let _ = writeln!(
         &file,
-        "=== sweetpad launched {} at {}{suffix} ===",
-        process_name(app),
-        oslog::now_clock(),
+        "{}",
+        launch_header(
+            process_name(app),
+            &oslog::now_clock(),
+            &plan.launch.args,
+            plan.added_ignore_persistence
+        )
     );
     let err = file.try_clone().ok()?;
     Some((file, err))
+}
+
+/// How the run header of a captured file opens and closes.
+const HEADER_OPEN: &str = "=== sweetpad launched ";
+const HEADER_CLOSE: &str = " ===";
+
+/// The header's last clause when sweetpad put [`IGNORE_PERSISTENCE`] ahead of
+/// the app's arguments itself. The file is the app's own stderr, so this is
+/// how a later read of it knows that AppKit's note about the key is
+/// sweetpad's to leave out ([`CapturedLog`]).
+const HEADER_OURS: &str = " · sweetpad added: -ApplePersistenceIgnoreState YES";
+
+/// The one-line run header [`open_detached_log`] writes, e.g. `=== sweetpad
+/// launched MyApp at 12:00:00.000 · args: --flag ===`. `args` are the
+/// process's; with `ours_ignore_persistence` they open with the pair
+/// sweetpad added, which the header names in its own clause instead.
+fn launch_header(
+    name: &str,
+    clock: &str,
+    args: &[String],
+    ours_ignore_persistence: bool,
+) -> String {
+    let (ours, args) = if ours_ignore_persistence {
+        (
+            HEADER_OURS,
+            args.get(IGNORE_PERSISTENCE.len()..).unwrap_or_default(),
+        )
+    } else {
+        ("", args)
+    };
+    let args = if args.is_empty() {
+        String::new()
+    } else {
+        format!(" · args: {}", args.join(" "))
+    };
+    format!("{HEADER_OPEN}{name} at {clock}{args}{ours}{HEADER_CLOSE}")
+}
+
+/// Reads a detached launch's captured file ([`detached_log_path`]) a line at
+/// a time. Its run header is sweetpad's, not the app's, so it renders as a
+/// dim `── … ──` separator in human output and is left out of the JSON
+/// stream, and AppKit's persistence note is left out when the header says
+/// sweetpad added the key. A key the caller or the scheme set keeps its note.
+#[derive(Default)]
+struct CapturedLog {
+    ours_ignore_persistence: bool,
+}
+
+/// What one line of a captured file is ([`CapturedLog::read`]).
+#[derive(Debug, PartialEq, Eq)]
+enum CapturedLine {
+    /// The run header, as its separator reads.
+    Header(String),
+    /// A line sweetpad's launch caused, left out.
+    Own,
+    /// One of the app's own lines.
+    App,
+}
+
+impl CapturedLog {
+    /// Read one line of the file, its trailing newline already trimmed.
+    fn read(&mut self, text: &str) -> CapturedLine {
+        if let Some(inner) = text
+            .strip_prefix(HEADER_OPEN)
+            .and_then(|rest| rest.strip_suffix(HEADER_CLOSE))
+        {
+            self.ours_ignore_persistence = inner.ends_with(HEADER_OURS);
+            return CapturedLine::Header(format!("── sweetpad launched {inner} ──"));
+        }
+        if self.ours_ignore_persistence && is_persistence_note(text) {
+            return CapturedLine::Own;
+        }
+        CapturedLine::App
+    }
+
+    /// Emit one line of the file, a trailing newline trimmed. Returns whether
+    /// it was one of the app's lines, the only ones an `--until` matches.
+    #[allow(clippy::print_stdout)] // the point of `app logs` is stdout
+    fn emit(&mut self, buf: &[u8], color: bool, json: bool) -> bool {
+        let mut line = buf;
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line = &line[..line.len() - 1];
+        }
+        match self.read(&String::from_utf8_lossy(line)) {
+            CapturedLine::Header(rule) => {
+                if !json {
+                    let rule = if color {
+                        format!("\x1b[90m{rule}\x1b[0m")
+                    } else {
+                        rule
+                    };
+                    println!("{rule}");
+                }
+                false
+            }
+            CapturedLine::Own => false,
+            CapturedLine::App => {
+                emit_console_line(line, color, json);
+                true
+            }
+        }
+    }
 }
 
 /// Start a macOS app and return, leaving it running — the counterpart to
@@ -3646,6 +4526,19 @@ fn launch_mac(
     plan: &RunPlan,
     app: &AppBundle,
 ) -> Result<AppStageReport, CliError> {
+    if !app.executable.exists() {
+        let elsewhere = if xcodebuild_args::has_flag(&plan.passthrough, "-derivedDataPath") {
+            ""
+        } else {
+            ", or pass '--derived-data-path <dir>' if it was built with \
+             '-- -derivedDataPath <dir>'"
+        };
+        return Err(CliError::new(format!(
+            "{} isn't built yet; build it with {}{elsewhere}",
+            app.path.display(),
+            follow_up(ctx, "build", &["--on", "mac"])
+        )));
+    }
     let (pid, log) = spawn_detached_mac(ctx, plan, app)?;
     Ok(AppStageReport {
         executable: None,
@@ -3688,7 +4581,7 @@ fn stop_for_debugger(ctx: &Context, pid: u32) {
         }
     }
     ctx.out.note(&format!(
-        "stopped for the debugger — attach to pid {pid}, then `kill -CONT {pid}` to continue"
+        "stopped for the debugger — attach to pid {pid}, then 'kill -CONT {pid}' to continue"
     ));
 }
 
@@ -3744,7 +4637,7 @@ fn spawn_detached_mac(
     own_session_on_spawn(&mut cmd);
     let child = ctx.out.step("Launching app", || {
         cmd.spawn().map_err(|e| {
-            CliError::new(format!("failed to run `{}`: {e}", app.executable.display()))
+            CliError::new(format!("failed to run '{}': {e}", app.executable.display()))
         })
     })?;
     // Deliberately not registered with the signal registry and never waited
@@ -3849,9 +4742,10 @@ fn debug(
     // one-shot JSON for it. Point at `app diagnose` for a structured report.
     if batch.batch && (ctx.out.is_json() || ctx.out.is_ndjson()) {
         return Err(CliError::new(
-            "`app debug --batch` streams lldb output and has no machine-readable form; use \
-             `app diagnose -o json` for a structured exception/crash report",
-        ));
+            "'app debug --batch' streams lldb output and has no machine-readable form; use \
+             'app diagnose -o json' for a structured exception/crash report",
+        )
+        .kind(ErrorKind::Usage));
     }
     let opts = lldb_run_opts(stage_target, launch, passthrough);
     let plan = plan(ctx, &opts)?;
@@ -3874,7 +4768,7 @@ fn debug(
              attach Xcode to the device",
         )),
         Target::SpmRun(_) => Err(CliError::new(
-            "app debug works on an app target; for a Swift package run `lldb -- swift run`",
+            "app debug works on an app target; for a Swift package run 'lldb -- swift run'",
         )),
     }
 }
@@ -3884,7 +4778,7 @@ fn debug(
 fn debug_sim_interactive(ctx: &mut Context, plan: &RunPlan, udid: &str) -> CommandResult {
     let (app, pid) = launch_suspended_on_sim(ctx, plan, udid)?;
     ctx.out.note(&format!(
-        "attaching lldb to {} (pid {pid}) — type `continue` to resume the app",
+        "attaching lldb to {} (pid {pid}) — type 'continue' to resume the app",
         app.bundle_id
     ));
     // Ctrl-C inside lldb is its break-into-the-debuggee gesture; the terminal
@@ -4097,18 +4991,10 @@ fn stage_report(
     }
 }
 
-/// Serve `app stop` from the recorded last launch when it targeted a
-/// simulator or macOS — no scheme resolution, no build-settings query, no
-/// prompting. `None` (fall back to the full plan) when nothing was recorded
-/// or the record is for a device run.
-fn simple_from_last_launched(ctx: &mut Context, stage: Stage) -> Option<CommandResult> {
-    match stage {
-        Stage::Stop => {}
-        Stage::Install | Stage::Launch | Stage::Uninstall => {
-            unreachable!("gated to Stop by the caller")
-        }
-    }
-    let last = last_launched(ctx)?;
+/// Serve `app stop` from the recorded last launch: no scheme resolution, no
+/// build-settings query, no prompting. `None` (fall back to the full plan)
+/// when the record lacks what its kind needs to find the process.
+fn stop_recorded(ctx: &Context, last: &LastLaunchedApp) -> Option<CommandResult> {
     match last.kind.as_str() {
         "simulator" => {
             let udid = last.simulator_udid.clone()?;
@@ -4131,7 +5017,7 @@ fn simple_from_last_launched(ctx: &mut Context, stage: Stage) -> Option<CommandR
             )
         }
         "macos" => {
-            let exe = mac_executable(&last)?;
+            let exe = mac_executable(last)?;
             Some(stop_mac(ctx, &exe, &last.bundle_identifier).map(Rendered::data))
         }
         "device" => {
@@ -4162,14 +5048,85 @@ fn simple_from_last_launched(ctx: &mut Context, stage: Stage) -> Option<CommandR
     }
 }
 
-/// The recorded last launch for this project, whatever it targeted.
-fn last_launched(ctx: &Context) -> Option<LastLaunchedApp> {
-    let container = resolve::container(ctx).ok()?;
-    ctx.state
-        .projects
-        .get(&container.key())?
-        .last_launched_app
-        .clone()
+/// The recorded last launch for this project, when it is the app this
+/// invocation names. The verbs that act on a running app read the record
+/// before resolving a build target because it carries what the launch
+/// started, including a product under a typed `-derivedDataPath` that a fresh
+/// resolve of the same flags would look for in the default DerivedData. So
+/// targeting flags keep the record when they agree with it and yield to a
+/// full resolve when they name another scheme, configuration or destination
+/// (see [`launch_matches`]). `stage` carries the mode flags of the verbs that
+/// take them; the rest pass the default.
+fn matching_last_launch(ctx: &Context, stage: &StageTargetArgs) -> Option<LastLaunchedApp> {
+    let key = resolve::container(ctx).ok()?.key();
+    let last = ctx.state.projects.get(&key)?.last_launched_app.clone()?;
+    launch_matches(ctx, &key, &last, stage).then_some(last)
+}
+
+/// Whether every targeting flag this invocation was given agrees with the
+/// recorded launch. An absent flag agrees with anything. A typed scheme,
+/// configuration or raw `--destination` must equal the recorded one, so a
+/// record written before those were kept never matches one. `--mac`,
+/// `--device` and `--device-id` must name the record's kind, and `--on` must
+/// resolve to its Mac, simulator or device: a UDID or `mac` is compared
+/// directly, and any other reference is resolved against the live simulator
+/// list the way the plan would resolve it.
+fn launch_matches(
+    ctx: &Context,
+    key: &str,
+    last: &LastLaunchedApp,
+    stage: &StageTargetArgs,
+) -> bool {
+    let t = &ctx.targeting;
+    let agrees =
+        |typed: &Option<String>, recorded: &Option<String>| typed.is_none() || typed == recorded;
+    if !agrees(&t.scheme, &last.scheme)
+        || !agrees(&t.configuration, &last.configuration)
+        || !agrees(&t.destination, &last.destination)
+    {
+        return false;
+    }
+    let kind = last.kind.as_str();
+    if stage.mac && kind != "macos" {
+        return false;
+    }
+    if (stage.device || stage.device_id.is_some()) && kind != "device" {
+        return false;
+    }
+    if let Some(id) = &stage.device_id
+        && !last
+            .destination_id
+            .as_deref()
+            .is_some_and(|recorded| recorded.eq_ignore_ascii_case(id))
+    {
+        return false;
+    }
+    let Some(reference) = t.on.as_deref() else {
+        return true;
+    };
+    if resolve::on_is_mac(ctx, key, reference) {
+        return kind == "macos";
+    }
+    let recorded = match kind {
+        "simulator" => last.simulator_udid.as_deref(),
+        "device" => last.destination_id.as_deref(),
+        _ => None,
+    };
+    let Some(recorded) = recorded else {
+        return false;
+    };
+    if reference.eq_ignore_ascii_case(recorded) {
+        return true;
+    }
+    let Ok(sims) = simctl::list() else {
+        return false;
+    };
+    match resolve::resolve_on(ctx, key, reference, &sims) {
+        Ok(resolve::OnTarget::Simulator { udid, .. } | resolve::OnTarget::Device { udid, .. }) => {
+            udid.eq_ignore_ascii_case(recorded)
+        }
+        _ => false,
+    }
 }
 
 /// The executable path inside a recorded macOS launch's `.app` bundle.
@@ -4190,15 +5147,15 @@ fn simple_logs(
     stage_target: &StageTargetArgs,
     filters: &LogFilterArgs,
 ) -> CommandResult {
-    // An explicit --mac/--device names the target, so the simulator fast path
-    // must yield to it just as explicit targeting does.
-    if !explicit_targeting(ctx)
-        && !stage_target.mac
-        && !stage_target.device
-        && stage_target.device_id.is_none()
-        && let Some((udid, app)) = last_launched_sim(ctx)
+    // The simulator fast path serves a recorded simulator launch that the
+    // targeting flags, `--mac` and `--device` included, agree with.
+    if let Some(last) = matching_last_launch(ctx, stage_target)
+        && let Some((udid, app)) = recorded_sim(&last)
     {
         ctx.out.step("Booting simulator", || simctl::boot(&udid))?;
+        if filters.exits {
+            return exits_report(ctx, &exits::Source::Simulator(&udid), &app, None, filters);
+        }
         stream_logs(ctx, &LogSource::Simulator(&udid), &app, filters)?;
         return Ok(Rendered::Streamed);
     }
@@ -4215,7 +5172,7 @@ fn simple_logs(
         keep_sandbox: false,
         hot_entitlements: None,
         launch: &LaunchArgs::default(),
-        passthrough: &[],
+        passthrough: &project_xcodebuild_args(ctx)?,
     };
     let plan = plan(ctx, &opts)?;
     let app = plan.app_bundle()?;
@@ -4224,21 +5181,34 @@ fn simple_logs(
             // Boot first so the stream attaches instead of failing with
             // "device is not booted" when the simulator is shut down.
             ctx.out.step("Booting simulator", || simctl::boot(udid))?;
+            if filters.exits {
+                return exits_report(ctx, &exits::Source::Simulator(udid), &app, None, filters);
+            }
             stream_logs(ctx, &LogSource::Simulator(udid), &app, filters)?;
+        }
+        Target::Mac if filters.exits => {
+            let project = plan.resolved.container.key();
+            return exits_report(ctx, &exits::Source::Mac, &app, Some(&project), filters);
         }
         // The host's own `log stream`, the same source `app run --mac` uses.
         Target::Mac => stream_logs(ctx, &LogSource::Mac, &app, filters)?,
+        Target::Device(_) if filters.exits => {
+            return Err(CliError::new(
+                "app logs --exits isn't supported for a physical device; it reads launchd's \
+                 exit records from a simulator's or this Mac's unified log",
+            ));
+        }
         Target::Device(_) => {
             return Err(CliError::new(
                 "app logs can't follow a physical device yet — a device's os_log needs \
-                 pymobiledevice3 (as `app run --device` uses); use `app run --device` to \
+                 pymobiledevice3 (as 'app run --device' uses); use 'app run --device' to \
                  follow it during a run",
             ));
         }
         Target::SpmRun(_) => {
             return Err(CliError::new(
                 "a Swift package executable has no os_log stream; its output goes to the \
-                 terminal during `app run`",
+                 terminal during 'app run'",
             ));
         }
     }
@@ -4261,7 +5231,7 @@ fn debug_mac(ctx: &mut Context, plan: &RunPlan) -> CommandResult {
     let mut args: Vec<&str> = vec!["--", &exe];
     args.extend(plan.launch.args.iter().map(String::as_str));
     ctx.out.note(&format!(
-        "starting lldb for {} — type `run` to launch it, `quit` to leave",
+        "starting lldb for {} — type 'run' to launch it, 'quit' to leave",
         app.bundle_id
     ));
     // Ctrl-C is lldb's break-into-the-debuggee gesture; the terminal delivers
@@ -4316,6 +5286,12 @@ fn push_one_line(args: &mut Vec<String>, cmd: &str) {
     args.push(cmd.to_string());
 }
 
+/// Push an lldb on-crash command (`-k <cmd>`) onto an argv.
+fn push_on_crash(args: &mut Vec<String>, cmd: &str) {
+    args.push("-k".to_string());
+    args.push(cmd.to_string());
+}
+
 /// Sentinels `app diagnose` prints (via `script print`) between the sections
 /// of its lldb chain, so a captured transcript splits into clean pieces even
 /// though lldb interleaves prompts and diagnostics. `-Q` suppresses lldb's
@@ -4331,22 +5307,55 @@ const SENTINEL_END: &str = "@@SWEETPAD_END@@";
 /// before killing it. `$arg1` is `objc_exception_throw`'s first argument — the
 /// `NSException` — valid only at that breakpoint, so the caller ignores those
 /// fields for a plain signal crash or a clean exit.
+///
+/// Batch mode runs the `-o` chain only while the process stops normally. A
+/// breakpoint (the Objective-C throw) is a normal stop, so the chain goes on
+/// and dumps the exception. A crash (a Mach exception, a signal, a Swift
+/// runtime failure) ends it after the start verb and runs the `-k` commands
+/// instead, which dump the backtrace and kill the app. A clean exit also
+/// carries the chain on, with no process to read, so each command that needs
+/// one runs [`when_stopped`]: it is skipped, only the sentinels print, and
+/// lldb exits 0 instead of stopping at a failed `po` with status 1.
 fn diagnose_lldb_args(target: &LldbTarget) -> Vec<String> {
     let mut a = vec!["-b".to_string(), "-Q".to_string()];
     a.extend(target.attach_flag());
     push_one_line(&mut a, "breakpoint set -n objc_exception_throw");
     push_one_line(&mut a, target.start_verb());
     push_one_line(&mut a, &format!("script print('{SENTINEL_EXC}')"));
-    push_one_line(&mut a, "po (id)[(id)$arg1 name]");
+    push_one_line(&mut a, &when_stopped("po (id)[(id)$arg1 name]"));
     push_one_line(&mut a, &format!("script print('{SENTINEL_REASON}')"));
-    push_one_line(&mut a, "po (id)[(id)$arg1 reason]");
-    push_one_line(&mut a, &format!("script print('{SENTINEL_BT}')"));
-    push_one_line(&mut a, "bt");
-    push_one_line(&mut a, &format!("script print('{SENTINEL_END}')"));
-    push_one_line(&mut a, "process kill");
-    push_one_line(&mut a, "quit");
+    push_one_line(&mut a, &when_stopped("po (id)[(id)$arg1 reason]"));
+    let backtrace_and_kill = [
+        (format!("script print('{SENTINEL_BT}')"), false),
+        ("bt".to_string(), true),
+        (format!("script print('{SENTINEL_END}')"), false),
+        ("process kill".to_string(), true),
+        ("quit".to_string(), false),
+    ];
+    for (cmd, needs_process) in &backtrace_and_kill {
+        if *needs_process {
+            push_one_line(&mut a, &when_stopped(cmd));
+        } else {
+            push_one_line(&mut a, cmd);
+        }
+    }
+    // A crash leaves the process stopped, so the `-k` commands run as is.
+    for (cmd, _) in &backtrace_and_kill {
+        push_on_crash(&mut a, cmd);
+    }
     a.extend(target.launch_suffix());
     a
+}
+
+/// An lldb command that runs `cmd` only while the process is stopped, and
+/// does nothing (successfully) once it has exited. `lldb.process` is the
+/// selected process, invalid when there is none, which also skips.
+fn when_stopped(cmd: &str) -> String {
+    debug_assert!(!cmd.contains(['"', '\\']), "{cmd}");
+    format!(
+        "script lldb.debugger.HandleCommand(\"{cmd}\") \
+         if lldb.process.GetState() == lldb.eStateStopped else None"
+    )
 }
 
 /// The `lldb -b` argv for `app debug --batch`: forward the user's `--cmd`
@@ -4358,8 +5367,7 @@ fn batch_lldb_args(target: &LldbTarget, cmds: &[String], on_crash: &[String]) ->
         push_one_line(&mut a, c);
     }
     for c in on_crash {
-        a.push("-k".to_string());
-        a.push(c.clone());
+        push_on_crash(&mut a, c);
     }
     a.extend(target.launch_suffix());
     a
@@ -4370,12 +5378,25 @@ fn batch_lldb_args(target: &LldbTarget, cmds: &[String], on_crash: &[String]) ->
 /// exception name/reason are set only for an Objective-C exception.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct DiagnoseOutcome {
+    /// The debuggee's pid, from lldb's own `Process <pid> launched|stopped|…`.
+    pid: Option<u32>,
     stop_reason: Option<String>,
+    /// The signal lldb stopped on (`signal SIGABRT`), or the one the Mach
+    /// exception it stopped on turns into (see [`mach_fault`]).
     signal: Option<String>,
+    /// A Mach exception stop, read into plain words.
+    fault: Option<MachFault>,
+    /// The message of a Swift runtime failure stop (see [`swift_failure`]).
+    swift_failure: Option<String>,
     exit_status: Option<i32>,
     exception_name: Option<String>,
     exception_reason: Option<String>,
     backtrace: Vec<String>,
+    /// Whether lldb's command chain printed its closing sentinel, which it
+    /// does once the backtrace is dumped. lldb stops a `-b` chain at the
+    /// first command that fails, so `false` with no timeout means it
+    /// stopped partway.
+    chain_complete: bool,
 }
 
 impl DiagnoseOutcome {
@@ -4387,20 +5408,47 @@ impl DiagnoseOutcome {
 /// Parse an `app diagnose` lldb transcript into an outcome. The first
 /// `stop reason = …` is the real stop — the trailing `exited with status = 9
 /// killed` from our own `process kill` carries none, so it never masquerades
-/// as the result. Section extraction is best-effort; the raw transcript is
-/// always carried alongside for the cases parsing can't cover.
-fn parse_diagnose(transcript: &str) -> DiagnoseOutcome {
-    let stop_reason = transcript.lines().find_map(|l| {
+/// as the result. `attached` says lldb attached to a process launched
+/// suspended (the simulator path): attaching stops it with `signal SIGSTOP`
+/// before the `continue`, and that stop is skipped. Section extraction is
+/// best-effort; the raw transcript is always carried alongside for the cases
+/// parsing can't cover.
+fn parse_diagnose(transcript: &str, attached: bool) -> DiagnoseOutcome {
+    // lldb's status lines start the line; the app's own log lines carry its
+    // pid too, but inside a `Name[pid:tid]` prefix, never after `Process `.
+    let pid = transcript.lines().find_map(|l| {
+        let mut words = l.strip_prefix("Process ")?.split(' ');
+        let pid = words.next()?.parse().ok()?;
+        matches!(
+            words.next()?,
+            "launched:" | "stopped" | "exited" | "resuming"
+        )
+        .then_some(pid)
+    });
+    let mut stop_reasons = transcript.lines().filter_map(|l| {
         l.split_once("stop reason = ")
             .map(|(_, r)| r.trim().to_string())
     });
+    let stop_reason = match stop_reasons.next() {
+        Some(first) if attached && first == "signal SIGSTOP" => stop_reasons.next(),
+        first => first,
+    };
     let is_objc = stop_reason
         .as_deref()
         .is_some_and(|r| r.contains("Objective-C exception"));
-    let signal = stop_reason.as_deref().and_then(|r| {
-        r.strip_prefix("signal ")
-            .map(|s| s.split_whitespace().next().unwrap_or(s).to_string())
-    });
+    let fault = stop_reason.as_deref().and_then(mach_fault);
+    let swift_failure = stop_reason
+        .as_deref()
+        .and_then(swift_failure)
+        .map(str::to_string);
+    let signal = stop_reason
+        .as_deref()
+        .and_then(|r| {
+            r.strip_prefix("signal ")
+                .map(|s| s.split_whitespace().next().unwrap_or(s).to_string())
+        })
+        .or_else(|| fault.as_ref().and_then(|f| f.signal).map(str::to_string))
+        .or_else(|| swift_failure.as_ref().map(|_| "SIGTRAP".to_string()));
     // A clean exit only counts when nothing stopped us first.
     let exit_status = if stop_reason.is_none() {
         transcript
@@ -4442,15 +5490,99 @@ fn parse_diagnose(transcript: &str) -> DiagnoseOutcome {
                 .collect()
         })
         .unwrap_or_default();
+    let chain_complete = transcript.lines().any(|l| l.trim() == SENTINEL_END);
 
     DiagnoseOutcome {
+        pid,
         stop_reason,
         signal,
+        fault,
+        swift_failure,
         exit_status,
         exception_name,
         exception_reason,
         backtrace,
+        chain_complete,
     }
+}
+
+/// A Mach exception lldb stopped on, read into the signal the kernel
+/// delivers for it and a phrase for the verdict.
+#[derive(Debug, PartialEq, Eq)]
+struct MachFault {
+    /// The exception's name, e.g. `EXC_BAD_ACCESS`.
+    exception: String,
+    /// What the kernel turns it into when nothing handles it, as XNU's
+    /// `ux_exception` maps it: a bad access at an unmapped address (code 1,
+    /// `KERN_INVALID_ADDRESS`, or an Intel general protection fault) is
+    /// `SIGSEGV` and any other bad access `SIGBUS`; a trap instruction is
+    /// `SIGTRAP`, an illegal instruction `SIGILL`, an arithmetic fault
+    /// `SIGFPE`.
+    signal: Option<&'static str>,
+    /// What happened, in plain words.
+    what: String,
+}
+
+/// Read an lldb stop reason that names a Mach exception, as lldb's
+/// `StopInfoMachException` words it: `EXC_BAD_ACCESS (code=1, address=0x10)`,
+/// `EXC_BREAKPOINT (code=1, subcode=0x100000538)`. A code lldb has a CPU name
+/// for is printed as that name (`code=EXC_I386_GPFLT`). `None` for any other
+/// stop, and for the exceptions with no settled signal or reading
+/// (`EXC_GUARD`, `EXC_RESOURCE`, …), which keep their raw text.
+fn mach_fault(reason: &str) -> Option<MachFault> {
+    let (exception, rest) = reason.split_once(' ').unwrap_or((reason, ""));
+    let fields: Vec<(&str, &str)> = rest
+        .trim()
+        .strip_prefix('(')
+        .and_then(|r| r.split(')').next())
+        .map(|inner| {
+            inner
+                .split(',')
+                .filter_map(|kv| kv.trim().split_once('='))
+                .collect()
+        })
+        .unwrap_or_default();
+    let field = |name: &str| fields.iter().find(|(k, _)| *k == name).map(|(_, v)| *v);
+    let (signal, what) = match exception {
+        "EXC_BAD_ACCESS" => (
+            field("code").map(|code| match code {
+                "1" | "EXC_I386_GPFLT" => "SIGSEGV",
+                _ => "SIGBUS",
+            }),
+            field("address").map_or_else(
+                || "a bad memory access".to_string(),
+                |address| format!("a bad memory access at {address}"),
+            ),
+        ),
+        "EXC_BREAKPOINT" => (
+            Some("SIGTRAP"),
+            "a trap instruction, the way a failed Swift check or fatalError stops the app"
+                .to_string(),
+        ),
+        "EXC_BAD_INSTRUCTION" => (Some("SIGILL"), "an illegal instruction".to_string()),
+        "EXC_ARITHMETIC" => (
+            Some("SIGFPE"),
+            "an arithmetic error, such as an integer division by zero".to_string(),
+        ),
+        _ => return None,
+    };
+    Some(MachFault {
+        exception: exception.to_string(),
+        signal,
+        what,
+    })
+}
+
+/// The message of a stop lldb reports for a Swift runtime failure, which it
+/// catches before the trap instruction that ends the app: `Fatal error:
+/// <message>` where the runtime reports one (`fatalError`, a failed
+/// `precondition`, a nil force-unwrap, an index out of range in a Debug
+/// build), and `Swift runtime failure: <message>` where an optimized build
+/// traps in place. Either way the app dies of `SIGTRAP` without a debugger.
+fn swift_failure(reason: &str) -> Option<&str> {
+    reason
+        .strip_prefix("Fatal error: ")
+        .or_else(|| reason.strip_prefix("Swift runtime failure: "))
 }
 
 /// A `--timeout <secs>` value as a `Duration`; `0` means unbounded.
@@ -4492,16 +5624,25 @@ fn kill_lldb_and_inferior(child: &mut std::process::Child, cleanup_pids: impl Fn
     let _ = child.wait();
 }
 
+/// What a captured lldb run left: its transcript, whether it ran out its
+/// timeout, and lldb's own exit code. The code is `None` when lldb was
+/// killed, at the timeout or by a signal.
+struct LldbCapture {
+    transcript: String,
+    timed_out: bool,
+    status: Option<i32>,
+}
+
 /// Spawn `lldb <args>` with its output **captured** to a temp file, wait up to
-/// `timeout`, and on expiry kill the inferior and lldb. Returns the transcript
-/// and whether it timed out. Capturing to a file (not a pipe) avoids a
-/// full-pipe deadlock when a chatty app blocks lldb inside `run`.
+/// `timeout`, and on expiry kill the inferior and lldb. Capturing to a file
+/// (not a pipe) avoids a full-pipe deadlock when a chatty app blocks lldb
+/// inside `run`.
 fn run_lldb_captured(
     args: &[String],
     env: &[(String, String)],
     timeout: Duration,
     cleanup_pids: impl Fn() -> Vec<i32>,
-) -> Result<(String, bool), CliError> {
+) -> Result<LldbCapture, CliError> {
     let path = std::env::temp_dir().join(format!("sweetpad-diagnose-{}.log", std::process::id()));
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -4525,16 +5666,24 @@ fn run_lldb_captured(
         .stdout(file)
         .stderr(err)
         .spawn()
-        .map_err(|e| CliError::new(format!("failed to run `lldb`: {e}")))?;
+        .map_err(|e| CliError::new(format!("failed to run 'lldb': {e}")))?;
     let slot = crate::cli::signals::register_child(child.id());
     let timed_out = wait_with_timeout(&mut child, timeout);
-    if timed_out {
+    let status = if timed_out {
         kill_lldb_and_inferior(&mut child, cleanup_pids);
-    }
+        None
+    } else {
+        // Already reaped by the wait, so this returns its status at once.
+        child.wait().ok().and_then(|s| s.code())
+    };
     crate::cli::signals::unregister_child(slot);
     let transcript = std::fs::read_to_string(&path).unwrap_or_default();
     let _ = std::fs::remove_file(&path);
-    Ok((transcript, timed_out))
+    Ok(LldbCapture {
+        transcript,
+        timed_out,
+        status,
+    })
 }
 
 /// Spawn `lldb <args>` with stdio inherited (output **streams** to the
@@ -4549,7 +5698,7 @@ fn run_lldb_streamed(
         .args(args)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .spawn()
-        .map_err(|e| CliError::new(format!("failed to run `lldb`: {e}")))?;
+        .map_err(|e| CliError::new(format!("failed to run 'lldb': {e}")))?;
     let slot = crate::cli::signals::register_child(child.id());
     let timed_out = wait_with_timeout(&mut child, timeout);
     if timed_out {
@@ -4558,7 +5707,7 @@ fn run_lldb_streamed(
     crate::cli::signals::unregister_child(slot);
     if timed_out {
         return Err(CliError::new(format!(
-            "lldb --batch hit the {}s timeout and was killed; raise --timeout, or add `quit` to \
+            "lldb --batch hit the {}s timeout and was killed; raise --timeout, or add 'quit' to \
              your --cmd chain",
             timeout.as_secs()
         )));
@@ -4588,7 +5737,7 @@ fn diagnose(
         )),
         Target::SpmRun(_) => Err(CliError::new(
             "app diagnose works on an app target; for a Swift package run \
-             `lldb -b -o run -o bt -- <binary>`",
+             'lldb -b -o run -o bt -- <binary>'",
         )),
     }
 }
@@ -4609,18 +5758,30 @@ fn diagnose_mac(ctx: &mut Context, plan: &RunPlan, timeout_secs: u64) -> Command
         app.bundle_id
     ));
     let executable = app.executable.clone();
-    let (transcript, timed_out) =
-        run_lldb_captured(&args, &env, batch_timeout(timeout_secs), || {
-            macwin::pids_for_executable(&executable).unwrap_or_default()
-        })?;
+    // lldb prints `Process <pid> launched` only once `run` returns, so a run
+    // that times out still running names its pid only through the kill.
+    let killed = std::cell::RefCell::new(Vec::new());
+    let capture = run_lldb_captured(&args, &env, batch_timeout(timeout_secs), || {
+        let pids = macwin::pids_for_executable(&executable).unwrap_or_default();
+        killed.borrow_mut().clone_from(&pids);
+        pids
+    })?;
+    let outcome = parse_diagnose(&capture.transcript, false);
+    let pid = outcome.pid.or_else(|| {
+        killed
+            .borrow()
+            .first()
+            .and_then(|pid| u32::try_from(*pid).ok())
+    });
     Ok(Rendered::data(DiagnoseReport {
         target: "macOS",
         bundle_id: app.bundle_id,
-        pid: None,
-        timed_out,
+        pid,
+        timed_out: capture.timed_out,
         timeout_secs,
-        outcome: parse_diagnose(&transcript),
-        transcript,
+        lldb_status: capture.status,
+        outcome,
+        transcript: capture.transcript,
     }))
 }
 
@@ -4634,16 +5795,16 @@ fn diagnose_sim(ctx: &mut Context, plan: &RunPlan, udid: &str, timeout_secs: u64
         app.bundle_id
     ));
     let pid_i32 = i32::try_from(pid).unwrap_or(0);
-    let (transcript, timed_out) =
-        run_lldb_captured(&args, &[], batch_timeout(timeout_secs), || vec![pid_i32])?;
+    let capture = run_lldb_captured(&args, &[], batch_timeout(timeout_secs), || vec![pid_i32])?;
     Ok(Rendered::data(DiagnoseReport {
         target: "simulator",
         bundle_id: app.bundle_id,
         pid: Some(pid),
-        timed_out,
+        timed_out: capture.timed_out,
         timeout_secs,
-        outcome: parse_diagnose(&transcript),
-        transcript,
+        lldb_status: capture.status,
+        outcome: parse_diagnose(&capture.transcript, true),
+        transcript: capture.transcript,
     }))
 }
 
@@ -4656,53 +5817,80 @@ struct DiagnoseReport {
     pid: Option<u32>,
     timed_out: bool,
     timeout_secs: u64,
+    /// lldb's own exit code (see [`LldbCapture`]).
+    lldb_status: Option<i32>,
     outcome: DiagnoseOutcome,
     transcript: String,
 }
 
-impl Render for DiagnoseReport {
-    fn human(&self, out: &Output) {
+impl DiagnoseReport {
+    /// What the run came to, in one line without the bundle id: the human
+    /// verdict, and `verdict` in JSON beside the raw fields it is read from.
+    fn verdict(&self) -> String {
         if self.timed_out {
-            out.note(&format!(
-                "{}: no exception or crash within {}s — the app was still running and has been \
+            return format!(
+                "no exception or crash within {}s — the app was still running and has been \
                  killed",
-                self.bundle_id, self.timeout_secs
-            ));
-            return;
+                self.timeout_secs
+            );
         }
+        let outcome = &self.outcome;
         match (
-            &self.outcome.exception_name,
-            &self.outcome.signal,
-            self.outcome.exit_status,
+            &outcome.exception_name,
+            &outcome.signal,
+            outcome.exit_status,
         ) {
             (Some(name), _, _) => {
-                let reason = self
-                    .outcome
-                    .exception_reason
-                    .as_deref()
-                    .unwrap_or("<no reason>");
-                out.note(&format!(
-                    "{}: caught Objective-C exception {name}: {reason}",
-                    self.bundle_id
-                ));
+                let reason = outcome.exception_reason.as_deref().unwrap_or("<no reason>");
+                format!("caught Objective-C exception {name}: {reason}")
             }
-            (None, Some(sig), _) => {
-                out.note(&format!("{}: crashed with {sig}", self.bundle_id));
-            }
+            (None, Some(sig), _) => match (&outcome.fault, &outcome.swift_failure) {
+                (Some(fault), _) => {
+                    format!("crashed with {sig}: {} ({})", fault.what, fault.exception)
+                }
+                (None, Some(message)) => {
+                    format!("crashed with {sig}: Swift fatal error \"{message}\"")
+                }
+                (None, None) => format!("crashed with {sig}"),
+            },
             (None, None, Some(status)) => {
-                out.note(&format!(
-                    "{}: exited cleanly (status {status}) — no exception or crash observed",
-                    self.bundle_id
-                ));
+                format!("exited cleanly (status {status}) — no exception or crash observed")
             }
-            _ => out.note(&format!(
-                "{}: {}",
-                self.bundle_id,
-                self.outcome
-                    .stop_reason
-                    .as_deref()
-                    .unwrap_or("no stop observed")
-            )),
+            _ => match (&outcome.fault, &outcome.stop_reason) {
+                (Some(fault), _) => format!("crashed: {} ({})", fault.what, fault.exception),
+                (None, Some(reason)) => reason.clone(),
+                (None, None) => self
+                    .stopped_partway()
+                    .unwrap_or_else(|| "no stop observed".into()),
+            },
+        }
+    }
+
+    /// The verdict for an lldb that failed partway through its chain before
+    /// the app stopped or exited, a failed attach say: its exit code and its
+    /// first error line. `None` when the chain ran to its end or lldb exited
+    /// 0.
+    fn stopped_partway(&self) -> Option<String> {
+        let status = self.lldb_status.filter(|s| *s != 0)?;
+        if self.outcome.chain_complete {
+            return None;
+        }
+        let error = self
+            .transcript
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("error: "));
+        Some(match error {
+            Some(error) => format!("lldb stopped partway with status {status}: {error}"),
+            None => format!("lldb stopped partway with status {status}"),
+        })
+    }
+}
+
+impl Render for DiagnoseReport {
+    fn human(&self, out: &Output) {
+        out.note(&format!("{}: {}", self.bundle_id, self.verdict()));
+        if self.timed_out {
+            return;
         }
         if !self.outcome.backtrace.is_empty() {
             out.line("");
@@ -4719,10 +5907,13 @@ impl Render for DiagnoseReport {
             "pid": self.pid,
             "timedOut": self.timed_out,
             "timeoutSecs": self.timeout_secs,
+            "lldbStatus": self.lldb_status,
+            "chainComplete": self.outcome.chain_complete,
             "stopped": self.outcome.stopped(),
             "stopReason": self.outcome.stop_reason,
             "signal": self.outcome.signal,
             "exitStatus": self.outcome.exit_status,
+            "verdict": self.verdict(),
             "exception": self.outcome.exception_name.as_ref().map(|name| serde_json::json!({
                 "name": name,
                 "reason": self.outcome.exception_reason,
@@ -4733,10 +5924,83 @@ impl Render for DiagnoseReport {
     }
 }
 
+/// The command a hint tells the user to run next, quoted for the message:
+/// `sweetpad <verb>`, the project and target flags this invocation resolved
+/// its app with, then `rest`, which names the destination. A typed `--scheme`
+/// is not remembered, so a hint that drops it can stop at "no scheme
+/// specified". `--on`/`--destination` are left out because `rest` replaces
+/// them.
+pub(crate) fn follow_up(ctx: &Context, verb: &str, rest: &[&str]) -> String {
+    let t = &ctx.targeting;
+    hint_command(
+        ctx,
+        verb,
+        &[
+            ("--scheme", t.scheme.clone()),
+            ("--configuration", t.configuration.clone()),
+            ("--sdk", t.sdk.clone()),
+        ],
+        rest,
+    )
+}
+
+/// A [`follow_up`] for a verb that reads the last run's result bundle back,
+/// such as 'test attachments': it takes the project flags, which pick the
+/// bundle, and refuses the target flags.
+pub(crate) fn read_back_follow_up(ctx: &Context, verb: &str, rest: &[&str]) -> String {
+    hint_command(ctx, verb, &[], rest)
+}
+
+/// `sweetpad <verb>` with the project flags this invocation was given, then
+/// `target` for those that are set, then `rest`, quoted for a message.
+fn hint_command(
+    ctx: &Context,
+    verb: &str,
+    target: &[(&str, Option<String>)],
+    rest: &[&str],
+) -> String {
+    let t = &ctx.targeting;
+    let path = |p: &Option<std::path::PathBuf>| p.as_ref().map(|p| p.display().to_string());
+    let mut words = vec!["sweetpad".to_string()];
+    if let Some(dir) = path(&ctx.global.chdir) {
+        words.extend(["-C".to_string(), hint_quote(&dir)]);
+    }
+    words.push(verb.to_string());
+    let project = [
+        ("--workspace", path(&t.workspace)),
+        ("--project", path(&t.project)),
+    ];
+    for (flag, value) in project.iter().chain(target).cloned() {
+        if let Some(value) = value {
+            words.extend([flag.to_string(), hint_quote(&value)]);
+        }
+    }
+    words.extend(rest.iter().map(|w| hint_quote(w)));
+    format!("'{}'", words.join(" "))
+}
+
+/// Double-quote a word of a [`follow_up`] command when the shell would split
+/// or expand it. The command sits in single quotes, so nesting those would
+/// read as the end of it.
+fn hint_quote(word: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-_./=:,+@%".contains(c);
+    if !word.is_empty() && word.chars().all(plain) {
+        return word.to_string();
+    }
+    let mut quoted = String::from('"');
+    for c in word.chars() {
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// Whether the invocation named its target explicitly (scheme, configuration,
-/// destination, or `--on`) — the last-launched fast paths yield to it.
-/// Container flags don't count: the recorded launch is already keyed per
-/// container.
+/// destination, or `--on`), which a `--pid` that skips app resolution
+/// refuses. Container flags don't count: they only say where to look.
 fn explicit_targeting(ctx: &Context) -> bool {
     ctx.targeting.scheme.is_some()
         || ctx.targeting.configuration.is_some()
@@ -4744,9 +6008,8 @@ fn explicit_targeting(ctx: &Context) -> bool {
         || ctx.targeting.on.is_some()
 }
 
-/// The recorded last launch, when it targeted a simulator: `(udid, bundle)`.
-fn last_launched_sim(ctx: &Context) -> Option<(String, AppBundle)> {
-    let last = last_launched(ctx)?;
+/// A recorded launch's `(udid, bundle)`, when it targeted a simulator.
+fn recorded_sim(last: &LastLaunchedApp) -> Option<(String, AppBundle)> {
     if last.kind != "simulator" {
         return None;
     }
@@ -4840,16 +6103,22 @@ struct MacShot {
 /// `stop`: an explicit `--pid` wins, then the recorded last launch, then the
 /// resolved build target — no build, ever.
 fn screenshot(ctx: &mut Context, args: &ScreenshotArgs) -> CommandResult {
+    if args.window == Some(0) {
+        return Err(
+            CliError::new("--window is 1-based (1 is the frontmost)").kind(ErrorKind::Usage)
+        );
+    }
     if let Some(pid) = args.pid {
         if explicit_targeting(ctx) {
             return Err(CliError::new(
                 "--pid captures a process directly; scheme/destination flags don't apply",
-            ));
+            )
+            .kind(ErrorKind::Usage));
         }
         // Positive pids only — 0/negative would address a process *group* in
         // the liveness probe below.
         if pid <= 0 {
-            return Err(CliError::new("--pid takes a positive process id"));
+            return Err(CliError::new("--pid takes a positive process id").kind(ErrorKind::Usage));
         }
         // ESRCH now beats "no on-screen window" after a 5s wait.
         if unsafe { libc::kill(pid, 0) } != 0
@@ -4868,15 +6137,13 @@ fn screenshot(ctx: &mut Context, args: &ScreenshotArgs) -> CommandResult {
         );
     }
 
-    // The recorded last launch serves the no-flags case with no scheme
-    // resolution and no prompting, exactly like `stop`.
-    if !explicit_targeting(ctx)
-        && let Some(last) = last_launched(ctx)
-    {
+    // The recorded last launch serves the flags that agree with it, with no
+    // scheme resolution and no prompting, exactly like `stop`.
+    if let Some(last) = matching_last_launch(ctx, &StageTargetArgs::default()) {
         match last.kind.as_str() {
             "macos" => {
                 if let Some(exe) = mac_executable(&last) {
-                    let shot = mac_shot_for(&exe, &last.bundle_identifier)?;
+                    let shot = mac_shot_for(ctx, &exe, &last.bundle_identifier)?;
                     return mac_screenshot(ctx, &shot, args);
                 }
                 // No executable recorded (an older state file) — fall through
@@ -4910,13 +6177,13 @@ fn screenshot(ctx: &mut Context, args: &ScreenshotArgs) -> CommandResult {
         keep_sandbox: false,
         hot_entitlements: None,
         launch: &LaunchArgs::default(),
-        passthrough: &[],
+        passthrough: &project_xcodebuild_args(ctx)?,
     };
     let plan = plan(ctx, &opts)?;
     match &plan.target {
         Target::Mac => {
             let app = plan.app_bundle()?;
-            let shot = mac_shot_for(&app.executable, &app.bundle_id)?;
+            let shot = mac_shot_for(ctx, &app.executable, &app.bundle_id)?;
             mac_screenshot(ctx, &shot, args)
         }
         Target::Simulator(udid) => simulator_screenshot(ctx, udid, args),
@@ -4931,11 +6198,12 @@ fn screenshot(ctx: &mut Context, args: &ScreenshotArgs) -> CommandResult {
 }
 
 /// Build the [`MacShot`] for an executable path, erroring when nothing runs.
-fn mac_shot_for(executable: &Path, bundle_id: &str) -> Result<MacShot, CliError> {
+fn mac_shot_for(ctx: &Context, executable: &Path, bundle_id: &str) -> Result<MacShot, CliError> {
     let pids = macwin::pids_for_executable(executable)?;
     if pids.is_empty() {
         return Err(CliError::new(format!(
-            "{bundle_id} isn't running — launch it with `sweetpad app run --mac --no-logs`"
+            "{bundle_id} isn't running — launch it with {}",
+            follow_up(ctx, "app run", &["--mac", "--no-logs"])
         )));
     }
     Ok(MacShot {
@@ -4985,6 +6253,328 @@ fn mac_screenshot(ctx: &Context, shot: &MacShot, args: &ScreenshotArgs) -> Comma
     }))
 }
 
+/// The `app sample` payload: the verdict on the main thread, anything else
+/// the report showed, and where the full report is.
+struct SampleReport {
+    pid: i32,
+    /// What was sampled, for the human note; not serialized.
+    label: String,
+    bundle_id: Option<String>,
+    seconds: u64,
+    report_path: String,
+    analysis: sample::Analysis,
+    /// The `app diagnose` command a swallowed exception points at, for the
+    /// human flag line; not serialized.
+    diagnose: String,
+}
+
+impl Render for SampleReport {
+    fn human(&self, out: &Output) {
+        let main = &self.analysis.main_thread;
+        let of = |part: u64| format!("{part} of {} samples", main.samples);
+        match main.state {
+            _ if main.samples == 0 => {
+                out.line("main thread: unclassified — the report has no call graph to read");
+            }
+            sample::State::Idle => {
+                out.line(&format!(
+                    "main thread: idle — waiting for events in its run loop ({})",
+                    of(main.breakdown.run_loop)
+                ));
+                out.line(
+                    "  not hung: if work stopped, look for a callback, completion handler or \
+                     queue that never fired",
+                );
+            }
+            sample::State::Blocked => {
+                let (what, from, samples) = main.wait.as_ref().map_or(
+                    ("a wait", String::new(), main.breakdown.waiting),
+                    |w| {
+                        let from = w
+                            .caller
+                            .as_ref()
+                            .map_or(String::new(), |c| format!(" in {}", c.symbol));
+                        (w.kind.describe(), from, w.samples)
+                    },
+                );
+                out.line(&format!(
+                    "main thread: blocked — waiting on {what}{from} ({})",
+                    of(samples)
+                ));
+            }
+            sample::State::Busy => {
+                out.line(&format!(
+                    "main thread: busy — running code ({})",
+                    of(main.breakdown.running)
+                ));
+            }
+            sample::State::Unclassified => {
+                let pct = |part: u64| part * 100 / main.samples;
+                let parts: Vec<String> = [
+                    (main.breakdown.run_loop, "run-loop wait"),
+                    (main.breakdown.waiting, "waiting"),
+                    (main.breakdown.running, "running"),
+                    (main.breakdown.syscall, "other system calls"),
+                ]
+                .into_iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, what)| format!("{}% {what}", pct(n)))
+                .collect();
+                out.line(&format!(
+                    "main thread: unclassified — no state holds most of its {} samples ({})",
+                    main.samples,
+                    parts.join(", ")
+                ));
+            }
+        }
+        // The frames say where the time went; for idle and blocked the verdict
+        // line already says it.
+        if matches!(
+            main.state,
+            sample::State::Busy | sample::State::Unclassified
+        ) {
+            for top in main.top_frames.iter().take(3) {
+                out.line(&format!(
+                    "  {:>6}  {}  ({})",
+                    top.samples, top.frame.symbol, top.frame.image
+                ));
+            }
+        }
+        for flag in &self.analysis.flags {
+            match flag {
+                sample::Flag::SwallowedException { thread } => out.line(&format!(
+                    "flag: AppKit swallowed an Objective-C exception and kept running \
+                     (thread '{thread}'); {} stops at the throw",
+                    self.diagnose
+                )),
+            }
+        }
+        out.note(&format!(
+            "saved the full sample of {} to {}",
+            self.label, self.report_path
+        ));
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let main = &self.analysis.main_thread;
+        let frame = |f: &sample::Frame| serde_json::json!({"symbol": f.symbol, "image": f.image});
+        let mut main_thread = serde_json::json!({
+            "state": main.state.as_str(),
+            "samples": main.samples,
+            "breakdown": {
+                "runLoop": main.breakdown.run_loop,
+                "waiting": main.breakdown.waiting,
+                "running": main.breakdown.running,
+                "syscall": main.breakdown.syscall,
+            },
+            "topFrames": main.top_frames.iter().map(|t| serde_json::json!({
+                "symbol": t.frame.symbol,
+                "image": t.frame.image,
+                "samples": t.samples,
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(wait) = &main.wait {
+            main_thread["wait"] = serde_json::json!({
+                "kind": wait.kind.as_str(),
+                "symbol": wait.symbol,
+                "caller": wait.caller.as_ref().map(frame),
+                "samples": wait.samples,
+            });
+        }
+        let flags: Vec<serde_json::Value> = self
+            .analysis
+            .flags
+            .iter()
+            .map(|flag| match flag {
+                sample::Flag::SwallowedException { thread } => serde_json::json!({
+                    "kind": "swallowedException",
+                    "thread": thread,
+                }),
+            })
+            .collect();
+        serde_json::json!({
+            "pid": self.pid,
+            "bundleId": self.bundle_id,
+            "seconds": self.seconds,
+            "reportPath": self.report_path,
+            "mainThread": main_thread,
+            "flags": flags,
+        })
+    }
+}
+
+/// `app sample` — sample the running app and read its main thread back as a
+/// verdict (CLI_DESIGN §9r). Resolution is `screenshot`'s: an explicit
+/// `--pid`, then the recorded last launch, then the resolved build target —
+/// never a build. A simulator app is a process on this Mac, so it samples like
+/// a macOS one; a physical device's processes are out of reach.
+fn sample(ctx: &mut Context, args: &SampleArgs) -> CommandResult {
+    if let Some(pid) = args.pid {
+        if explicit_targeting(ctx) {
+            return Err(CliError::new(
+                "--pid samples a process directly; scheme/destination flags don't apply",
+            )
+            .kind(ErrorKind::Usage));
+        }
+        if pid <= 0 {
+            return Err(CliError::new("--pid takes a positive process id").kind(ErrorKind::Usage));
+        }
+        if unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return Err(CliError::new(format!("no process with pid {pid}")));
+        }
+        return sample_pid(ctx, pid, &format!("pid {pid}"), None, &[], args);
+    }
+
+    if let Some(last) = matching_last_launch(ctx, &StageTargetArgs::default()) {
+        match last.kind.as_str() {
+            "macos" => {
+                if let Some(exe) = mac_executable(&last) {
+                    let shot = mac_shot_for(ctx, &exe, &last.bundle_identifier)?;
+                    return sample_shot(ctx, &shot, &["--mac"], args);
+                }
+            }
+            "simulator" => {
+                if let (Some(udid), Some(exe)) = (&last.simulator_udid, &last.executable_name) {
+                    let shot = sim_shot_for(ctx, udid, &last.bundle_identifier, exe)?;
+                    return sample_shot(ctx, &shot, &["--on", udid], args);
+                }
+            }
+            "device" => return Err(sample_not_local()),
+            _ => {}
+        }
+    }
+
+    let opts = RunOpts {
+        device: false,
+        device_id: None,
+        mac: false,
+        no_logs: true,
+        detach: false,
+        hot: false,
+        hot_explicit: false,
+        hot_mode: Mode::Resolver,
+        hot_selfcheck: None,
+        keep_sandbox: false,
+        hot_entitlements: None,
+        launch: &LaunchArgs::default(),
+        passthrough: &project_xcodebuild_args(ctx)?,
+    };
+    let plan = plan(ctx, &opts)?;
+    match &plan.target {
+        Target::Mac => {
+            let app = plan.app_bundle()?;
+            let shot = mac_shot_for(ctx, &app.executable, &app.bundle_id)?;
+            sample_shot(ctx, &shot, &["--mac"], args)
+        }
+        Target::Simulator(udid) => {
+            let app = plan.app_bundle()?;
+            let shot = sim_shot_for(ctx, udid, &app.bundle_id, &process_name_of(&app.executable))?;
+            sample_shot(ctx, &shot, &["--on", udid], args)
+        }
+        Target::Device(_) => Err(sample_not_local()),
+        Target::SpmRun(_) => Err(CliError::new(
+            "a Swift package executable has no app bundle to find; use --pid for the process \
+             it started",
+        )),
+    }
+}
+
+/// A simulator app's host process: the simulator runs it on this Mac, out of
+/// the installed bundle, so its executable path finds its pid the way a macOS
+/// app's does.
+fn sim_shot_for(
+    ctx: &Context,
+    udid: &str,
+    bundle_id: &str,
+    executable: &str,
+) -> Result<MacShot, CliError> {
+    let bundle = simctl::app_container(udid, bundle_id, "app")
+        .map_err(|e| e.context(format!("finding {bundle_id} on the simulator")))?
+        .ok_or_else(|| {
+            CliError::new(format!(
+                "{bundle_id} isn't installed on the simulator; install it with {}",
+                follow_up(ctx, "app install", &["--on", udid])
+            ))
+        })?;
+    let pids = macwin::pids_for_executable(&Path::new(bundle.trim()).join(executable))?;
+    if pids.is_empty() {
+        return Err(CliError::new(format!(
+            "{bundle_id} isn't running on the simulator; start it with {}",
+            follow_up(ctx, "app launch", &["--on", udid])
+        )));
+    }
+    Ok(MacShot {
+        pids,
+        name: executable.to_string(),
+        bundle_id: Some(bundle_id.to_string()),
+    })
+}
+
+/// `destination` names where the app runs, as `--mac` or `--on <udid>`, for
+/// the report's pointer at `app diagnose`.
+fn sample_shot(
+    ctx: &Context,
+    shot: &MacShot,
+    destination: &[&str],
+    args: &SampleArgs,
+) -> CommandResult {
+    let pid = one_pid(shot)?;
+    let label = format!("{} (pid {pid})", shot.name);
+    sample_pid(ctx, pid, &label, shot.bundle_id.clone(), destination, args)
+}
+
+fn sample_pid(
+    ctx: &Context,
+    pid: i32,
+    label: &str,
+    bundle_id: Option<String>,
+    destination: &[&str],
+    args: &SampleArgs,
+) -> CommandResult {
+    let path = args.output_file.clone().unwrap_or_else(|| {
+        let name = label.split(" (pid").next().unwrap_or(label);
+        default_sample_path(name)
+    });
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let text = ctx
+        .out
+        .step(&format!("Sampling {label} for {}s", args.seconds), || {
+            sample::capture(pid, args.seconds, &path)
+        })?;
+    Ok(Rendered::data(SampleReport {
+        pid,
+        label: label.to_string(),
+        bundle_id,
+        seconds: args.seconds,
+        report_path: path.display().to_string(),
+        analysis: sample::analyze(&sample::parse(&text)),
+        diagnose: follow_up(ctx, "app diagnose", destination),
+    }))
+}
+
+/// `<state>/sweetpad/samples/<app>-<epoch-millis>.txt`. Unlike a screenshot,
+/// a report is evidence to read back rather than a file to keep beside the
+/// project, so it stays out of the working directory.
+fn default_sample_path(name: &str) -> std::path::PathBuf {
+    let file = super::simulator::timestamped_file_name(name, "txt");
+    sweetpad_core::paths::sweetpad_state_dir().map_or_else(
+        || std::env::temp_dir().join(&file),
+        |dir| dir.join("samples").join(&file),
+    )
+}
+
+/// Why a physical device's app can't be sampled.
+fn sample_not_local() -> CliError {
+    CliError::new(
+        "'app sample' needs a process on this Mac: a macOS app, or an app in a simulator. \
+         An app on a physical device runs on the device, where 'sample' can't reach it",
+    )
+}
+
 /// The window-poll + permission half of [`mac_screenshot`], shared with the
 /// session's `s` key. Fails fast on a missing Screen Recording permission —
 /// without it `screencapture` silently produces the wallpaper — requesting
@@ -4994,9 +6584,6 @@ fn wait_for_window(
     shot: &MacShot,
     index: Option<usize>,
 ) -> Result<(macwin::WindowInfo, usize), CliError> {
-    if index == Some(0) {
-        return Err(CliError::new("--window is 1-based (1 is the frontmost)"));
-    }
     if !macwin::has_screen_capture_access() {
         if ctx.out.is_interactive() {
             macwin::request_screen_capture_access();
@@ -5052,6 +6639,309 @@ fn simulator_screenshot(ctx: &Context, udid: &str, args: &ScreenshotArgs) -> Com
         bundle_id: None,
         windows: None,
     }))
+}
+
+/// `app container` — where the app's files live on this Mac (CLI_DESIGN
+/// §9o). Resolution mirrors `stop`: the recorded last launch unless a flag
+/// names another target, else the resolved build target — no build, ever.
+fn container(ctx: &mut Context, stage: &StageTargetArgs, kind: ContainerKind) -> CommandResult {
+    // The recorded launch serves the targeting flags, `--mac` and `--device`
+    // included, that agree with it.
+    if let Some(last) = matching_last_launch(ctx, stage) {
+        match last.kind.as_str() {
+            "simulator" => {
+                if let Some(udid) = &last.simulator_udid {
+                    return simulator_container(ctx, udid, &last.bundle_identifier, kind);
+                }
+            }
+            "macos" => {
+                return mac_container(
+                    ctx,
+                    Path::new(&last.app_path),
+                    &last.bundle_identifier,
+                    "platform=macOS",
+                    kind,
+                );
+            }
+            "device" => {
+                return Err(device_container_error(
+                    last.destination_id.as_deref(),
+                    &last.bundle_identifier,
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let opts = RunOpts {
+        device: stage.device || stage.device_id.is_some(),
+        device_id: stage.device_id.as_deref(),
+        mac: stage.mac,
+        no_logs: true,
+        detach: false,
+        hot: false,
+        hot_explicit: false,
+        hot_mode: Mode::Resolver,
+        hot_selfcheck: None,
+        keep_sandbox: false,
+        hot_entitlements: None,
+        launch: &LaunchArgs::default(),
+        passthrough: &project_xcodebuild_args(ctx)?,
+    };
+    let plan = plan(ctx, &opts)?;
+    match &plan.target {
+        Target::Simulator(udid) => {
+            let app = plan.app_bundle()?;
+            simulator_container(ctx, udid, &app.bundle_id, kind)
+        }
+        Target::Mac => {
+            let app = plan.app_bundle()?;
+            mac_container(ctx, &app.path, &app.bundle_id, &plan.destination, kind)
+        }
+        Target::Device(id) => {
+            let app = plan.app_bundle()?;
+            Err(device_container_error(Some(id), &app.bundle_id))
+        }
+        Target::SpmRun(_) => Err(CliError::new(
+            "a Swift package executable has no app bundle, so it has no container",
+        )),
+    }
+}
+
+/// The simulator side of `app container`: `simctl get_app_container`, after
+/// booting the simulator, since a shut-down one can't answer the lookup.
+fn simulator_container(
+    ctx: &Context,
+    udid: &str,
+    bundle_id: &str,
+    kind: ContainerKind,
+) -> CommandResult {
+    let sims = simctl::list()?;
+    let sim = simctl::find(&sims, udid).ok_or_else(|| {
+        CliError::new(format!("no simulator matching {udid:?}")).kind(ErrorKind::TargetResolution)
+    })?;
+    if !sim.is_booted() {
+        ctx.out
+            .step("Booting simulator", || simctl::boot(&sim.udid))?;
+    }
+    let raw = simctl::app_container(&sim.udid, bundle_id, kind.as_str())?.ok_or_else(|| {
+        CliError::new(format!(
+            "{bundle_id} isn't installed on {}; install it there with {}",
+            sim.label(),
+            follow_up(ctx, "app install", &["--on", &sim.udid])
+        ))
+    })?;
+    let found = match kind {
+        ContainerKind::Groups => ContainerPaths::Groups(simctl::parse_app_groups(&raw)),
+        ContainerKind::Data | ContainerKind::App => ContainerPaths::One(raw.trim().to_string()),
+    };
+    Ok(Rendered::data(ContainerReport {
+        kind,
+        bundle_id: bundle_id.to_string(),
+        destination: sim.destination(),
+        found,
+    }))
+}
+
+/// The macOS side of `app container`. The `.app` is the product sweetpad
+/// launches; the data and App Group containers are whatever its signed
+/// entitlements grant. Those are read from the product rather than inferred
+/// from `~/Library/Containers`, which appears only after a first launch and
+/// stays behind when the sandbox is turned off.
+fn mac_container(
+    ctx: &Context,
+    app: &Path,
+    bundle_id: &str,
+    destination: &str,
+    kind: ContainerKind,
+) -> CommandResult {
+    if !app.exists() {
+        return Err(CliError::new(format!(
+            "{} isn't built yet; build it with {}",
+            app.display(),
+            follow_up(ctx, "build", &["--on", "mac"])
+        )));
+    }
+    let home = || {
+        sweetpad_core::paths::home_dir()
+            .ok_or_else(|| CliError::new("$HOME is not set; cannot locate the app's container"))
+    };
+    let found = match kind {
+        ContainerKind::App => ContainerPaths::One(app.display().to_string()),
+        ContainerKind::Data => {
+            let path = mac_data_container(&home()?, bundle_id, &signed_entitlements(app))?;
+            if !path.exists() {
+                ctx.out.note(&format!(
+                    "{} doesn't exist yet; macOS creates it the first time the app launches",
+                    path.display()
+                ));
+            }
+            ContainerPaths::One(path.display().to_string())
+        }
+        ContainerKind::Groups => {
+            ContainerPaths::Groups(mac_group_containers(&home()?, &signed_entitlements(app)))
+        }
+    };
+    Ok(Rendered::data(ContainerReport {
+        kind,
+        bundle_id: bundle_id.to_string(),
+        destination: destination.to_string(),
+        found,
+    }))
+}
+
+/// What `app container` reads from a macOS product's signed entitlements.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MacEntitlements {
+    /// `com.apple.security.app-sandbox` is `<true/>`.
+    sandboxed: bool,
+    /// `com.apple.security.application-groups`, in declared order.
+    groups: Vec<String>,
+}
+
+/// The entitlements `codesign` reports for a signed product. An unsigned
+/// bundle has none, which reads correctly as "not sandboxed": the sandbox
+/// can't be granted without a signature.
+fn signed_entitlements(app: &Path) -> MacEntitlements {
+    let xml = std::process::Command::new("codesign")
+        .args(["-d", "--entitlements", "-", "--xml"])
+        .arg(app)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    parse_entitlements(&xml)
+}
+
+/// Read [`MacEntitlements`] from the XML plist `codesign --xml` prints: a
+/// `<dict>` of `<key>` elements, each followed by its value. Anything that
+/// doesn't parse grants nothing.
+fn parse_entitlements(xml: &str) -> MacEntitlements {
+    let mut found = MacEntitlements::default();
+    let Ok(root) = sweetpad_lib::xcscheme::parse(xml) else {
+        return found;
+    };
+    let Some(dict) = root.child("dict") else {
+        return found;
+    };
+    let mut entries = dict.children.iter();
+    while let Some(key) = entries.next() {
+        if key.name != "key" {
+            continue;
+        }
+        let Some(value) = entries.next() else {
+            break;
+        };
+        match key.text.as_str() {
+            "com.apple.security.app-sandbox" => found.sandboxed = value.name == "true",
+            "com.apple.security.application-groups" => {
+                found.groups = value
+                    .children_named("string")
+                    .map(|s| s.text.clone())
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// A sandboxed macOS app's data container, `~/Library/Containers/<bundle
+/// id>/Data`. An app without the sandbox has none, since it reads and writes
+/// the home directory directly, so that is an error rather than a guess at
+/// Application Support.
+fn mac_data_container(
+    home: &Path,
+    bundle_id: &str,
+    entitlements: &MacEntitlements,
+) -> Result<std::path::PathBuf, CliError> {
+    if !entitlements.sandboxed {
+        return Err(CliError::new(format!(
+            "{bundle_id} isn't sandboxed (its signed entitlements don't grant \
+             com.apple.security.app-sandbox), so it has no container"
+        )));
+    }
+    Ok(home.join("Library/Containers").join(bundle_id).join("Data"))
+}
+
+/// A macOS app's App Group containers, `~/Library/Group Containers/<id>` for
+/// each group it is entitled to. Groups don't need the sandbox, so this reads
+/// the entitlement whether or not the app is sandboxed.
+fn mac_group_containers(home: &Path, entitlements: &MacEntitlements) -> Vec<(String, String)> {
+    entitlements
+        .groups
+        .iter()
+        .map(|id| {
+            let path = home.join("Library/Group Containers").join(id);
+            (id.clone(), path.display().to_string())
+        })
+        .collect()
+}
+
+/// `app container` on a physical device: its containers live on the device,
+/// not on this Mac, so there is no path to print. devicectl copies files in
+/// and out of them.
+fn device_container_error(device: Option<&str>, bundle_id: &str) -> CliError {
+    let device = device.unwrap_or("<udid>");
+    CliError::new(format!(
+        "a physical device's containers aren't on this Mac, so there's no path to print; \
+         copy files with 'xcrun devicectl device copy to' or 'copy from', passing \
+         '--device {device} --domain-type appDataContainer --domain-identifier {bundle_id}'"
+    ))
+}
+
+/// What `app container` found: one path, or every App Group as `(id, path)`.
+enum ContainerPaths {
+    One(String),
+    Groups(Vec<(String, String)>),
+}
+
+/// The `app container` payload. Human mode prints only the path, so
+/// `$(sweetpad app container)` captures exactly it, or one `id  path` line
+/// per App Group. JSON is `{path, kind, bundleId, destination}`, with
+/// `groups: [{id, path}]` in place of `path` for `--kind groups`.
+struct ContainerReport {
+    kind: ContainerKind,
+    bundle_id: String,
+    /// The `-destination` specifier of the simulator or Mac it belongs to.
+    destination: String,
+    found: ContainerPaths,
+}
+
+impl Render for ContainerReport {
+    fn human(&self, out: &Output) {
+        match &self.found {
+            ContainerPaths::One(path) => out.line(path),
+            ContainerPaths::Groups(groups) if groups.is_empty() => {
+                out.note(&format!("{} has no App Group containers", self.bundle_id));
+            }
+            ContainerPaths::Groups(groups) => {
+                let width = groups.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+                for (id, path) in groups {
+                    out.line(&format!("{id:<width$}  {path}"));
+                }
+            }
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let mut data = serde_json::json!({
+            "kind": self.kind.as_str(),
+            "bundleId": self.bundle_id,
+            "destination": self.destination,
+        });
+        match &self.found {
+            ContainerPaths::One(path) => data["path"] = path.as_str().into(),
+            ContainerPaths::Groups(groups) => {
+                data["groups"] = groups
+                    .iter()
+                    .map(|(id, path)| serde_json::json!({ "id": id, "path": path }))
+                    .collect();
+            }
+        }
+        data
+    }
 }
 
 /// The `app ui tree` payload: the app that was inspected and its element
@@ -5166,22 +7056,27 @@ fn ui_act(
         role: query.role.clone(),
         nth: query.nth,
     };
+    let tree = ui_tree_command(ctx, app.pid);
     // An empty query would match the application element itself and press
     // something arbitrary; make the caller say what they meant.
     if query.is_empty() {
-        return Err(CliError::new(
-            "name the element with --label, or --role for a lone control; \
-             `sweetpad app ui tree` shows what the app exposes",
-        ));
+        return Err(CliError::new(format!(
+            "name the element with --label, or --role for a lone control; {tree} shows what \
+             the app exposes"
+        ))
+        .kind(ErrorKind::Usage));
+    }
+    if query.nth == Some(0) {
+        return Err(CliError::new("--nth is 1-based (1 is the first)").kind(ErrorKind::Usage));
     }
     let shot = resolve_ui_app(ctx, app.pid)?;
     let pid = ui_preflight(ctx, &shot)?;
     let root = ax::snapshot(pid, usize::MAX)?;
-    let target = ax::find(&root, &query).map_err(CliError::new)?;
+    let target = ax::find(&root, &query, &tree).map_err(CliError::new)?;
 
     match text {
-        Some(text) => ax::act(pid, target, &ax::Act::SetValue(text))?,
-        None => ax::act(pid, target, &ax::Act::Perform("AXPress"))?,
+        Some(text) => ax::act(pid, target, &ax::Act::SetValue(text), &tree)?,
+        None => ax::act(pid, target, &ax::Act::Perform("AXPress"), &tree)?,
     }
     Ok(Rendered::data(UiActReport {
         app: shot.name,
@@ -5191,6 +7086,21 @@ fn ui_act(
         path: target.path.clone(),
         text: text.map(str::to_string),
     }))
+}
+
+/// The `app ui tree` a `ui click`/`ui type` error sends the caller to, quoted
+/// and spelled with the flags that found this app: its `--pid`, else the
+/// destination it was named by, which [`follow_up`] leaves to `rest`.
+fn ui_tree_command(ctx: &Context, pid: Option<i32>) -> String {
+    let pid = pid.map(|p| p.to_string());
+    let t = &ctx.targeting;
+    let rest: Vec<&str> = match (&pid, &t.on, &t.destination) {
+        (Some(pid), _, _) => vec!["--pid", pid],
+        (None, Some(on), _) => vec!["--on", on],
+        (None, None, Some(destination)) => vec!["--destination", destination],
+        (None, None, None) => Vec::new(),
+    };
+    follow_up(ctx, "app ui tree", &rest)
 }
 
 /// Check the Accessibility grant and settle on one pid to drive.
@@ -5205,6 +7115,12 @@ fn ui_preflight(ctx: &Context, shot: &MacShot) -> Result<i32, CliError> {
         }
         return Err(ax::permission_error());
     }
+    one_pid(shot)
+}
+
+/// The app's one live process, refusing to pick among several: `ui` has no
+/// frontmost element tree to prefer, and `sample` no frontmost main thread.
+fn one_pid(shot: &MacShot) -> Result<i32, CliError> {
     match shot.pids.as_slice() {
         [pid] => Ok(*pid),
         [] => Err(CliError::new(format!("{} isn't running", shot.name))),
@@ -5228,10 +7144,11 @@ fn resolve_ui_app(ctx: &mut Context, pid: Option<i32>) -> Result<MacShot, CliErr
         if explicit_targeting(ctx) {
             return Err(CliError::new(
                 "--pid drives a process directly; scheme/destination flags don't apply",
-            ));
+            )
+            .kind(ErrorKind::Usage));
         }
         if pid <= 0 {
-            return Err(CliError::new("--pid takes a positive process id"));
+            return Err(CliError::new("--pid takes a positive process id").kind(ErrorKind::Usage));
         }
         if unsafe { libc::kill(pid, 0) } != 0
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
@@ -5245,13 +7162,11 @@ fn resolve_ui_app(ctx: &mut Context, pid: Option<i32>) -> Result<MacShot, CliErr
         });
     }
 
-    if !explicit_targeting(ctx)
-        && let Some(last) = last_launched(ctx)
-    {
+    if let Some(last) = matching_last_launch(ctx, &StageTargetArgs::default()) {
         match last.kind.as_str() {
             "macos" => {
                 if let Some(exe) = mac_executable(&last) {
-                    return mac_shot_for(&exe, &last.bundle_identifier);
+                    return mac_shot_for(ctx, &exe, &last.bundle_identifier);
                 }
             }
             "simulator" | "device" => return Err(ui_not_mac(&last.kind)),
@@ -5272,13 +7187,13 @@ fn resolve_ui_app(ctx: &mut Context, pid: Option<i32>) -> Result<MacShot, CliErr
         keep_sandbox: false,
         hot_entitlements: None,
         launch: &LaunchArgs::default(),
-        passthrough: &[],
+        passthrough: &project_xcodebuild_args(ctx)?,
     };
     let plan = plan(ctx, &opts)?;
     match &plan.target {
         Target::Mac => {
             let app = plan.app_bundle()?;
-            mac_shot_for(&app.executable, &app.bundle_id)
+            mac_shot_for(ctx, &app.executable, &app.bundle_id)
         }
         Target::Simulator(_) => Err(ui_not_mac("simulator")),
         Target::Device(_) => Err(ui_not_mac("device")),
@@ -5293,10 +7208,10 @@ fn resolve_ui_app(ctx: &mut Context, pid: Option<i32>) -> Result<MacShot, CliErr
 /// there instead.
 fn ui_not_mac(kind: &str) -> CliError {
     CliError::new(format!(
-        "`app ui` drives macOS apps through the Accessibility API, which doesn't reach a \
-         {kind}. For a simulator, `app screenshot` captures the screen and `app open-url` \
+        "'app ui' drives macOS apps through the Accessibility API, which doesn't reach a \
+         {kind}. For a simulator, 'app screenshot' captures the screen and 'app open-url' \
          drives it by deep link; scripted taps need a UI test target run through \
-         `sweetpad test`"
+         'sweetpad test'"
     ))
 }
 
@@ -5360,9 +7275,9 @@ fn stream_logs(
     if filters.source == LogChannel::Stdout {
         let Some(path) = console_file else {
             return Err(CliError::new(format!(
-                "no captured output for {} — a detached launch (`app run --detach`, \
-                 `app launch --mac`, or `app run --mac --no-logs`) writes it; a foreground \
-                 `app run --mac` streams stdout inline instead",
+                "no captured output for {} — a detached launch ('app run --detach', \
+                 'app launch --mac', or 'app run --mac --no-logs') writes it; a foreground \
+                 'app run --mac' streams stdout inline instead",
                 app.bundle_id
             )));
         };
@@ -5377,7 +7292,7 @@ fn stream_logs(
     let marker = log_stream_marker();
     let (program, args) = log_command(source, app, level, Some(&marker), filters);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut child = process::spawn_piped(program, &refs, None)?;
+    let mut child = process::spawn_piped_forwarded(program, &refs)?;
     let stream_pid = child.id();
 
     // Both sources can satisfy `--until`, and either one matching ends the
@@ -5414,8 +7329,10 @@ fn stream_logs(
     if let Some(stdout) = child.stdout.take() {
         process::read_lines_lossy(stdout, &mut |line: &str| {
             emit_log_line(line, color, json);
-            if let Some(w) = watch.as_ref() {
-                w.sees(&oslog::render_ndjson_line(line, false).text);
+            if let Some(w) = watch.as_ref()
+                && let Some(rendered) = oslog::render_ndjson_line(line, false)
+            {
+                w.sees(&rendered.text);
             }
         });
     }
@@ -5512,16 +7429,17 @@ fn until_result(
 /// Emit one `log stream` ndjson line: verbatim in json/ndjson mode (it is
 /// already one object per line), or rendered as a colored `HH:MM:SS.sss L [cat]`
 /// line otherwise. Shared by the live follow ([`stream_logs`]) and the backfill
-/// ([`backfill_logs`]).
+/// ([`backfill_logs`]). The log tool's own lines, its banner and the summary
+/// `log show` ends on, are dropped in both forms.
 #[allow(clippy::print_stdout)] // the point of `app logs` is stdout
 fn emit_log_line(line: &str, color: bool, json: bool) {
     if json {
         // Already one JSON object per line; emit the event verbatim.
-        if line.trim_start().starts_with('{') {
+        if line.trim_start().starts_with('{') && !oslog::is_query_summary(line) {
             println!("{line}");
         }
-    } else {
-        println!("{}", oslog::render_ndjson_line(line, color).text);
+    } else if let Some(rendered) = oslog::render_ndjson_line(line, color) {
+        println!("{}", rendered.text);
     }
 }
 
@@ -5578,6 +7496,7 @@ fn follow_console_file(
     // A captured line is its own message, so `--until` matches it directly
     // rather than through the os_log renderer.
     let matched = |buf: &[u8]| watch.is_some_and(|w| w.sees(&String::from_utf8_lossy(buf)));
+    let mut log = CapturedLog::default();
     let mut reader = BufReader::new(file);
     let mut buf: Vec<u8> = Vec::new();
     loop {
@@ -5588,7 +7507,7 @@ fn follow_console_file(
             Ok([]) => {
                 if stop.load(Ordering::Relaxed) {
                     if !buf.is_empty() {
-                        emit_console_line(&buf, color, json);
+                        log.emit(&buf, color, json);
                     }
                     return;
                 }
@@ -5601,8 +7520,7 @@ fn follow_console_file(
         };
         let consumed = if let Some(pos) = available.iter().position(|&b| b == b'\n') {
             buf.extend_from_slice(&available[..=pos]);
-            emit_console_line(&buf, color, json);
-            if matched(&buf) {
+            if log.emit(&buf, color, json) && matched(&buf) {
                 return;
             }
             buf.clear();
@@ -5613,8 +7531,7 @@ fn follow_console_file(
         };
         reader.consume(consumed);
         if buf.len() >= MAX_LINE {
-            emit_console_line(&buf, color, json);
-            if matched(&buf) {
+            if log.emit(&buf, color, json) && matched(&buf) {
                 return;
             }
             buf.clear();
@@ -5661,52 +7578,188 @@ fn backfill_logs(
         && let Some(path) = detached_log_path(&app.bundle_id).filter(|p| p.exists())
         && let Ok(bytes) = std::fs::read(&path)
     {
+        let mut log = CapturedLog::default();
         for line in bytes.split(|&b| b == b'\n') {
             if !line.is_empty() {
-                emit_console_line(line, color, json);
+                log.emit(line, color, json);
             }
         }
     }
     Ok(())
 }
 
+/// How far back `app logs --exits` looks when `--last` is not given.
+const EXITS_WINDOW: &str = "10m";
+
+/// The longest `app logs --exits` waits on its `log show`. An hour of history
+/// takes 2 to 3s, so this bounds a wedged query rather than a slow one.
+const EXITS_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `app logs --exits`: the app's terminations over the window, from every
+/// account there is (see [`exits`]): launchd's exit lines, the crash reports
+/// the system wrote, and, for a macOS app, sweetpad's record of the processes
+/// it spawned for `project`. Each crash carries its report when there is one.
+fn exits_report(
+    ctx: &Context,
+    source: &exits::Source,
+    app: &AppBundle,
+    project: Option<&str>,
+    filters: &LogFilterArgs,
+) -> CommandResult {
+    let window = filters.last.as_deref().unwrap_or(EXITS_WINDOW);
+    let launchd = exits::query(
+        source,
+        &[&app.bundle_id],
+        &exits::Window::Last(window),
+        EXITS_QUERY_TIMEOUT,
+    )
+    .context("reading the app's exits from the unified log")?;
+    let not_before = parse_duration(window)
+        .ok()
+        .and_then(|d| std::time::SystemTime::now().checked_sub(d));
+    let recorded = project.map_or_else(Vec::new, |project| {
+        let since = not_before
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0, |d| d.as_secs_f64());
+        crate::cli::state::ExitLog::load()
+            .for_bundle(project, &app.bundle_id, since)
+            .iter()
+            .filter_map(exits::from_record)
+            .collect()
+    });
+    let reports = exits::crash_reports(source, &[&app.bundle_id], not_before);
+    let exits = exits::merge(launchd, recorded, reports);
+    let destination: &[&str] = match source {
+        exits::Source::Simulator(udid) => &["--on", udid],
+        exits::Source::Mac => &["--mac"],
+    };
+    Ok(Rendered::data(ExitsReport {
+        bundle_id: app.bundle_id.clone(),
+        window: window.to_string(),
+        mac: matches!(source, exits::Source::Mac),
+        exits,
+        diagnose: follow_up(ctx, "app diagnose", destination),
+    }))
+}
+
+/// The result of `app logs --exits`: one line per termination in human mode,
+/// `{bundleId, window, exits}` as JSON.
+struct ExitsReport {
+    bundle_id: String,
+    window: String,
+    mac: bool,
+    exits: Vec<(exits::Exit, Option<std::path::PathBuf>)>,
+    /// The `app diagnose` command an unreported crash points at, for the
+    /// human note; not serialized.
+    diagnose: String,
+}
+
+impl Render for ExitsReport {
+    fn human(&self, out: &Output) {
+        if self.exits.is_empty() {
+            out.note(&format!(
+                "no terminations of {} in the last {}",
+                self.bundle_id, self.window
+            ));
+            if self.mac {
+                out.note(
+                    "a detached launch ('app launch --mac', 'app run --mac --detach') leaves a \
+                     record only when it crashes; a clean exit or an outside kill goes unseen",
+                );
+            }
+            return;
+        }
+        out.note(&format!(
+            "{} termination{} of {} in the last {}",
+            self.exits.len(),
+            if self.exits.len() == 1 { "" } else { "s" },
+            self.bundle_id,
+            self.window
+        ));
+        let mut unreported_crash = false;
+        for (exit, report) in &self.exits {
+            let time = oslog::clock_time(&exit.time).unwrap_or_else(|| exit.time.clone());
+            let pid = exit.pid.map_or_else(|| "?".to_string(), |p| p.to_string());
+            let ran = exit
+                .ran_for_ms
+                .map_or_else(String::new, |ms| format!(", ran {}", ran_for(ms)));
+            out.line(&format!("{time}  pid {pid}  {}{ran}", exit.summary()));
+            if let Some(path) = report {
+                out.line(&format!("    crash report: {}", path.display()));
+            } else if exit.is_crash() {
+                unreported_crash = true;
+            }
+        }
+        if unreported_crash {
+            out.note(&format!(
+                "no crash report found for a crash above ({}); {} runs the app under lldb \
+                 and stops at the fault",
+                exits::REPORT_LIMIT,
+                self.diagnose
+            ));
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let exits: Vec<serde_json::Value> = self
+            .exits
+            .iter()
+            .map(|(exit, report)| exit.json(report.as_deref()))
+            .collect();
+        serde_json::json!({
+            "bundleId": self.bundle_id,
+            "window": self.window,
+            "exits": exits,
+        })
+    }
+}
+
+/// A run time in the unit that reads naturally: `850ms`, `3.8s`, `12m`.
+fn ran_for(ms: u64) -> String {
+    match ms {
+        0..1_000 => format!("{ms}ms"),
+        1_000..60_000 => format!("{:.1}s", Duration::from_millis(ms).as_secs_f64()),
+        _ => format!("{}m", ms / 60_000),
+    }
+}
+
 /// Extract the simulator UDID from a `platform=…,id=<udid>` destination.
 fn udid(destination: &str) -> Result<String, CliError> {
-    destination
-        .split(',')
-        .find_map(|kv| kv.trim().strip_prefix("id="))
-        .map(str::to_string)
-        .ok_or_else(|| {
-            CliError::new(format!(
-                "app commands need a destination with an id= (got {destination:?})"
-            ))
-            .kind(ErrorKind::TargetResolution)
-        })
+    DestinationSpec::parse(destination).id.ok_or_else(|| {
+        CliError::new(format!(
+            "app commands need a destination with an id= (got {destination:?})"
+        ))
+        .kind(ErrorKind::TargetResolution)
+    })
 }
 
 /// The simulator a destination addresses: `id=` names it outright; a `name=`
 /// specifier — the form the config examples use, valid for xcodebuild — is
-/// resolved against `simctl list` (booted preferred, `simctl::find`'s
-/// policy), so `run` accepts every destination `build` does.
+/// resolved against `simctl list` on the destination's platform and `OS=`,
+/// booted preferred (`simctl::find_named`), so `run` installs onto the
+/// simulator `build` built for.
 fn destination_udid(destination: &str) -> Result<String, CliError> {
-    if let Ok(u) = udid(destination) {
-        return Ok(u);
+    let spec = DestinationSpec::parse(destination);
+    if let Some(id) = spec.id {
+        return Ok(id);
     }
-    let Some(name) = destination
-        .split(',')
-        .find_map(|kv| kv.trim().strip_prefix("name="))
-    else {
+    let Some(name) = spec.name.as_deref() else {
         return Err(CliError::new(format!(
             "app commands need a destination with an id= or name= (got {destination:?})"
         ))
         .kind(ErrorKind::TargetResolution));
     };
     let sims = simctl::list()?;
-    simctl::find(&sims, name)
+    sweetpad_core::devices::simctl::find_named(&sims, &spec)
         .map(|s| s.udid.clone())
         .ok_or_else(|| {
+            let os = spec
+                .os
+                .as_deref()
+                .filter(|os| !os.eq_ignore_ascii_case("latest"))
+                .map_or_else(String::new, |os| format!(" on OS {os}"));
             CliError::new(format!(
-                "the destination names the simulator {name:?}, but no such simulator exists"
+                "the destination names the simulator {name:?}{os}, but no such simulator exists"
             ))
             .kind(ErrorKind::TargetResolution)
         })
@@ -5715,6 +7768,7 @@ fn destination_udid(destination: &str) -> Result<String, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::testdir::TempDir;
 
     #[test]
     fn the_pid_is_read_from_simctls_bundle_colon_pid_line() {
@@ -5724,37 +7778,6 @@ mod tests {
         // Never worth failing a launch that already succeeded.
         assert_eq!(launched_pid(""), None);
         assert_eq!(launched_pid("com.example.App: not-a-pid"), None);
-    }
-
-    /// The warning covers what the locator can neither follow nor refuse.
-    /// Warning about the rest reads as "this may not work" over cases that
-    /// either work or fail loudly a few lines later.
-    #[test]
-    fn only_the_relocations_the_locator_misses_are_warned_about() {
-        let argv = |args: &[&str]| args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-
-        // Followed: the resolver takes the same -derivedDataPath the build does.
-        assert!(passthrough_moves_output(&argv(&["-derivedDataPath", "/tmp/dd"])).is_none());
-        // Refused outright by `xcodebuild::passthrough_derived_data`.
-        for relocating in [
-            "SYMROOT=/tmp/s",
-            "OBJROOT=/tmp/o",
-            "CONFIGURATION_BUILD_DIR=/tmp/c",
-        ] {
-            assert!(
-                passthrough_moves_output(&argv(&[relocating])).is_none(),
-                "{relocating}"
-            );
-            assert!(
-                xcodebuild::passthrough_derived_data(&argv(&[relocating])).is_err(),
-                "{relocating}"
-            );
-        }
-        // Neither followed nor refused — the warning's whole remit.
-        assert!(passthrough_moves_output(&argv(&["-xcconfig", "Over.xcconfig"])).is_some());
-        assert!(passthrough_moves_output(&argv(&["TARGET_BUILD_DIR=/tmp/t"])).is_some());
-        // An ordinary flag says nothing about the products dir.
-        assert!(passthrough_moves_output(&argv(&["-allowProvisioningUpdates"])).is_none());
     }
 
     #[test]
@@ -5818,6 +7841,44 @@ mod tests {
         assert!(udid("platform=iOS Simulator,name=iPhone 15").is_err());
     }
 
+    /// A flag a typed '--hot' can't honor is a usage error that says why.
+    #[test]
+    fn a_typed_hot_refuses_what_it_cant_honor() {
+        let typed = refuse_under_hot("--no-logs", "the reason");
+        assert_eq!(typed.error_kind(), ErrorKind::Usage);
+        assert_eq!(
+            typed.to_string(),
+            "--no-logs isn't supported with --hot; the reason"
+        );
+    }
+
+    /// The sweetpad.toml default gives way to '--no-logs', '--detach' and
+    /// '--wait-for-debugger' with a note naming what it yielded to, so the
+    /// agent-facing forms work in a project that turns hot reload on.
+    #[test]
+    fn the_hot_default_yields_to_the_runs_own_flags() {
+        assert_eq!(hot_default_yields_to(false, false, false), None);
+        assert_eq!(
+            hot_default_yields_to(true, false, false).as_deref(),
+            Some(
+                "hot reload off for this run: the '[run] hot = true' default yields to '--no-logs'"
+            )
+        );
+        assert_eq!(
+            hot_default_yields_to(false, true, false).as_deref(),
+            Some(
+                "hot reload off for this run: the '[run] hot = true' default yields to '--detach'"
+            )
+        );
+        assert_eq!(
+            hot_default_yields_to(true, false, true).as_deref(),
+            Some(
+                "hot reload off for this run: the '[run] hot = true' default yields to \
+                 '--no-logs' and '--wait-for-debugger'"
+            )
+        );
+    }
+
     #[test]
     fn a_config_default_turns_hot_on_for_simulators_only() {
         let sim = Target::Simulator("UDID".into());
@@ -5841,6 +7902,49 @@ mod tests {
         assert!(!session_hot(false, true, &sim));
     }
 
+    /// `o` brings a macOS app forward only while it runs, since `open` on a
+    /// stopped bundle launches it outside the session. The plain session and
+    /// the `--hot` one both ask this.
+    #[test]
+    fn o_brings_forward_only_a_mac_app_that_is_still_running() {
+        let ctx = project_ctx(Path::new("/nonexistent/App.xcodeproj"));
+        // Before any launch, and after a rebuild that failed.
+        assert!(!mac_app_still_running(&ctx, None));
+
+        // The kind decides only what an exit records; a simulator one records
+        // nothing, so the test writes no state.
+        let running = |child: std::process::Child| Running {
+            stream: Some(child),
+            kind: RunningKind::Simulator {
+                udid: "UDID".into(),
+                bundle_id: "dev.sweetpad.app".into(),
+            },
+            name: "dev.sweetpad.app".into(),
+            reported_exit: false,
+            reap_slot: None,
+        };
+        let spawn = |program: &str, args: &[&str]| {
+            std::process::Command::new(program)
+                .args(args)
+                .spawn()
+                .unwrap()
+        };
+
+        let mut done = spawn("true", &[]);
+        done.wait().unwrap();
+        let mut exited = running(done);
+        assert!(!mac_app_still_running(&ctx, Some(&mut exited)));
+        assert!(exited.reported_exit, "the exit is reported on the way");
+
+        let mut live = running(spawn("sleep", &["30"]));
+        assert!(mac_app_still_running(&ctx, Some(&mut live)));
+        assert!(!live.reported_exit);
+        crate::cli::signals::unregister_child(live.reap_slot.take());
+        let mut child = live.stream.take().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn bg_boot_is_a_noop_for_non_simulator_targets() {
         // No simulator → no thread is spawned and waiting just succeeds; a second
@@ -5849,6 +7953,82 @@ mod tests {
         let mut boot = BgBoot::start(&Target::Mac);
         assert!(boot.wait().is_ok());
         assert!(boot.wait().is_ok());
+    }
+
+    /// Ctrl-C during a build exits 6 however the session went before it. A
+    /// quit exits 0 once the app has run, and otherwise with the code the
+    /// last build earned.
+    #[test]
+    fn a_session_exits_by_how_it_ended() {
+        let code = |launched, last| {
+            session_result(launched, last)
+                .err()
+                .map(|e| e.error_kind().exit_code())
+        };
+        assert_eq!(code(false, LastBuild::Cancelled), Some(6));
+        assert_eq!(code(true, LastBuild::Cancelled), Some(6));
+        assert_eq!(code(false, LastBuild::Failed), Some(3));
+        assert_eq!(code(false, LastBuild::Succeeded), Some(1));
+        assert_eq!(code(true, LastBuild::Failed), None);
+        assert_eq!(code(true, LastBuild::Succeeded), None);
+    }
+
+    /// A quit whose terminate a wedged simulator never answers exits 1 and
+    /// says the app may still be running, keeping the restart tip. A session
+    /// already failing keeps its own code and reports that stop error ahead
+    /// of it, and a stop that worked changes nothing.
+    #[test]
+    fn a_quit_whose_stop_fails_exits_1_saying_the_app_may_still_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::cli::testdir::TempDir::new("sweetpad-test-quit-stuck");
+        let xcrun = dir.join("xcrun");
+        std::fs::write(&xcrun, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stuck = || {
+            simctl::terminate_within(
+                &xcrun.display().to_string(),
+                "UDID",
+                "dev.app",
+                Duration::from_secs(1),
+            )
+        };
+        let assert_stop_error = |err: &CliError| {
+            assert_eq!(err.error_kind().exit_code(), 1);
+            assert_eq!(
+                err.headline(),
+                Some("couldn't stop dev.app, so it may still be running")
+            );
+            assert_eq!(
+                err.detail(),
+                "terminating the app on the simulator: 'xcrun simctl terminate' didn't finish \
+                 within 1s, so the simulator looks stuck"
+            );
+            assert!(
+                err.tip_text()
+                    .unwrap()
+                    .contains("sweetpad simulator shutdown UDID")
+            );
+        };
+        let unreported = |e: &CliError| panic!("reported {e}, which the result carries");
+
+        let err = quit_result(Ok(()), "dev.app", stuck(), unreported).unwrap_err();
+        assert_stop_error(&err);
+
+        let built = CliError::new("the last build failed").kind(ErrorKind::BuildFailure);
+        let mut reported = false;
+        let err = quit_result(Err(built), "dev.app", stuck(), |e| {
+            assert_stop_error(e);
+            reported = true;
+        })
+        .unwrap_err();
+        assert!(reported, "the stop error goes to the report");
+        assert_eq!(err.error_kind().exit_code(), 3);
+        assert_eq!(err.to_string(), "the last build failed");
+
+        assert!(quit_result(Ok(()), "dev.app", Ok(()), unreported).is_ok());
+        let built = CliError::new("the last build failed").kind(ErrorKind::BuildFailure);
+        let err = quit_result(Err(built), "dev.app", Ok(()), unreported).unwrap_err();
+        assert_eq!(err.error_kind().exit_code(), 3);
     }
 
     #[test]
@@ -5871,6 +8051,24 @@ mod tests {
         // Anything else is ignored — the session keeps streaming output.
         assert_eq!(classify_key('x'), SessionKey::Ignore);
         assert_eq!(classify_key('\n'), SessionKey::Ignore);
+    }
+
+    /// `h` lists `s` and `o` only where they act, and names what `o` brings
+    /// forward: the Simulator window, or the macOS app itself.
+    #[test]
+    fn the_key_list_matches_the_target() {
+        let sim = session_keys(&Target::Simulator("UDID".into()));
+        assert!(sim.contains("s screenshot · o focus simulator"), "{sim}");
+        let mac = session_keys(&Target::Mac);
+        assert!(mac.contains("s screenshot · o focus app"), "{mac}");
+        assert!(!mac.contains("simulator"), "{mac}");
+        let device = session_keys(&Target::Device("UDID".into()));
+        assert!(!device.contains("o focus"), "{device}");
+        assert!(!device.contains("screenshot"), "{device}");
+        for keys in [sim, mac, device] {
+            assert!(keys.starts_with("r rebuild+relaunch"), "{keys}");
+            assert!(keys.ends_with("q quit (terminate the app)"), "{keys}");
+        }
     }
 
     #[test]
@@ -6067,8 +8265,7 @@ mod tests {
 
     #[test]
     fn captured_tail_ends_on_an_until_match_without_waiting_for_stop() {
-        let dir = std::env::temp_dir().join(format!("sweetpad-until-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("sweetpad-until");
         let path = dir.join("captured.log");
         std::fs::write(&path, b"booting\nlistening on 8080\nstill going\n").unwrap();
 
@@ -6082,7 +8279,6 @@ mod tests {
         // test would hang rather than pass if the tail ignored it.
         follow_console_file(&path, false, false, &AtomicBool::new(false), Some(&watch));
         assert!(hit.load(Ordering::Relaxed));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -6123,7 +8319,8 @@ mod tests {
 * frame #0: 0x0001 libobjc.A.dylib`objc_exception_throw\n    \
 frame #1: 0x0002 CoreFoundation`+[NSException raise:format:] + 128\n\
 @@SWEETPAD_END@@\nProcess 67090 exited with status = 9 (0x00000009) killed\n";
-        let o = parse_diagnose(t);
+        let o = parse_diagnose(t, false);
+        assert_eq!(o.pid, Some(67090));
         assert!(o.stopped());
         assert_eq!(o.stop_reason.as_deref(), Some("hit Objective-C exception"));
         assert_eq!(o.exception_name.as_deref(), Some("MyExc"));
@@ -6132,37 +8329,1040 @@ frame #1: 0x0002 CoreFoundation`+[NSException raise:format:] + 128\n\
         assert_eq!(o.exit_status, None); // killed by us, not a real exit
         assert_eq!(o.backtrace.len(), 2);
         assert!(o.backtrace[0].contains("objc_exception_throw"));
+        assert!(o.chain_complete);
     }
 
     #[test]
-    fn parse_clean_exit_transcript() {
-        // No stop reason; the `po` sections carry lldb errors we must drop.
-        let t = "Process 67104 launched: '/tmp/okbin' (arm64)\n\
-Process 67104 exited with status = 0 (0x00000000)\n\
-@@SWEETPAD_EXC@@\n\
-error: unable to evaluate expression while the process is exited\n\
-@@SWEETPAD_REASON@@\n@@SWEETPAD_BT@@\n@@SWEETPAD_END@@\n";
-        let o = parse_diagnose(t);
-        assert!(!o.stopped());
-        assert_eq!(o.exit_status, Some(0));
-        assert_eq!(o.exception_name, None);
-        assert_eq!(o.exception_reason, None);
-        assert!(o.backtrace.is_empty());
+    fn a_run_still_going_names_no_pid_from_the_apps_own_log() {
+        // Captured from a `diagnose --mac` that timed out: lldb had not
+        // returned from `run`, and the app's log lines carry its pid in their
+        // own prefix.
+        let t = "Current executable set to '/dd/App.app/Contents/MacOS/App' (arm64).\n\
+Breakpoint 1: where = libobjc.A.dylib`objc_exception_throw, address = 0x01\n\
+2026-09-26 20:19:01.084636+0200 App[67475:20392328] [Connection] Unable to re-register with \
+Process Instance Registry, error: Error Domain=NSCocoaErrorDomain Code=4097\r\n";
+        assert_eq!(parse_diagnose(t, false).pid, None);
+    }
+
+    /// A real `app diagnose` lldb transcript from `fixtures/diagnose`: the CI
+    /// fixture app, given launch-argument crash hooks, on macOS and on the
+    /// iPhone 17 simulator, and a Swift probe built with `-O`, with the
+    /// machine's paths globbed.
+    fn diagnose_fixture(name: &str) -> String {
+        let path = format!(
+            "{}/fixtures/diagnose/{name}.txt",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
     #[test]
-    fn parse_signal_crash_transcript() {
-        // A plain signal crash (not an ObjC throw): signal set, no exception.
-        let t = "Process 30835 stopped\n\
-* thread #1, queue = 'com.apple.main-thread', stop reason = signal SIGABRT\n\
-@@SWEETPAD_EXC@@\nerror: no Objective-C exception\n\
-@@SWEETPAD_REASON@@\n@@SWEETPAD_BT@@\n  \
-* frame #0: 0x00 libsystem_kernel.dylib`__pthread_kill + 8\n\
-@@SWEETPAD_END@@\n";
-        let o = parse_diagnose(t);
-        assert!(o.stopped());
-        assert_eq!(o.signal.as_deref(), Some("SIGABRT"));
-        assert_eq!(o.exception_name, None); // not an ObjC exception → no $arg1
-        assert_eq!(o.backtrace.len(), 1);
+    fn the_crash_path_runs_as_on_crash_commands() {
+        let on = |flag: &str, args: &[String]| -> Vec<String> {
+            args.windows(2)
+                .filter(|w| w[0] == flag)
+                .map(|w| w[1].clone())
+                .collect()
+        };
+        let tail = [
+            "script print('@@SWEETPAD_BT@@')",
+            "bt",
+            "script print('@@SWEETPAD_END@@')",
+            "process kill",
+            "quit",
+        ];
+        for kind in ["mac", "sim"] {
+            let args = plan_args(kind);
+            // A crash ends the `-o` chain after the start verb, so the
+            // backtrace and the kill it needs are the `-k` commands.
+            assert_eq!(on("-k", &args), tail, "{kind}");
+            // An Objective-C throw is a breakpoint, which the chain goes on
+            // from: the exception, then the same backtrace and kill, each
+            // command that needs a process guarded for a clean exit.
+            let one_line = on("-o", &args);
+            assert_eq!(
+                one_line,
+                [
+                    "breakpoint set -n objc_exception_throw",
+                    if kind == "mac" { "run" } else { "continue" },
+                    "script print('@@SWEETPAD_EXC@@')",
+                    &when_stopped("po (id)[(id)$arg1 name]"),
+                    "script print('@@SWEETPAD_REASON@@')",
+                    &when_stopped("po (id)[(id)$arg1 reason]"),
+                    "script print('@@SWEETPAD_BT@@')",
+                    &when_stopped("bt"),
+                    "script print('@@SWEETPAD_END@@')",
+                    &when_stopped("process kill"),
+                    "quit",
+                ],
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_guarded_command_runs_only_on_a_stopped_process() {
+        assert_eq!(
+            when_stopped("bt"),
+            "script lldb.debugger.HandleCommand(\"bt\") \
+             if lldb.process.GetState() == lldb.eStateStopped else None"
+        );
+    }
+
+    #[test]
+    fn a_crash_reports_the_backtrace_the_on_crash_commands_print() {
+        let cases = [
+            (
+                "mac-segv",
+                false,
+                "EXC_BAD_ACCESS (code=1, address=0x10)",
+                "crashed with SIGSEGV: a bad memory access at 0x10 (EXC_BAD_ACCESS)",
+                "sweetpadCrashHook() at SweetpadCIApp.swift:10:19",
+            ),
+            (
+                "sim-segv",
+                true,
+                "EXC_BAD_ACCESS (code=1, address=0x10)",
+                "crashed with SIGSEGV: a bad memory access at 0x10 (EXC_BAD_ACCESS)",
+                "sweetpadCrashHook() at SweetpadCIApp.swift:10:19",
+            ),
+            (
+                "mac-swift-fatal",
+                false,
+                "Fatal error: diagnose probe",
+                "crashed with SIGTRAP: Swift fatal error \"diagnose probe\"",
+                "_swift_runtime_on_report",
+            ),
+            (
+                "sim-swift-fatal",
+                true,
+                "Fatal error: diagnose probe",
+                "crashed with SIGTRAP: Swift fatal error \"diagnose probe\"",
+                "_swift_runtime_on_report",
+            ),
+            (
+                "mac-swift-trap-optimized",
+                false,
+                "Swift runtime failure: Index out of range",
+                "crashed with SIGTRAP: Swift fatal error \"Index out of range\"",
+                "Swift runtime failure: Index out of range",
+            ),
+        ];
+        for (name, attached, stop, verdict, first_frame) in cases {
+            let t = diagnose_fixture(name);
+            // Nothing after the start verb in the `-o` chain ran.
+            assert!(!t.contains(SENTINEL_EXC), "{name}");
+            let o = parse_diagnose(&t, attached);
+            assert!(o.stopped(), "{name}");
+            assert_eq!(o.stop_reason.as_deref(), Some(stop), "{name}");
+            assert_eq!(o.exit_status, None, "{name}: killed by us, not an exit");
+            assert_eq!(o.exception_name, None, "{name}");
+            assert!(
+                o.backtrace[0].contains(first_frame),
+                "{name}: {:?}",
+                o.backtrace
+            );
+            assert!(
+                o.backtrace.last().unwrap().contains("dyld`start"),
+                "{name}: {:?}",
+                o.backtrace
+            );
+            let json = diagnose_report(o, &t).json();
+            assert_eq!(json["verdict"], verdict, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_simulator_attach_stop_is_not_the_result() {
+        // Attaching to the suspended app stops it with SIGSTOP before the
+        // `continue`, and lldb reports that stop like any other.
+        let t = diagnose_fixture("sim-segv");
+        assert!(t.starts_with("Process 42569 stopped\n* thread #1, stop reason = signal SIGSTOP"));
+        let o = parse_diagnose(&t, true);
+        assert_eq!(o.pid, Some(42569));
+        assert_eq!(o.signal.as_deref(), Some("SIGSEGV"));
+
+        // A launch lldb owns has no attach stop to skip.
+        let o = parse_diagnose(&t, false);
+        assert_eq!(o.stop_reason.as_deref(), Some("signal SIGSTOP"));
+    }
+
+    #[test]
+    fn a_clean_exit_skips_the_commands_that_need_a_process() {
+        // After a clean exit the guarded commands do nothing, so the chain
+        // runs to its end with only the sentinels and no lldb error.
+        for (name, attached, pid) in [
+            ("mac-clean-exit", false, 70991),
+            ("sim-clean-exit", true, 71718),
+        ] {
+            let t = diagnose_fixture(name);
+            assert!(t.contains(SENTINEL_END), "{name}");
+            assert!(!t.contains("error:"), "{name}");
+            let o = parse_diagnose(&t, attached);
+            assert_eq!(o.pid, Some(pid), "{name}");
+            assert!(!o.stopped(), "{name}");
+            assert_eq!(o.exit_status, Some(0), "{name}");
+            assert_eq!(o.exception_name, None, "{name}");
+            assert!(o.backtrace.is_empty(), "{name}");
+            assert_eq!(
+                diagnose_report(o, &t).verdict(),
+                "exited cleanly (status 0) — no exception or crash observed",
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timed_out_run_reports_no_stop() {
+        // lldb is killed while `run` or `continue` still blocks: the
+        // transcript ends before any stop of the app's own.
+        for (name, attached, pid) in [
+            ("mac-timeout", false, None),
+            ("sim-timeout", true, Some(42942)),
+        ] {
+            let t = diagnose_fixture(name);
+            let o = parse_diagnose(&t, attached);
+            assert_eq!(o.pid, pid, "{name}");
+            assert!(!o.stopped(), "{name}");
+            assert_eq!(o.signal, None, "{name}");
+            assert_eq!(o.exit_status, None, "{name}");
+            let report = DiagnoseReport {
+                timed_out: true,
+                lldb_status: None,
+                ..diagnose_report(o, &t)
+            };
+            let json = report.json();
+            assert_eq!(json["stopped"], false, "{name}");
+            assert_eq!(
+                json["verdict"],
+                "no exception or crash within 30s — the app was still running and has been killed",
+                "{name}"
+            );
+        }
+    }
+
+    /// The head of a transcript `app diagnose`'s lldb chain printed for a C
+    /// program on arm64 that stops with `stop_line`, captured verbatim but
+    /// for the program's path.
+    fn mach_stop_transcript(stop_line: &str) -> String {
+        format!(
+            "Current executable set to '/tmp/crash' (arm64).\n\
+Breakpoint 1: no locations (pending).\n\
+WARNING:  Unable to resolve breakpoint to any actual locations.\n\
+1 location added to breakpoint 1\n\
+Process 43073 launched: '/tmp/crash' (arm64)\n\
+Process 43073 stopped\n\
+* thread #1, queue = 'com.apple.main-thread', stop reason = {stop_line}\n      \
+frame #0: 0x00000001000004d0 crash`main(argc=2, argv=0x000000016fdfea20) at crash.c:11:56\n\
+Target 0: (crash) stopped.\n"
+        )
+    }
+
+    fn diagnose_report(outcome: DiagnoseOutcome, transcript: &str) -> DiagnoseReport {
+        DiagnoseReport {
+            target: "macos",
+            bundle_id: "com.example.App".into(),
+            pid: outcome.pid,
+            timed_out: false,
+            timeout_secs: 30,
+            lldb_status: Some(0),
+            outcome,
+            transcript: transcript.into(),
+        }
+    }
+
+    /// lldb's exit code and whether its chain reached the closing sentinel
+    /// are in the JSON beside the transcript. A crash, an Objective-C throw
+    /// and a clean exit all run the chain to its end; a timeout kills lldb
+    /// first, and a failed attach ends the chain before it starts, which the
+    /// verdict says instead of "no stop observed".
+    #[test]
+    fn the_report_says_whether_lldbs_chain_ran_to_its_end() {
+        for name in [
+            "mac-segv",
+            "sim-segv",
+            "mac-swift-fatal",
+            "sim-swift-fatal",
+            "mac-swift-trap-optimized",
+            "mac-clean-exit",
+            "sim-clean-exit",
+        ] {
+            let t = diagnose_fixture(name);
+            let json = diagnose_report(parse_diagnose(&t, name.starts_with("sim")), &t).json();
+            assert_eq!(json["chainComplete"], true, "{name}");
+            assert_eq!(json["lldbStatus"], 0, "{name}");
+        }
+
+        for name in ["mac-timeout", "sim-timeout"] {
+            let t = diagnose_fixture(name);
+            let report = DiagnoseReport {
+                timed_out: true,
+                lldb_status: None,
+                ..diagnose_report(parse_diagnose(&t, name.starts_with("sim")), &t)
+            };
+            let json = report.json();
+            assert_eq!(json["chainComplete"], false, "{name}");
+            assert_eq!(json["lldbStatus"], serde_json::Value::Null, "{name}");
+        }
+
+        // Captured from the simulator chain attaching to a pid that had gone.
+        let t = diagnose_fixture("sim-attach-failed");
+        let report = DiagnoseReport {
+            lldb_status: Some(1),
+            ..diagnose_report(parse_diagnose(&t, true), &t)
+        };
+        let json = report.json();
+        assert_eq!(json["chainComplete"], false);
+        assert_eq!(json["lldbStatus"], 1);
+        assert_eq!(json["stopped"], false);
+        assert_eq!(
+            json["verdict"],
+            "lldb stopped partway with status 1: attach failed: no such process"
+        );
+
+        // A chain that stopped with no error line still says so.
+        let report = DiagnoseReport {
+            lldb_status: Some(1),
+            ..diagnose_report(parse_diagnose("", true), "")
+        };
+        assert_eq!(report.verdict(), "lldb stopped partway with status 1");
+    }
+
+    /// lldb reports a crash on Apple platforms as the Mach exception, before
+    /// the kernel turns it into a signal, so the stop reads `EXC_BAD_ACCESS
+    /// (code=1, address=0x10)` rather than `signal SIGSEGV`. The report names
+    /// the signal the app dies of and says what happened in words, and the
+    /// raw stop reason stays beside them.
+    #[test]
+    fn a_mach_exception_stop_reads_as_its_signal() {
+        // Captured with `*(volatile int *)0x10 = 1`, a write to read-only
+        // memory, `__builtin_trap()`, and `.inst 0x00000000`.
+        let cases = [
+            (
+                "EXC_BAD_ACCESS (code=1, address=0x10)",
+                "SIGSEGV",
+                "crashed with SIGSEGV: a bad memory access at 0x10 (EXC_BAD_ACCESS)",
+            ),
+            (
+                "EXC_BAD_ACCESS (code=2, address=0x10001c000)",
+                "SIGBUS",
+                "crashed with SIGBUS: a bad memory access at 0x10001c000 (EXC_BAD_ACCESS)",
+            ),
+            (
+                "EXC_BREAKPOINT (code=1, subcode=0x100000538)",
+                "SIGTRAP",
+                "crashed with SIGTRAP: a trap instruction, the way a failed Swift check or \
+                 fatalError stops the app (EXC_BREAKPOINT)",
+            ),
+            (
+                "EXC_BAD_INSTRUCTION (code=1, subcode=0x0)",
+                "SIGILL",
+                "crashed with SIGILL: an illegal instruction (EXC_BAD_INSTRUCTION)",
+            ),
+        ];
+        for (stop, signal, verdict) in cases {
+            let t = mach_stop_transcript(stop);
+            let o = parse_diagnose(&t, false);
+            assert_eq!(o.pid, Some(43073), "{stop}");
+            assert!(o.stopped(), "{stop}");
+            assert_eq!(o.stop_reason.as_deref(), Some(stop));
+            assert_eq!(o.signal.as_deref(), Some(signal), "{stop}");
+            assert_eq!(o.exception_name, None, "{stop}");
+            let json = diagnose_report(o, &t).json();
+            assert_eq!(json["signal"], signal, "{stop}");
+            assert_eq!(json["verdict"], verdict, "{stop}");
+            assert_eq!(json["stopReason"], stop, "{stop}");
+            assert_eq!(json["transcript"], t.as_str(), "{stop}");
+        }
+
+        // Intel names its codes: a general protection fault is SIGSEGV, and
+        // a divide error is SIGFPE.
+        let gp = mach_fault("EXC_BAD_ACCESS (code=EXC_I386_GPFLT)").unwrap();
+        assert_eq!(gp.signal, Some("SIGSEGV"));
+        assert_eq!(gp.what, "a bad memory access");
+        let div = mach_fault("EXC_ARITHMETIC (code=EXC_I386_DIV, subcode=0x0)").unwrap();
+        assert_eq!(div.signal, Some("SIGFPE"));
+
+        // A signal lldb stopped on is not a Mach exception, and an exception
+        // with no settled reading keeps its raw text as the verdict.
+        assert_eq!(mach_fault("signal SIGABRT"), None);
+        assert_eq!(mach_fault("hit Objective-C exception"), None);
+        let t = mach_stop_transcript("EXC_GUARD (code=0x1, subcode=0x2)");
+        let o = parse_diagnose(&t, false);
+        assert_eq!(o.signal, None);
+        assert_eq!(
+            diagnose_report(o, &t).verdict(),
+            "EXC_GUARD (code=0x1, subcode=0x2)"
+        );
+    }
+
+    // `codesign -d --entitlements - --xml` on a `project new --platform macos`
+    // build as scaffolded, with the App Sandbox turned on, and re-signed with
+    // an App Group.
+    const STOCK_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.get-task-allow</key><true/></dict></plist>"#;
+    const SANDBOXED_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.app-sandbox</key><true/><key>com.apple.security.get-task-allow</key><true/></dict></plist>"#;
+    const GROUP_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.security.app-sandbox</key><true/><key>com.apple.security.application-groups</key><array><string>group.com.example.ContainerProbe.shared</string></array></dict></plist>"#;
+
+    #[test]
+    fn entitlements_read_the_sandbox_and_app_groups_codesign_reports() {
+        assert_eq!(
+            parse_entitlements(STOCK_ENTITLEMENTS),
+            MacEntitlements::default()
+        );
+        assert_eq!(
+            parse_entitlements(SANDBOXED_ENTITLEMENTS),
+            MacEntitlements {
+                sandboxed: true,
+                groups: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parse_entitlements(GROUP_ENTITLEMENTS),
+            MacEntitlements {
+                sandboxed: true,
+                groups: vec!["group.com.example.ContainerProbe.shared".to_string()],
+            }
+        );
+        // An unsigned product prints nothing, and '<false/>' grants nothing.
+        assert_eq!(parse_entitlements(""), MacEntitlements::default());
+        assert!(
+            !parse_entitlements(
+                "<plist><dict><key>com.apple.security.app-sandbox</key><false/></dict></plist>"
+            )
+            .sandboxed
+        );
+    }
+
+    #[test]
+    fn a_sandboxed_mac_apps_data_container_is_under_library_containers() {
+        let sandboxed = parse_entitlements(SANDBOXED_ENTITLEMENTS);
+        assert_eq!(
+            mac_data_container(Path::new("/Users/someone"), "com.example.App", &sandboxed).unwrap(),
+            Path::new("/Users/someone/Library/Containers/com.example.App/Data")
+        );
+    }
+
+    #[test]
+    fn an_unsandboxed_mac_app_has_no_data_container() {
+        let err = mac_data_container(
+            Path::new("/Users/someone"),
+            "com.example.App",
+            &parse_entitlements(STOCK_ENTITLEMENTS),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("com.example.App isn't sandboxed"), "{err}");
+        assert!(err.contains("com.apple.security.app-sandbox"), "{err}");
+        // No guess at where an unsandboxed app might keep its files.
+        assert!(!err.contains("Application Support"), "{err}");
+    }
+
+    #[test]
+    fn mac_app_groups_map_to_group_containers_without_needing_the_sandbox() {
+        let entitlements = MacEntitlements {
+            sandboxed: false,
+            groups: vec![
+                "group.com.example.shared".to_string(),
+                "ABCDE12345.com.example.team".to_string(),
+            ],
+        };
+        assert_eq!(
+            mac_group_containers(Path::new("/Users/someone"), &entitlements),
+            vec![
+                (
+                    "group.com.example.shared".to_string(),
+                    "/Users/someone/Library/Group Containers/group.com.example.shared".to_string()
+                ),
+                (
+                    "ABCDE12345.com.example.team".to_string(),
+                    "/Users/someone/Library/Group Containers/ABCDE12345.com.example.team"
+                        .to_string()
+                ),
+            ]
+        );
+        assert!(
+            mac_group_containers(Path::new("/Users/someone"), &MacEntitlements::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_device_container_error_names_the_devicectl_copy() {
+        let err = device_container_error(Some("00008110-000A1B2C3D4E5F60"), "com.example.App")
+            .to_string();
+        assert!(err.contains("aren't on this Mac"), "{err}");
+        assert!(err.contains("xcrun devicectl device copy to"), "{err}");
+        assert!(err.contains("--device 00008110-000A1B2C3D4E5F60"), "{err}");
+        assert!(err.contains("--domain-identifier com.example.App"), "{err}");
+        // Backticks render literally in a terminal.
+        assert!(!err.contains('`'), "{err}");
+    }
+
+    #[test]
+    fn container_json_carries_the_path_or_the_groups() {
+        let data = ContainerReport {
+            kind: ContainerKind::Data,
+            bundle_id: "dev.sweetpad.ci.app".to_string(),
+            destination: "platform=iOS Simulator,id=AAAA".to_string(),
+            found: ContainerPaths::One("/sim/Data/Application/1234".to_string()),
+        };
+        assert_eq!(
+            data.json(),
+            serde_json::json!({
+                "path": "/sim/Data/Application/1234",
+                "kind": "data",
+                "bundleId": "dev.sweetpad.ci.app",
+                "destination": "platform=iOS Simulator,id=AAAA",
+            })
+        );
+
+        let groups = ContainerReport {
+            kind: ContainerKind::Groups,
+            bundle_id: "dev.sweetpad.ci.app".to_string(),
+            destination: "platform=iOS Simulator,id=AAAA".to_string(),
+            found: ContainerPaths::Groups(vec![(
+                "group.dev.sweetpad.ci.shared".to_string(),
+                "/sim/Shared/AppGroup/5678".to_string(),
+            )]),
+        };
+        assert_eq!(
+            groups.json(),
+            serde_json::json!({
+                "groups": [{ "id": "group.dev.sweetpad.ci.shared", "path": "/sim/Shared/AppGroup/5678" }],
+                "kind": "groups",
+                "bundleId": "dev.sweetpad.ci.app",
+                "destination": "platform=iOS Simulator,id=AAAA",
+            })
+        );
+    }
+
+    /// A context aimed at `project` by `--project`, with no config and no
+    /// recorded state, so every verb falls through to the resolved build target.
+    fn project_ctx(project: &Path) -> Context {
+        let global = crate::cli::GlobalArgs {
+            remote: None,
+            chdir: None,
+            developer_dir: None,
+            output: None,
+            json: false,
+            non_interactive: true,
+            no_color: true,
+            verbose: false,
+            quiet: false,
+            gh_annotations: false,
+        };
+        let out = Output::new(&global);
+        Context {
+            global,
+            targeting: crate::cli::Targeting {
+                project: Some(project.to_path_buf()),
+                ..crate::cli::Targeting::default()
+            },
+            config: crate::cli::config::Config::default(),
+            state: crate::cli::state::State::default(),
+            out,
+            project_toml: std::cell::OnceCell::new(),
+            root_toml: std::cell::OnceCell::new(),
+            stale_checked: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The verbs that find an already-built product read the project's
+    /// `[xcodebuild] args` before they plan, as `build` does. A file `build`
+    /// refuses is refused here too, rather than these verbs quietly looking in
+    /// the default DerivedData for a product the build would put elsewhere.
+    #[test]
+    fn the_verbs_that_find_a_built_product_read_the_projects_xcodebuild_args() {
+        let dir = TempDir::new("sweetpad-app-configured");
+        let project = dir.join("App.xcodeproj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            dir.join("sweetpad.toml"),
+            "[xcodebuild]\nargs = [\"-derivedDataPath\", \"dd\"]\n",
+        )
+        .unwrap();
+
+        let refused = |verb: &str, err: Option<CliError>| {
+            let err = err.unwrap_or_else(|| panic!("{verb} planned past a refused sweetpad.toml"));
+            assert!(
+                err.to_string()
+                    .contains("sweetpad.toml: '-derivedDataPath' in [xcodebuild] args"),
+                "{verb}: {err}"
+            );
+        };
+        let stage = StageTargetArgs::default();
+        let launch = LaunchArgs::default();
+        for (verb, kind) in [
+            ("launch", Stage::Launch),
+            ("uninstall", Stage::Uninstall),
+            ("stop", Stage::Stop),
+        ] {
+            let result = simple(&mut project_ctx(&project), kind, &launch, &stage, &[]);
+            refused(verb, result.err());
+        }
+        let result = simple_logs(
+            &mut project_ctx(&project),
+            &stage,
+            &LogFilterArgs::default(),
+        );
+        refused("logs", result.err());
+        let result = container(&mut project_ctx(&project), &stage, ContainerKind::Data);
+        refused("container", result.err());
+        let result = screenshot(
+            &mut project_ctx(&project),
+            &ScreenshotArgs {
+                target: crate::cli::BuildTargetArgs::default(),
+                output_file: None,
+                window: None,
+                pid: None,
+                clipboard: false,
+            },
+        );
+        refused("screenshot", result.err());
+        let result = sample(
+            &mut project_ctx(&project),
+            &SampleArgs {
+                target: crate::cli::BuildTargetArgs::default(),
+                seconds: 3,
+                output_file: None,
+                pid: None,
+            },
+        );
+        refused("sample", result.err());
+        let result = resolve_ui_app(&mut project_ctx(&project), None);
+        refused("ui", result.err());
+    }
+
+    /// Targeting flags that name the recorded launch keep it: after 'app
+    /// launch --mac --derived-data-path dd', 'app ui click --scheme AppMac
+    /// --on mac' has to find the app that launch started, which a fresh resolve
+    /// would look for in the default DerivedData. Flags that name anything
+    /// else yield to the resolve.
+    #[test]
+    fn targeting_flags_that_agree_with_the_recorded_launch_keep_it() {
+        let dir = TempDir::new("sweetpad-app-record");
+        let project = dir.join("App.xcodeproj");
+        std::fs::create_dir_all(&project).unwrap();
+        let mac = LastLaunchedApp {
+            kind: "macos".into(),
+            app_path: "/work/dd/Build/Products/Debug/AppMac.app".into(),
+            bundle_identifier: "com.example.mac".into(),
+            executable_name: Some("AppMac".into()),
+            scheme: Some("AppMac".into()),
+            configuration: Some("Debug".into()),
+            destination: Some("platform=macOS".into()),
+            ..LastLaunchedApp::default()
+        };
+        let sim = LastLaunchedApp {
+            kind: "simulator".into(),
+            app_path: "/dd/App.app".into(),
+            bundle_identifier: "com.example.app".into(),
+            simulator_udid: Some("AAAA-1111".into()),
+            scheme: Some("App".into()),
+            configuration: Some("Debug".into()),
+            destination: Some("platform=iOS Simulator,id=AAAA-1111".into()),
+            ..LastLaunchedApp::default()
+        };
+        let matches = |record: &LastLaunchedApp,
+                       targeting: crate::cli::Targeting,
+                       stage: &StageTargetArgs| {
+            let mut ctx = project_ctx(&project);
+            let key = resolve::container(&ctx).unwrap().key();
+            ctx.state.project_mut(&key).last_launched_app = Some(record.clone());
+            ctx.targeting = crate::cli::Targeting {
+                project: Some(project.clone()),
+                ..targeting
+            };
+            matching_last_launch(&ctx, stage).is_some()
+        };
+        let flags = |scheme: Option<&str>, on: Option<&str>| crate::cli::Targeting {
+            scheme: scheme.map(str::to_string),
+            on: on.map(str::to_string),
+            ..crate::cli::Targeting::default()
+        };
+        let none = StageTargetArgs::default();
+        let mac_flag = StageTargetArgs {
+            mac: true,
+            ..StageTargetArgs::default()
+        };
+
+        // No flags, and flags that name the recorded launch, keep it.
+        assert!(matches(&mac, flags(None, None), &none));
+        assert!(matches(&mac, flags(Some("AppMac"), Some("mac")), &none));
+        assert!(matches(&mac, flags(Some("AppMac"), None), &mac_flag));
+        assert!(matches(
+            &mac,
+            crate::cli::Targeting {
+                configuration: Some("Debug".into()),
+                destination: Some("platform=macOS".into()),
+                ..crate::cli::Targeting::default()
+            },
+            &none
+        ));
+        // A simulator named by its UDID needs no simulator list.
+        assert!(matches(&sim, flags(Some("App"), Some("aaaa-1111")), &none));
+
+        // Another scheme, configuration, or kind of destination is another app.
+        assert!(!matches(&mac, flags(Some("Other"), Some("mac")), &none));
+        assert!(!matches(
+            &mac,
+            crate::cli::Targeting {
+                configuration: Some("Release".into()),
+                ..crate::cli::Targeting::default()
+            },
+            &none
+        ));
+        assert!(!matches(&sim, flags(None, Some("mac")), &none));
+        assert!(!matches(&sim, flags(None, None), &mac_flag));
+        assert!(!matches(
+            &mac,
+            flags(None, None),
+            &StageTargetArgs {
+                device: true,
+                ..StageTargetArgs::default()
+            }
+        ));
+        // A record kept before the scheme was can't answer a typed one.
+        let unscoped = LastLaunchedApp {
+            scheme: None,
+            ..mac.clone()
+        };
+        assert!(matches(&unscoped, flags(None, Some("mac")), &none));
+        assert!(!matches(
+            &unscoped,
+            flags(Some("AppMac"), Some("mac")),
+            &none
+        ));
+    }
+
+    /// A hint's command carries the project and target flags that found the
+    /// app, so running it as printed reaches the same one. The destination is
+    /// the hint's own, and a value the shell would split is quoted without
+    /// closing the single quotes around the whole command.
+    #[test]
+    fn a_follow_up_command_carries_the_flags_that_found_the_app() {
+        let mut ctx = project_ctx(Path::new("ios/App.xcodeproj"));
+        assert_eq!(
+            follow_up(&ctx, "app install", &["--on", "AAAA-1111"]),
+            "'sweetpad app install --project ios/App.xcodeproj --on AAAA-1111'"
+        );
+
+        ctx.global.chdir = Some("My Apps".into());
+        ctx.targeting.scheme = Some("My App".into());
+        ctx.targeting.configuration = Some("Release".into());
+        ctx.targeting.sdk = Some("iphonesimulator".into());
+        ctx.targeting.on = Some("iPhone 17".into());
+        ctx.targeting.destination = Some("platform=iOS Simulator,name=iPhone 17".into());
+        assert_eq!(
+            follow_up(&ctx, "build", &["--on", "mac"]),
+            "'sweetpad -C \"My Apps\" build --project ios/App.xcodeproj --scheme \"My App\" \
+             --configuration Release --sdk iphonesimulator --on mac'"
+        );
+        // A verb that reads the last run back takes the project, which picks
+        // the result bundle, and refuses the rest.
+        assert_eq!(
+            read_back_follow_up(&ctx, "test attachments", &["--only-testing", "T/C/t(n:)"]),
+            "'sweetpad -C \"My Apps\" test attachments --project ios/App.xcodeproj \
+             --only-testing \"T/C/t(n:)\"'"
+        );
+
+        ctx.targeting = crate::cli::Targeting::default();
+        ctx.global.chdir = None;
+        assert_eq!(
+            follow_up(&ctx, "app diagnose", &["--mac"]),
+            "'sweetpad app diagnose --mac'"
+        );
+        assert_eq!(hint_quote("a\"b$c"), "\"a\\\"b\\$c\"");
+        assert_eq!(hint_quote(""), "\"\"");
+    }
+
+    /// `app ui`'s re-run hint names the app the failing verb drove: the pid it
+    /// was given, else the project, target and destination flags.
+    #[test]
+    fn a_ui_rerun_hint_keeps_the_pid_and_the_targeting_flags() {
+        let mut ctx = project_ctx(Path::new("App.xcodeproj"));
+        assert_eq!(
+            ui_tree_command(&ctx, Some(4242)),
+            "'sweetpad app ui tree --project App.xcodeproj --pid 4242'"
+        );
+        ctx.targeting.scheme = Some("AppMac".into());
+        ctx.targeting.on = Some("mac".into());
+        assert_eq!(
+            ui_tree_command(&ctx, None),
+            "'sweetpad app ui tree --project App.xcodeproj --scheme AppMac --on mac'"
+        );
+        ctx.targeting.on = None;
+        ctx.targeting.destination = Some("platform=macOS".into());
+        assert_eq!(
+            ui_tree_command(&ctx, None),
+            "'sweetpad app ui tree --project App.xcodeproj --scheme AppMac --destination \
+             platform=macOS'"
+        );
+    }
+
+    /// AppKit's note opens the message after the log prefix; the same words
+    /// anywhere else in a line are the app's.
+    #[test]
+    fn the_persistence_note_is_recognized_by_its_opening() {
+        assert!(is_persistence_note(
+            "2026-09-27 00:01:39.396 SweetpadCIMac[34229:21532494] ApplePersistenceIgnoreState: \
+             Existing state will not be touched. New state will be written to \
+             /var/folders/wq/T/dev.sweetpad.ci.mac.savedState"
+        ));
+        assert!(is_persistence_note(
+            "ApplePersistenceIgnoreState: Existing state will not be touched."
+        ));
+        assert!(!is_persistence_note(
+            "2026-09-27 00:01:39.396 App[1:2] saw 'ApplePersistenceIgnoreState: Existing \
+             state will not be touched' in the log"
+        ));
+        assert!(!is_persistence_note("hello from print()"));
+    }
+
+    /// The injection client's line when the hot session's server closes,
+    /// captured from 'run --hot --mac' then 'q'. Only a read that got
+    /// nothing is the connection ending.
+    #[test]
+    fn the_injection_clients_disconnect_line_is_sweetpads() {
+        let quit = "2026-09-27 02:01:17.509 SweetpadB6RunMac[31397:22121620] [<InjectionNext: \
+                    0x103323380> readInt:0x16d50dd94 length:4] error: 0 Operation not supported";
+        assert!(is_injection_disconnect(quit));
+        let own = OwnLines {
+            injection_disconnect: true,
+            ..OwnLines::default()
+        };
+        assert!(own.covers(quit));
+        assert!(!OwnLines::default().covers(quit));
+
+        assert!(!is_injection_disconnect(
+            "2026-09-27 02:01:17.509 App[1:2] [<InjectionNext: 0x1> readInt:0x2 length:4] \
+             error: 2 Operation not supported"
+        ));
+        assert!(!is_injection_disconnect(
+            "2026-09-27 02:01:13.084 App[1:2] 🔥 Connecting to INJECTION_HOST setting 127.0.0.1"
+        ));
+        assert!(!is_injection_disconnect("hello from print()"));
+    }
+
+    /// A detached launch's header names the arguments the caller gave, and
+    /// in a clause of its own the pair sweetpad added.
+    #[test]
+    fn a_captured_files_header_says_who_added_the_persistence_key() {
+        let argv = |args: &[&str]| args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            launch_header(
+                "App",
+                "12:00:00.000",
+                &argv(&["-ApplePersistenceIgnoreState", "YES", "--flag"]),
+                true
+            ),
+            "=== sweetpad launched App at 12:00:00.000 · args: --flag · sweetpad added: \
+             -ApplePersistenceIgnoreState YES ==="
+        );
+        assert_eq!(
+            launch_header(
+                "App",
+                "12:00:00.000",
+                &argv(&["-ApplePersistenceIgnoreState", "YES"]),
+                true
+            ),
+            "=== sweetpad launched App at 12:00:00.000 · sweetpad added: \
+             -ApplePersistenceIgnoreState YES ==="
+        );
+        assert_eq!(
+            launch_header(
+                "App",
+                "12:00:00.000",
+                &argv(&["-ApplePersistenceIgnoreState", "YES"]),
+                false
+            ),
+            "=== sweetpad launched App at 12:00:00.000 · args: -ApplePersistenceIgnoreState YES ==="
+        );
+        assert_eq!(
+            launch_header("App", "12:00:00.000", &[], false),
+            "=== sweetpad launched App at 12:00:00.000 ==="
+        );
+    }
+
+    /// Reading a captured file back: the header is a separator, not one of
+    /// the app's lines, and AppKit's note goes only when the header says
+    /// sweetpad added the key.
+    #[test]
+    fn a_captured_file_reads_its_header_as_a_separator() {
+        let note = "2026-09-27 00:01:39.396 App[1:2] ApplePersistenceIgnoreState: Existing state \
+                    will not be touched. New state will be written to /tmp/x.savedState";
+        let ours = launch_header(
+            "App",
+            "12:00:00.000",
+            &IGNORE_PERSISTENCE.map(String::from),
+            true,
+        );
+        let mut log = CapturedLog::default();
+        assert_eq!(
+            log.read(&ours),
+            CapturedLine::Header(
+                "── sweetpad launched App at 12:00:00.000 · sweetpad added: \
+                 -ApplePersistenceIgnoreState YES ──"
+                    .into()
+            )
+        );
+        assert_eq!(log.read(note), CapturedLine::Own);
+        assert_eq!(log.read("hello from print()"), CapturedLine::App);
+
+        let theirs = launch_header(
+            "App",
+            "12:00:00.000",
+            &IGNORE_PERSISTENCE.map(String::from),
+            false,
+        );
+        let mut log = CapturedLog::default();
+        assert!(matches!(log.read(&theirs), CapturedLine::Header(_)));
+        assert_eq!(log.read(note), CapturedLine::App);
+
+        // A file written before the header named sweetpad's clause.
+        let mut log = CapturedLog::default();
+        assert_eq!(
+            log.read("=== sweetpad launched App at 12:00:00.000 — args: -ApplePersistenceIgnoreState YES ==="),
+            CapturedLine::Header(
+                "── sweetpad launched App at 12:00:00.000 — args: -ApplePersistenceIgnoreState YES ──"
+                    .into()
+            )
+        );
+        assert_eq!(log.read(note), CapturedLine::App);
+    }
+
+    /// An '--until' for the app's name matches the app's lines, not the
+    /// header that names it.
+    #[test]
+    fn until_skips_the_captured_files_header() {
+        let dir = crate::cli::testdir::TempDir::new("sweetpad-captured-header");
+        let path = dir.join("captured.log");
+        let header = launch_header("MyApp", "12:00:00.000", &[], false);
+        for (body, sees) in [
+            (format!("{header}\n"), false),
+            (format!("{header}\nMyApp is ready\n"), true),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let hit = Arc::new(AtomicBool::new(false));
+            let watch = UntilWatch {
+                text: "MyApp".to_string(),
+                hit: Arc::clone(&hit),
+                stream_pid: None,
+            };
+            // `stop` is already raised, so the tail reads to the end and returns.
+            follow_console_file(&path, false, false, &AtomicBool::new(true), Some(&watch));
+            assert_eq!(hit.load(Ordering::Relaxed), sees);
+        }
+    }
+
+    /// A macOS launch skips AppKit's window restoration unless asked not to,
+    /// and never sets the key twice or over a value someone else chose.
+    #[test]
+    fn a_mac_launch_ignores_persistent_state_unless_told_otherwise() {
+        let argv = |args: &[&str]| args.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            mac_launch_args(&argv(&["-MyFlag", "YES"]), false),
+            ["-ApplePersistenceIgnoreState", "YES", "-MyFlag", "YES"]
+        );
+        assert_eq!(
+            mac_launch_args(&[], false),
+            ["-ApplePersistenceIgnoreState", "YES"]
+        );
+        // '--restore-state' leaves the app to its own behavior.
+        assert_eq!(
+            mac_launch_args(&argv(&["-MyFlag", "YES"]), true),
+            ["-MyFlag", "YES"]
+        );
+        // A value the scheme or the caller chose wins, whatever it is.
+        let own = argv(&["-MyFlag", "YES", "-ApplePersistenceIgnoreState", "NO"]);
+        assert_eq!(mac_launch_args(&own, false), own);
+    }
+
+    /// The scheme's launch rows go ahead of what this run typed, so a typed
+    /// '--arg' comes last and a typed '--env' replaces the scheme's value.
+    #[test]
+    fn scheme_launch_settings_go_ahead_of_the_typed_ones() {
+        let mut launch = LaunchArgs {
+            args: vec!["-Typed".into(), "1".into()],
+            env: vec!["SHARED=typed".into(), "OWN=1".into()],
+            ..LaunchArgs::default()
+        };
+        merge_scheme_launch(
+            &mut launch,
+            sweetpad_lib::scheme::LaunchSettings {
+                args: vec!["-Scheme".into(), "a b".into()],
+                env: vec![
+                    ("SHARED".into(), "scheme".into()),
+                    ("URL".into(), "a=b".into()),
+                ],
+            },
+        );
+        assert_eq!(launch.args, ["-Scheme", "a b", "-Typed", "1"]);
+        let env = launch.env_pairs("SIMCTL_CHILD_").unwrap();
+        let resolved: std::collections::HashMap<_, _> = env.iter().cloned().collect();
+        assert_eq!(resolved["SIMCTL_CHILD_SHARED"], "typed");
+        assert_eq!(resolved["SIMCTL_CHILD_URL"], "a=b");
+        assert_eq!(resolved["SIMCTL_CHILD_OWN"], "1");
+    }
+
+    /// Every launch leaves the app's stdout unbuffered, as Xcode's do, unless
+    /// the scheme or an '--env' says otherwise.
+    #[test]
+    fn launches_leave_stdout_unbuffered_unless_told_otherwise() {
+        let resolved = |env: &[&str]| {
+            let mut launch = LaunchArgs {
+                env: env.iter().map(|e| (*e).to_string()).collect(),
+                ..LaunchArgs::default()
+            };
+            add_xcode_launch_env(&mut launch);
+            let pairs = launch.env_pairs("").unwrap();
+            pairs
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        assert_eq!(resolved(&[])["NSUnbufferedIO"], "YES");
+        assert_eq!(resolved(&["NSUnbufferedIO=NO"])["NSUnbufferedIO"], "NO");
+    }
+
+    /// '--restore-state' belongs to every verb that launches the app.
+    #[test]
+    fn restore_state_is_a_flag_of_the_verbs_that_launch() {
+        use clap::Parser;
+
+        let launch = |argv: &[&str]| -> Option<LaunchArgs> {
+            let cli = crate::cli::Cli::try_parse_from(argv).ok()?;
+            match cli.resource? {
+                crate::cli::Resource::Run(args) => Some(args.launch),
+                crate::cli::Resource::App { action } => match action? {
+                    Action::Run(args) => Some(args.launch),
+                    Action::Launch { launch, .. }
+                    | Action::Debug { launch, .. }
+                    | Action::Diagnose { launch, .. } => Some(launch),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        for verb in [
+            &["run"][..],
+            &["app", "run"],
+            &["app", "launch"],
+            &["app", "debug"],
+            &["app", "diagnose"],
+        ] {
+            let argv: Vec<&str> = ["sweetpad"]
+                .iter()
+                .chain(verb)
+                .chain(&["--mac", "--restore-state"])
+                .copied()
+                .collect();
+            let parsed = launch(&argv).unwrap_or_else(|| panic!("{argv:?} rejected"));
+            assert!(parsed.restore_state, "{argv:?}");
+        }
+        assert!(
+            crate::cli::Cli::try_parse_from(["sweetpad", "app", "stop", "--restore-state"])
+                .is_err()
+        );
     }
 }

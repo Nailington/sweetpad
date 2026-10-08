@@ -23,7 +23,7 @@ did:
 | 3    | The build or the tests failed.                                             |
 | 4    | Couldn't resolve a target: unknown scheme, destination, simulator, device. |
 | 5    | A required tool is missing (xcodebuild, simctl, …).                        |
-| 6    | Cancelled: a declined prompt, or Ctrl-C.                                   |
+| 6    | Cancelled: a declined prompt, or Ctrl-C while `sweetpad run` is building.  |
 
 The distinction that matters most in CI is **3 versus 4**. Code 3 means your code is broken; code 4
 means the job is misconfigured and never got as far as compiling anything. Treating them the same is
@@ -60,8 +60,20 @@ $ sweetpad build --on "nope-does-not-exist" -o json
 {"error":{"code":"target_resolution","message":"--on \"nope-does-not-exist\" matches nothing (try one of: …)"},"ok":false,"schema":1}
 ```
 
-`error.code` is a name, not a number: `generic`, `build_failure`, `target_resolution`, `tool_missing`,
-or `user_cancel`. It mirrors the exit-code taxonomy, so a script can branch on either.
+`error.code` is a name, not a number: `generic`, `usage_error`, `build_failure`, `target_resolution`,
+`tool_missing`, or `user_cancel`. It mirrors the exit-code taxonomy, so a script can branch on either.
+
+`usage_error` goes with exit 2 when SweetPad parses a flag but won't take it, such as `--failed` on
+`test build` or `--on` together with `--destination`. It also covers an argument no project could
+make valid, such as `archive --on toaster` or a `pbxproj membership add` that names no file. SweetPad
+checks these before it looks for a project, so you get the same answer from any directory. A flag
+that doesn't parse at all also exits 2, but prints the argument parser's plain-text error, even under
+`-o json`.
+
+A command that would ask a question at a terminal also exits 2 when it can't ask, and names the flag
+that answers it. Examples are `derived-data purge` or `simulator delete` without `--yes`, and
+`dependency add` without `--product` and `--target`. A missing scheme or destination is different.
+It exits 4, because whether you need `--scheme` depends on how many schemes the project has.
 
 :::warning
 
@@ -103,8 +115,8 @@ tool output. `-q` wins if you pass both.
 
 ## Never prompting
 
-Interactive commands ask questions: which scheme, which simulator. `--non-interactive` turns every
-such question into an error instead:
+Interactive commands ask questions: which scheme, which simulator, whether to delete.
+`--non-interactive` turns every such question into an error that names the flag to pass instead:
 
 ```bash
 sweetpad build --non-interactive
@@ -142,6 +154,12 @@ more than one project:
 ```bash
 sweetpad -C ./ios build
 ```
+
+A sandbox that sets `HOME` to a scratch directory doesn't move DerivedData. `xcodebuild` reads your
+account's home from the system, and so does SweetPad, so both keep using
+`~/Library/Developer/Xcode/DerivedData`. A custom `TMPDIR` doesn't move Xcode's cache directory
+either. To give a job its own DerivedData, pass `-- -derivedDataPath <dir>`, or set
+`CFFIXED_USER_HOME`, which moves the home for both Xcode's tools and SweetPad.
 
 ## GitHub Actions
 
@@ -215,14 +233,15 @@ sweetpad build -o quiet || {
 ```
 
 Bear in mind `sweetpad build` compiles the app target and not your test targets, so a hook like this
-won't catch a test that no longer compiles.
+won't catch a test that no longer compiles. Add `sweetpad test build -o quiet` for that. It compiles
+the test targets without running them.
 
 ## Reading results in a script
 
 Anything the CLI knows, it will hand over as JSON. A few patterns worth having:
 
 ```bash
-# The path to the built .app
+# The path to the built .app (null, with a "note" saying why, when it can't be found)
 sweetpad build -o json | jq -r '.data.productPath'
 
 # One build setting, as a bare string — no jq needed

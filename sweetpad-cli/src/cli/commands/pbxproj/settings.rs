@@ -8,12 +8,19 @@
 //! files, SDK defaults, and `$(inherited)` chains on top of this layer —
 //! and is why a value can survive an `unset` in the resolved view.
 //!
-//! Mutations ride [`sweetpad_lib::settings_pbxproj`] and never guess: an
-//! ambiguous workspace, unknown target, or unknown configuration is a hard
-//! error — interactive or not. Setting `INFOPLIST_FILE` to a path inside a
-//! target's synchronized folder also records the membership exception Xcode
-//! itself would write (without it the plist doubles as a bundle resource — a
-//! "Multiple commands produce" build failure on flat-bundle platforms).
+//! Mutations never guess: an ambiguous workspace, unknown target, or unknown
+//! configuration is a hard error — interactive or not. Setting
+//! `INFOPLIST_FILE` to a path inside a target's synchronized folder also
+//! records the membership exception Xcode itself would write (without it the
+//! plist doubles as a bundle resource — a "Multiple commands produce" build
+//! failure on flat-bundle platforms).
+//!
+//! Both document formats are edited, through
+//! [`sweetpad_lib::settings_pbxproj`] and [`sweetpad_lib::settings_xcproj`].
+//! They store the layer differently — a `buildSettings` dict per
+//! configuration against one map per scope with the configuration folded into
+//! the key — and this command speaks only the shared vocabulary, so a caller
+//! never learns which one the bundle held.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -21,15 +28,19 @@ use std::path::Path;
 use clap::{Args, Subcommand};
 
 use crate::cli::output::Output;
-use crate::cli::pbxedit;
-use crate::cli::{CliError, CommandResult, ContainerArgs, Context, Render, Rendered};
+use crate::cli::pbxedit::Editable;
+use crate::cli::{
+    CliError, CommandResult, ContainerArgs, Context, ErrorKind, Render, Rendered, resolve,
+    xcodebuild,
+};
 use sweetpad_core::build_settings::{BuildSettingsOptions, resolve_build_settings};
-use sweetpad_lib::settings_pbxproj::{self, Assignment, Change, Op, Scope, Setting};
-use sweetpad_lib::sync_pbxproj::{self, ExcludeOutcome};
+use sweetpad_lib::membership::ExcludeOutcome;
+use sweetpad_lib::stored_settings::{Assignment, Change, ConfigSettings, Op, Scope, Setting};
+use sweetpad_lib::{settings_pbxproj, settings_xcproj, sync_pbxproj, sync_xcproj};
 
 #[derive(Debug, Subcommand)]
 pub enum Action {
-    /// Show the stored `buildSettings` entries, per configuration.
+    /// Show the stored 'buildSettings' entries, per configuration.
     Show {
         #[command(flatten)]
         container: ContainerArgs,
@@ -52,9 +63,9 @@ pub enum Action {
 /// Flags for `pbxproj settings set`.
 #[derive(Debug, Args)]
 pub struct SetArgs {
-    /// Assignments: `KEY=VALUE` sets, `KEY+=VALUE` appends to the value's
+    /// Assignments: 'KEY=VALUE' sets, 'KEY+=VALUE' appends to the value's
     /// element list, and repeating a key builds an array in argument order.
-    /// Conditional keys (`KEY[sdk=iphoneos*]`) pass through verbatim.
+    /// Conditional keys ('KEY[sdk=iphoneos*]') pass through verbatim.
     #[arg(required = true, value_name = "KEY=VALUE")]
     pub assignments: Vec<String>,
 
@@ -81,7 +92,7 @@ pub struct SetArgs {
 #[derive(Debug, Args)]
 pub struct UnsetArgs {
     /// Keys to remove. Exact match only — conditional variants
-    /// (`KEY[sdk=…]`) are separate keys and stay untouched.
+    /// ('KEY[sdk=…]') are separate keys and stay untouched.
     #[arg(required = true, value_name = "KEY")]
     pub keys: Vec<String>,
 
@@ -254,20 +265,19 @@ fn setting_json(setting: Option<&Setting>) -> serde_json::Value {
 }
 
 fn set(ctx: &mut Context, args: &SetArgs) -> CommandResult {
-    ctx.targeting = args.container.clone().into();
-    let container = crate::cli::resolve::container(ctx)?;
-    let xcodeproj = pbxedit::mutation_xcodeproj(ctx, &container, &args.targets)?;
-    pbxedit::guard_generated(ctx.project_file(&container), &xcodeproj, args.force)?;
-    let mut root = pbxedit::parse_owned(&xcodeproj)?;
-
     let assignments = parse_assignments(&args.assignments)?;
+    let (xcodeproj, mut document) =
+        super::open_document_mut(ctx, &args.container, &args.targets, args.force)?;
+
     let scopes = scopes_of(&args.targets);
     let mut changes = Vec::new();
     for scope in &scopes {
-        changes.extend(
-            settings_pbxproj::set(&mut root, scope, &args.configurations, &assignments)
-                .map_err(CliError::new)?,
-        );
+        changes.extend(apply_set(
+            &mut document,
+            scope,
+            &args.configurations,
+            &assignments,
+        )?);
     }
 
     // A custom Info.plist inside a synchronized folder needs a membership
@@ -276,13 +286,12 @@ fn set(ctx: &mut Context, args: &SetArgs) -> CommandResult {
     let mut exceptions = Vec::new();
     if let Some(plist) = assigned_value(&assignments, "INFOPLIST_FILE") {
         let affected: Vec<String> = if args.targets.is_empty() {
-            settings_pbxproj::target_names(&root)
+            document.target_names()
         } else {
             args.targets.clone()
         };
         for target in affected {
-            let outcome = sync_pbxproj::ensure_infoplist_exception(&mut root, &target, &plist)
-                .map_err(CliError::new)?;
+            let outcome = ensure_plist_exception(&mut document, &target, &plist)?;
             match outcome {
                 Some(ExcludeOutcome::Added {
                     root_dir,
@@ -310,25 +319,28 @@ fn set(ctx: &mut Context, args: &SetArgs) -> CommandResult {
     let mut warnings = xcspec_warnings(&assignments);
     let keys: Vec<String> = assignments.iter().map(|a| a.key.clone()).collect();
     warnings.extend(xcconfig_warnings(
-        &root,
+        &document,
         &xcodeproj,
         &scopes,
         &args.configurations,
         &keys,
     ));
+    let command_line = project_command_line(ctx)?;
+    warnings.extend(command_line_warnings(&command_line, &keys));
 
-    pbxedit::write_pbxproj(&xcodeproj, &root)?;
+    document.write(&xcodeproj)?;
 
     let resolved = resolve_effects(
         &xcodeproj,
-        &root,
+        &document,
         &args.targets,
         &changes,
         &keys,
+        &command_line,
         &mut warnings,
     );
     Ok(Rendered::data(MutationResult {
-        file: xcodeproj.join("project.pbxproj").display().to_string(),
+        file: document.path(&xcodeproj).display().to_string(),
         unset: false,
         changes: changes.into_iter().map(change_row).collect(),
         exceptions,
@@ -338,49 +350,99 @@ fn set(ctx: &mut Context, args: &SetArgs) -> CommandResult {
 }
 
 fn unset(ctx: &mut Context, args: &UnsetArgs) -> CommandResult {
-    ctx.targeting = args.container.clone().into();
-    let container = crate::cli::resolve::container(ctx)?;
-    let xcodeproj = pbxedit::mutation_xcodeproj(ctx, &container, &args.targets)?;
-    pbxedit::guard_generated(ctx.project_file(&container), &xcodeproj, args.force)?;
-    let mut root = pbxedit::parse_owned(&xcodeproj)?;
-
     let keys = parse_keys(&args.keys)?;
+    let (xcodeproj, mut document) =
+        super::open_document_mut(ctx, &args.container, &args.targets, args.force)?;
+
     let scopes = scopes_of(&args.targets);
     let mut changes = Vec::new();
     for scope in &scopes {
-        changes.extend(
-            settings_pbxproj::unset(&mut root, scope, &args.configurations, &keys)
-                .map_err(CliError::new)?,
-        );
+        changes.extend(apply_unset(
+            &mut document,
+            scope,
+            &args.configurations,
+            &keys,
+        )?);
     }
 
-    let mut warnings = xcconfig_warnings(&root, &xcodeproj, &scopes, &args.configurations, &keys);
+    let mut warnings =
+        xcconfig_warnings(&document, &xcodeproj, &scopes, &args.configurations, &keys);
+    let command_line = project_command_line(ctx)?;
+    warnings.extend(command_line_warnings(&command_line, &keys));
 
     let touched = changes.iter().any(|c| c.old.is_some());
     if touched {
-        pbxedit::write_pbxproj(&xcodeproj, &root)?;
+        document.write(&xcodeproj)?;
     }
 
     let resolved = if touched {
         resolve_effects(
             &xcodeproj,
-            &root,
+            &document,
             &args.targets,
             &changes,
             &keys,
+            &command_line,
             &mut warnings,
         )
     } else {
         Vec::new()
     };
     Ok(Rendered::data(MutationResult {
-        file: xcodeproj.join("project.pbxproj").display().to_string(),
+        file: document.path(&xcodeproj).display().to_string(),
         unset: true,
         changes: changes.into_iter().map(change_row).collect(),
         exceptions: Vec::new(),
         warnings,
         resolved,
     }))
+}
+
+/// Apply assignments to whichever format the document is in.
+fn apply_set(
+    document: &mut Editable,
+    scope: &Scope,
+    configurations: &[String],
+    assignments: &[Assignment],
+) -> Result<Vec<Change>, CliError> {
+    match document {
+        Editable::Pbxproj(root) => settings_pbxproj::set(root, scope, configurations, assignments),
+        Editable::Xcproj(root) => settings_xcproj::set(root, scope, configurations, assignments),
+    }
+    .map_err(CliError::new)
+}
+
+fn apply_unset(
+    document: &mut Editable,
+    scope: &Scope,
+    configurations: &[String],
+    keys: &[String],
+) -> Result<Vec<Change>, CliError> {
+    match document {
+        Editable::Pbxproj(root) => settings_pbxproj::unset(root, scope, configurations, keys),
+        Editable::Xcproj(root) => settings_xcproj::unset(root, scope, configurations, keys),
+    }
+    .map_err(CliError::new)
+}
+
+fn stored_settings(document: &Editable, scope: &Scope) -> Result<Vec<ConfigSettings>, CliError> {
+    match document {
+        Editable::Pbxproj(root) => settings_pbxproj::raw(root, scope),
+        Editable::Xcproj(root) => settings_xcproj::raw(root, scope),
+    }
+    .map_err(CliError::new)
+}
+
+fn ensure_plist_exception(
+    document: &mut Editable,
+    target: &str,
+    plist: &str,
+) -> Result<Option<ExcludeOutcome>, CliError> {
+    match document {
+        Editable::Pbxproj(root) => sync_pbxproj::ensure_infoplist_exception(root, target, plist),
+        Editable::Xcproj(root) => sync_xcproj::ensure_infoplist_exception(root, target, plist),
+    }
+    .map_err(CliError::new)
 }
 
 fn change_row(c: Change) -> ChangeRow {
@@ -456,8 +518,9 @@ fn split_assignment(input: &str) -> Result<(String, bool, String), CliError> {
         }
     }
     Err(CliError::new(format!(
-        "`{input}` is not a KEY=VALUE assignment (use KEY=VALUE, or KEY+=VALUE to append)"
-    )))
+        "'{input}' is not a KEY=VALUE assignment (use KEY=VALUE, or KEY+=VALUE to append)"
+    ))
+    .kind(ErrorKind::Usage))
 }
 
 fn parse_keys(inputs: &[String]) -> Result<Vec<String>, CliError> {
@@ -474,8 +537,9 @@ fn parse_keys(inputs: &[String]) -> Result<Vec<String>, CliError> {
                     ']' => depth = depth.saturating_sub(1),
                     '=' if depth == 0 => {
                         return Err(CliError::new(format!(
-                            "`{k}` names a key to remove — pass the key only, without a value"
-                        )));
+                            "'{k}' names a key to remove — pass the key only, without a value"
+                        ))
+                        .kind(ErrorKind::Usage));
                     }
                     _ => {}
                 }
@@ -488,14 +552,16 @@ fn parse_keys(inputs: &[String]) -> Result<Vec<String>, CliError> {
 
 fn validate_key(key: &str, input: &str) -> Result<(), CliError> {
     if key.is_empty() {
-        return Err(CliError::new(format!(
-            "`{input}` has no setting key before the `=`"
-        )));
+        return Err(
+            CliError::new(format!("'{input}' has no setting key before the '='"))
+                .kind(ErrorKind::Usage),
+        );
     }
     if key.chars().any(char::is_whitespace) {
-        return Err(CliError::new(format!(
-            "setting key `{key}` contains whitespace"
-        )));
+        return Err(
+            CliError::new(format!("setting key '{key}' contains whitespace"))
+                .kind(ErrorKind::Usage),
+        );
     }
     Ok(())
 }
@@ -562,7 +628,7 @@ fn xcspec_warnings(assignments: &[Assignment]) -> Vec<String> {
 /// edited keys: the pbxproj layer outranks it, so a `set` silently shadows
 /// the xcconfig value and an `unset` hands the wheel back to it.
 fn xcconfig_warnings(
-    root: &sweetpad_lib::pbxproj::Value,
+    document: &Editable,
     xcodeproj: &Path,
     scopes: &[Scope],
     configurations: &[String],
@@ -572,7 +638,13 @@ fn xcconfig_warnings(
     let mut warnings = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     for scope in scopes {
-        let Ok(bases) = settings_pbxproj::base_xcconfigs(root, scope, configurations) else {
+        let bases = match document {
+            Editable::Pbxproj(root) => {
+                settings_pbxproj::base_xcconfigs(root, scope, configurations)
+            }
+            Editable::Xcproj(root) => settings_xcproj::base_xcconfigs(root, scope, configurations),
+        };
+        let Ok(bases) = bases else {
             continue;
         };
         for (configuration, rel_path) in bases {
@@ -588,7 +660,7 @@ fn xcconfig_warnings(
                 if assigns && seen.insert((rel_path.clone(), key.clone())) {
                     warnings.push(format!(
                         "{configuration}'s base xcconfig ({rel_path}) also assigns {key}; \
-                         the pbxproj layer outranks it"
+                         the stored layer outranks it"
                     ));
                 }
             }
@@ -597,19 +669,69 @@ fn xcconfig_warnings(
     warnings
 }
 
+/// The settings the project's builds add above the stored layer: the
+/// `KEY=VALUE` settings and `-xcconfig` in `sweetpad.toml`'s `[xcodebuild]
+/// args`, so an effect row reads what a build of the project would use.
+fn project_command_line(ctx: &Context) -> Result<xcodebuild::CommandLineSettings, CliError> {
+    Ok(match resolve::container_silently(ctx) {
+        Some(container) => xcodebuild::command_line_settings(
+            &ctx.xcodebuild_args(xcodebuild::Action::Build, &[])?,
+            &container,
+        ),
+        None => xcodebuild::CommandLineSettings::default(),
+    })
+}
+
+/// Warn when `sweetpad.toml`'s `[xcodebuild] args` also set one of the edited
+/// keys: a command-line setting, or one in its `-xcconfig`, outranks the
+/// stored layer, so the build keeps that value whatever the edit wrote.
+fn command_line_warnings(
+    command_line: &xcodebuild::CommandLineSettings,
+    keys: &[String],
+) -> Vec<String> {
+    let overlay = command_line
+        .xcconfig
+        .as_deref()
+        .and_then(|path| Some((path, sweetpad_lib::xcconfig::parse_file(path).ok()?)));
+    let mut warnings = Vec::new();
+    for key in keys {
+        let base_key = key.split('[').next().unwrap_or(key);
+        if command_line.overrides.iter().any(|(k, _)| k == base_key) {
+            warnings.push(format!(
+                "sweetpad.toml's '[xcodebuild] args' also set {base_key}, which outranks the \
+                 stored layer"
+            ));
+        } else if let Some((path, xcconfig)) = &overlay
+            && xcconfig.entries.iter().any(
+                |e| matches!(e, sweetpad_lib::xcconfig::Entry::Assignment(a) if a.key == base_key),
+            )
+        {
+            warnings.push(format!(
+                "the '-xcconfig {}' in sweetpad.toml's '[xcodebuild] args' also assigns \
+                 {base_key}, which outranks the stored layer",
+                path.display()
+            ));
+        }
+    }
+    warnings
+}
+
 /// Re-resolve the touched keys after the write — the *effect* of the edit,
-/// per (target, configuration). A project-level edit applies to every target.
-/// Resolution failures degrade to a warning; the mutation itself stands.
+/// per (target, configuration), with the settings `command_line` adds, as a
+/// build of the project resolves them. A project-level edit applies to every
+/// target. Resolution failures degrade to a warning; the mutation itself
+/// stands.
 fn resolve_effects(
     xcodeproj: &Path,
-    root: &sweetpad_lib::pbxproj::Value,
+    document: &Editable,
     targets: &[String],
     changes: &[Change],
     keys: &[String],
+    command_line: &xcodebuild::CommandLineSettings,
     warnings: &mut Vec<String>,
 ) -> Vec<ResolvedRow> {
     let affected: Vec<String> = if targets.is_empty() {
-        settings_pbxproj::target_names(root)
+        document.target_names()
     } else {
         targets.to_vec()
     };
@@ -626,12 +748,13 @@ fn resolve_effects(
                 sdk: String::new(),
                 arch: String::new(),
                 destination: None,
-                xcconfig: None,
+                xcconfig: command_line.xcconfig.clone(),
                 xcode: None,
                 xcspec_root: None,
                 sdksettings_root: None,
                 catalog_cache: None,
-                derived_data_path: None,
+                derived_data_path: command_line.derived_data_path.clone(),
+                overrides: command_line.overrides.clone(),
                 read_xcode_locations: true,
                 keys: Some(keys.to_vec()),
             };
@@ -663,7 +786,7 @@ fn resolve_effects(
 /// One scope's stored settings: the project, or one target.
 struct RawScope {
     target: Option<String>,
-    configurations: Vec<settings_pbxproj::ConfigSettings>,
+    configurations: Vec<ConfigSettings>,
 }
 
 /// The `pbxproj settings show` payload: the stored layer per scope,
@@ -743,21 +866,17 @@ fn show(
     key: Option<&str>,
 ) -> CommandResult {
     let target_owned = target.map(str::to_string);
-    let (_, root) = super::open_project(ctx, container, target_owned.as_ref())?;
+    let (_, document) = super::open_document(ctx, container, target_owned.as_ref())?;
 
     let mut scopes = Vec::new();
     let wanted: Vec<Scope> = match target {
         Some(t) => vec![Scope::Target(t.to_string())],
         None => std::iter::once(Scope::Project)
-            .chain(
-                settings_pbxproj::target_names(&root)
-                    .into_iter()
-                    .map(Scope::Target),
-            )
+            .chain(document.target_names().into_iter().map(Scope::Target))
             .collect(),
     };
     for scope in wanted {
-        let mut configurations = settings_pbxproj::raw(&root, &scope).map_err(CliError::new)?;
+        let mut configurations = stored_settings(&document, &scope)?;
         if let Some(key) = key {
             for config in &mut configurations {
                 config.settings.retain(|(k, _)| k == key);
@@ -777,6 +896,39 @@ fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_the_projects_command_line_outranks_is_warned_about() {
+        let dir = crate::cli::testdir::TempDir::new("sweetpad-pbxproj-cmdline");
+        let overlay = dir.join("ci.xcconfig");
+        std::fs::write(&overlay, "OTHER_SWIFT_FLAGS = -DCI\n").unwrap();
+        let command_line = xcodebuild::CommandLineSettings {
+            derived_data_path: None,
+            xcconfig: Some(overlay.clone()),
+            overrides: vec![("SWIFT_VERSION".into(), "5.9".into())],
+        };
+        let keys = [
+            "SWIFT_VERSION".to_string(),
+            "OTHER_SWIFT_FLAGS[sdk=macosx*]".to_string(),
+            "PRODUCT_NAME".to_string(),
+        ];
+        assert_eq!(
+            command_line_warnings(&command_line, &keys),
+            [
+                "sweetpad.toml's '[xcodebuild] args' also set SWIFT_VERSION, which outranks the \
+                 stored layer"
+                    .to_string(),
+                format!(
+                    "the '-xcconfig {}' in sweetpad.toml's '[xcodebuild] args' also assigns \
+                     OTHER_SWIFT_FLAGS, which outranks the stored layer",
+                    overlay.display()
+                ),
+            ]
+        );
+        assert!(
+            command_line_warnings(&xcodebuild::CommandLineSettings::default(), &keys).is_empty()
+        );
+    }
 
     #[test]
     fn splits_assignments_and_appends() {
@@ -811,9 +963,12 @@ mod tests {
             split_assignment("DEVELOPMENT_TEAM=").unwrap(),
             ("DEVELOPMENT_TEAM".into(), false, String::new())
         );
-        assert!(split_assignment("NO_EQUALS_HERE").is_err());
-        assert!(split_assignment("=value").is_err());
-        assert!(split_assignment("BAD KEY=1").is_err());
+        // A malformed argument is refused on its own spelling, before any
+        // project is opened: a usage error.
+        for bad in ["NO_EQUALS_HERE", "=value", "BAD KEY=1"] {
+            let err = split_assignment(bad).expect_err(bad);
+            assert_eq!(err.error_kind(), ErrorKind::Usage, "{bad}");
+        }
     }
 
     #[test]
@@ -851,7 +1006,8 @@ mod tests {
 
     #[test]
     fn unset_keys_reject_values() {
-        assert!(parse_keys(&["SWIFT_VERSION=5.0".into()]).is_err());
+        let err = parse_keys(&["SWIFT_VERSION=5.0".into()]).expect_err("a value was taken");
+        assert_eq!(err.error_kind(), ErrorKind::Usage);
         assert_eq!(
             parse_keys(&["CODE_SIGN_IDENTITY[sdk=iphoneos*]".into()]).unwrap(),
             vec!["CODE_SIGN_IDENTITY[sdk=iphoneos*]".to_string()]

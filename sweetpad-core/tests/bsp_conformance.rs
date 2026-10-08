@@ -26,6 +26,23 @@ fn b_swift_uri() -> String {
     )
 }
 
+/// A `bsp-server` command that keeps what a session writes in Cargo's scratch
+/// space for integration tests. The server resolves against the active Xcode,
+/// and the parsed catalog it caches would otherwise land in the user's
+/// `~/.cache/sweetpad`. Its home is there too, as `CFFIXED_USER_HOME`: the
+/// DerivedData locator and the `xcodebuild` a prepare runs both follow that,
+/// not `HOME`, so what the warm-up after `build/initialized` builds stays out
+/// of the user's DerivedData.
+fn bsp_server() -> Command {
+    let home = concat!(env!("CARGO_TARGET_TMPDIR"), "/home");
+    std::fs::create_dir_all(home).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bsp-server"));
+    cmd.env("SWEETPAD_CACHE_DIR", env!("CARGO_TARGET_TMPDIR"))
+        .env("HOME", home)
+        .env("CFFIXED_USER_HOME", home);
+    cmd
+}
+
 fn frame(msg: &Value) -> Vec<u8> {
     let body = msg.to_string();
     format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
@@ -62,13 +79,25 @@ fn run_session(messages: &[Value], project: &str) -> Vec<Value> {
 /// As [`run_session`], with extra CLI flags after `--project` (e.g.
 /// `--derived-data-path`) so a test can exercise the flag-driven config.
 fn run_session_args(messages: &[Value], project: &str, extra: &[&str]) -> Vec<Value> {
+    run_session_env(messages, project, extra, &[])
+}
+
+/// As [`run_session_args`], with extra environment for the server (a fake
+/// `HOME`, say).
+fn run_session_env(
+    messages: &[Value],
+    project: &str,
+    extra: &[&str],
+    env: &[(&str, &std::path::Path)],
+) -> Vec<Value> {
     let mut input = Vec::new();
     for m in messages {
         input.extend(frame(m));
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bsp-server"))
+    let mut child = bsp_server()
         .args(["bsp", "--project", project])
         .args(extra)
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -481,6 +510,117 @@ fn bsp_initialize_advertises_index_store() {
         db,
         format!("{dd}/Index.noindex/IndexDatabase"),
         "indexDatabasePath"
+    );
+}
+
+/// Without a `--derived-data-path`, the index store sits in the folder
+/// `xcodebuild` writes, which it names by the container's standardized path.
+/// A root reached through a symlink therefore shares its real path's folder:
+/// building `ci/fixture-app` through a symlinked directory wrote
+/// `SweetpadCIApp-<hash of the real path>`, never a folder hashed from the
+/// symlink spelling.
+#[test]
+fn bsp_index_store_of_a_symlinked_root_is_the_real_paths_folder() {
+    use sweetpad_lib::derived_data::{container_hash, hashed_folder};
+
+    let scratch = sweetpad_core::scratch::ScratchDir::new("sweetpad-bsp-symlink").unwrap();
+    let real_dir = std::path::Path::new(&project())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let link = scratch.join("link");
+    std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+    let home = scratch.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let through_link = link.join("MultiModule.xcodeproj");
+    let real = std::fs::canonicalize(&through_link).unwrap();
+    let messages = vec![
+        json!({"jsonrpc":"2.0","id":1,"method":"build/initialize","params":{}}),
+        json!({"jsonrpc":"2.0","method":"build/exit"}),
+    ];
+    let frames = run_session_env(
+        &messages,
+        &through_link.display().to_string(),
+        &[],
+        &[
+            ("HOME", home.as_path()),
+            ("CFFIXED_USER_HOME", home.as_path()),
+        ],
+    );
+    let store = result_for(&frames, 1)
+        .and_then(|init| init.pointer("/data/indexStorePath"))
+        .and_then(Value::as_str)
+        .expect("indexStorePath")
+        .to_string();
+
+    let folder = hashed_folder("MultiModule", &container_hash(&real));
+    assert_eq!(
+        store,
+        home.join("Library/Developer/Xcode/DerivedData")
+            .join(&folder)
+            .join("Index.noindex/DataStore")
+            .display()
+            .to_string()
+    );
+    // The symlink spelling hashes to a folder of its own, which is the one
+    // nothing writes.
+    let as_spelled =
+        sweetpad_lib::xcode_hash::derived_data_hash(&through_link.display().to_string());
+    assert!(!store.contains(&as_spelled), "{store}");
+}
+
+/// Xcode's Settings → Locations → Derived Data moves the index store with the
+/// rest of the build, and the server finds it there, as the editor arguments
+/// find the build's products.
+#[test]
+fn bsp_index_store_follows_xcodes_derived_data_location() {
+    use sweetpad_lib::derived_data::{container_hash, hashed_folder};
+
+    let scratch = sweetpad_core::scratch::ScratchDir::new("sweetpad-bsp-ddloc").unwrap();
+    let home = scratch.join("home");
+    let prefs = home.join("Library/Preferences");
+    std::fs::create_dir_all(&prefs).unwrap();
+    let custom = scratch.join("Fast/DerivedData");
+    std::fs::write(
+        prefs.join("com.apple.dt.Xcode.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\
+             \t<key>IDECustomDerivedDataLocation</key>\n\t<string>{}</string>\n</dict>\n</plist>\n",
+            custom.display()
+        ),
+    )
+    .unwrap();
+
+    let messages = vec![
+        json!({"jsonrpc":"2.0","id":1,"method":"build/initialize","params":{}}),
+        json!({"jsonrpc":"2.0","method":"build/exit"}),
+    ];
+    let frames = run_session_env(
+        &messages,
+        &project(),
+        &[],
+        &[
+            ("HOME", home.as_path()),
+            ("CFFIXED_USER_HOME", home.as_path()),
+        ],
+    );
+    let store = result_for(&frames, 1)
+        .and_then(|init| init.pointer("/data/indexStorePath"))
+        .and_then(Value::as_str)
+        .expect("indexStorePath")
+        .to_string();
+    let folder = hashed_folder(
+        "MultiModule",
+        &container_hash(std::path::Path::new(&project())),
+    );
+    assert_eq!(
+        store,
+        custom
+            .join(folder)
+            .join("Index.noindex/DataStore")
+            .display()
+            .to_string()
     );
 }
 
@@ -912,8 +1052,7 @@ fn bsp_per_file_clang_dialect_matrix() {
 /// `workspacePath`, open the folder as a project, and exit before replying.
 #[test]
 fn bsp_starts_from_extension_bsp_json() {
-    let workspace = std::env::temp_dir().join(format!("sweetpad-bsp-json-{}", std::process::id()));
-    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let workspace = sweetpad_core::scratch::ScratchDir::new("sweetpad-bsp-json").unwrap();
     let config = json!({
         "name": "sweetpad",
         "workspacePath": workspace.to_string_lossy(),
@@ -936,7 +1075,7 @@ fn bsp_starts_from_extension_bsp_json() {
     for m in &messages {
         input.extend(frame(m));
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bsp-server"))
+    let mut child = bsp_server()
         .arg("bsp")
         .arg("--config")
         .arg(&config_path)
@@ -959,7 +1098,6 @@ fn bsp_starts_from_extension_bsp_json() {
         .read_to_end(&mut out)
         .expect("read stdout");
     let status = child.wait().expect("wait");
-    let _ = std::fs::remove_dir_all(&workspace);
 
     assert!(status.success(), "server exited non-zero: {status:?}");
     let frames = parse_frames(&out);
@@ -988,7 +1126,7 @@ fn bsp_starts_from_extension_bsp_json() {
 /// path, with a `bspConfig` pointer).
 #[test]
 fn bsp_discovers_config_from_cwd_index() {
-    let root = std::env::temp_dir().join(format!("sweetpad-bsp-cwd-{}", std::process::id()));
+    let root = sweetpad_core::scratch::ScratchDir::new("sweetpad-bsp-cwd").unwrap();
     let workspace = root.join("workspace");
     let state_home = root.join("xdg-state");
     std::fs::create_dir_all(&workspace).expect("create workspace");
@@ -1025,7 +1163,7 @@ fn bsp_discovers_config_from_cwd_index() {
         input.extend(frame(m));
     }
     // No --config: discovery falls back to the cwd + index.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bsp-server"))
+    let mut child = bsp_server()
         .arg("bsp")
         .current_dir(&workspace)
         .env("XDG_STATE_HOME", &state_home)
@@ -1048,7 +1186,6 @@ fn bsp_discovers_config_from_cwd_index() {
         .read_to_end(&mut out)
         .expect("read stdout");
     let status = child.wait().expect("wait");
-    let _ = std::fs::remove_dir_all(&root);
 
     assert!(status.success(), "server exited non-zero: {status:?}");
     let frames = parse_frames(&out);
@@ -1084,7 +1221,7 @@ fn bsp_replies_parse_error_on_malformed_frame() {
     ] {
         input.extend(frame(&m));
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bsp-server"))
+    let mut child = bsp_server()
         .args(["bsp", "--project", &proj])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1131,7 +1268,7 @@ fn bsp_framing_header_robustness() {
     let body = json!({"jsonrpc":"2.0","id":1,"method":"build/initialize","params":{}}).to_string();
     let mut input = format!("content-length: {}\r\n\r\n{body}", body.len()).into_bytes();
     input.extend(frame(&json!({"jsonrpc":"2.0","method":"build/exit"})));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bsp-server"))
+    let mut child = bsp_server()
         .args(["bsp", "--project", &proj])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1159,7 +1296,7 @@ fn bsp_framing_header_robustness() {
 
     // Unparseable length: the frame boundary is unrecoverable — exit non-zero
     // without panicking (a panic would abort with a signal, not a code).
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bsp-server"))
+    let mut child = bsp_server()
         .args(["bsp", "--project", &proj])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1187,7 +1324,7 @@ fn bsp_framing_header_robustness() {
 #[test]
 fn bsp_rejects_oversized_content_length() {
     let proj = project();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bsp-server"))
+    let mut child = bsp_server()
         .args(["bsp", "--project", &proj])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -1206,4 +1343,235 @@ fn bsp_rejects_oversized_content_length() {
         Some(1),
         "expected clean error exit (a None code means a signal/abort): {status:?}"
     );
+}
+
+/// A `swiftc` for the warm-up's fast path to find first on `PATH`: it leaves a
+/// `TemporaryDirectory.*` in its `TMPDIR`, as the Swift driver does when it
+/// dies before it finishes, then runs `rest`.
+fn stub_swiftc(bin: &std::path::Path, rest: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(bin).unwrap();
+    let path = bin.join("swiftc");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nmktemp -d \"$TMPDIR/TemporaryDirectory.XXXXXX\" > /dev/null || exit 1\n\
+             {rest}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// An `xcodebuild` for the warm-up's fallback to find first on `PATH`. It
+/// leaves in its `TMPDIR` what a real build does: a `TemporaryDirectory.*`
+/// holding the driver's `.keep-directory`, from the build service's `swiftc
+/// --version`, and one of SwiftPM's lock files.
+fn stub_xcodebuild(bin: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(bin).unwrap();
+    let path = bin.join("xcodebuild");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nd=$(mktemp -d \"$TMPDIR/TemporaryDirectory.XXXXXX\") || exit 1\n\
+         : > \"$d/.keep-directory\"\n: > \"$TMPDIR/_Users_stub_.swiftpm.lock\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A server warming up the multi-module fixture, whose closure is pure Swift,
+/// so its prepare runs the `swiftc` in `bin` rather than `xcodebuild`, with
+/// `tmp` as its `TMPDIR` and its products in `dd`. Read off-thread: stdout
+/// stays open while the warm-up runs.
+struct WarmUp {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    out: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    reader: std::thread::JoinHandle<()>,
+}
+
+impl WarmUp {
+    fn start(
+        bin: &std::path::Path,
+        tmp: &std::path::Path,
+        dd: &std::path::Path,
+        env: &[(&str, &std::path::Path)],
+    ) -> WarmUp {
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut child = bsp_server()
+            .args(["bsp", "--project", &project(), "--derived-data-path"])
+            .arg(dd)
+            .env("PATH", path)
+            .env("TMPDIR", tmp)
+            .envs(env.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bsp server");
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&out);
+        let reader = std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                sink.lock().unwrap().extend_from_slice(&chunk[..n]);
+            }
+        });
+        for m in [
+            json!({"jsonrpc":"2.0","id":1,"method":"build/initialize","params":{}}),
+            json!({"jsonrpc":"2.0","method":"build/initialized"}),
+        ] {
+            stdin.write_all(&frame(&m)).unwrap();
+        }
+        stdin.flush().unwrap();
+        WarmUp {
+            child,
+            stdin,
+            out,
+            reader,
+        }
+    }
+
+    /// Poll until `done` holds, returning whether it did within a minute.
+    fn wait_until(&self, done: impl Fn(&WarmUp) -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if done(self) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
+    fn output(&self) -> String {
+        String::from_utf8_lossy(&self.out.lock().unwrap()).into_owned()
+    }
+
+    /// Send `build/exit` and return how long the server took to go.
+    fn exit(mut self) -> std::time::Duration {
+        let asked = std::time::Instant::now();
+        let _ = self
+            .stdin
+            .write_all(&frame(&json!({"jsonrpc":"2.0","method":"build/exit"})));
+        let _ = self.stdin.flush();
+        drop(self.stdin);
+        let _ = self.child.wait();
+        let took = asked.elapsed();
+        let _ = self.reader.join();
+        took
+    }
+}
+
+fn entries(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// The Swift driver leaves a `TemporaryDirectory.*` in its `TMPDIR` whenever
+/// it dies before it finishes, and the server runs in the user's editor, so
+/// the warm-up's `swiftc`s get a `TMPDIR` of the server's own, which goes when
+/// the server does. The stub here leaves one on every run.
+#[test]
+fn a_warm_up_leaves_nothing_in_the_servers_tmpdir() {
+    let scratch = sweetpad_core::scratch::ScratchDir::new("sweetpad-bsp-tmpdir").unwrap();
+    let (bin, tmp, dd) = (scratch.join("bin"), scratch.join("tmp"), scratch.join("dd"));
+    std::fs::create_dir_all(&tmp).unwrap();
+    // Writes the module it's asked for, so the fast path counts it built.
+    stub_swiftc(
+        &bin,
+        r#"while [ $# -gt 0 ]; do [ "$1" = -emit-module-path ] && : > "$2"; shift; done"#,
+    );
+
+    let server = WarmUp::start(&bin, &tmp, &dd, &[]);
+    let warmed = server.wait_until(|s| s.output().contains("buildTarget/didChange"));
+    server.exit();
+
+    assert!(warmed, "the warm-up never finished");
+    assert!(
+        dd.join("Build/Products/Debug/ModuleA.swiftmodule").exists(),
+        "the stub swiftc never ran"
+    );
+    assert_eq!(entries(&tmp), Vec::<String>::new());
+}
+
+/// The warm-up's `xcodebuild` keeps the user's `TMPDIR`, where SwiftPM's
+/// locks are shared, and each build leaves a `TemporaryDirectory.*` there.
+/// The server removes the ones its builds left once each exits, and keeps the
+/// locks and a directory that was there before it started.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_warm_up_removes_what_its_xcodebuild_left_in_tmpdir() {
+    let scratch =
+        sweetpad_core::scratch::ScratchDir::new("sweetpad-bsp-tmpdir-xcodebuild").unwrap();
+    let (bin, tmp, dd) = (scratch.join("bin"), scratch.join("tmp"), scratch.join("dd"));
+    let theirs = tmp.join("TemporaryDirectory.theirs");
+    std::fs::create_dir_all(&theirs).unwrap();
+    std::fs::write(theirs.join(".keep-directory"), "").unwrap();
+    // The fast path fails, so each prepare falls back to xcodebuild.
+    stub_swiftc(&bin, "exit 1");
+    stub_xcodebuild(&bin);
+
+    let server = WarmUp::start(&bin, &tmp, &dd, &[]);
+    let warmed = server.wait_until(|s| s.output().contains("buildTarget/didChange"));
+    server.exit();
+
+    assert!(warmed, "the warm-up never finished");
+    let mut left = entries(&tmp);
+    left.sort();
+    assert_eq!(
+        left,
+        ["TemporaryDirectory.theirs", "_Users_stub_.swiftpm.lock"],
+        "the stub xcodebuild never ran, or its leftovers stayed"
+    );
+}
+
+/// `build/exit` in the middle of a warm-up kills the `swiftc` it is running
+/// rather than leaving it behind, and still removes that `swiftc`'s `TMPDIR`.
+#[test]
+fn an_exit_during_the_warm_up_stops_its_swiftc_and_leaves_nothing() {
+    let scratch = sweetpad_core::scratch::ScratchDir::new("sweetpad-bsp-tmpdir-exit").unwrap();
+    let (bin, tmp, dd) = (scratch.join("bin"), scratch.join("tmp"), scratch.join("dd"));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let pid_file = scratch.join("swiftc.pid");
+    // Says it started, then runs longer than the test waits.
+    stub_swiftc(
+        &bin,
+        r#"echo $$ > "$STUB_PID.tmp" && mv "$STUB_PID.tmp" "$STUB_PID"; exec sleep 30"#,
+    );
+
+    let server = WarmUp::start(&bin, &tmp, &dd, &[("STUB_PID", pid_file.as_path())]);
+    let started = server.wait_until(|_| pid_file.exists());
+    let took = server.exit();
+
+    assert!(started, "the stub swiftc never ran");
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let pid = pid.trim();
+    let alive = Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "the server left its swiftc (pid {pid}) running");
+    assert!(
+        took < std::time::Duration::from_secs(20),
+        "the server took {took:?} to exit"
+    );
+    assert_eq!(entries(&tmp), Vec::<String>::new());
 }

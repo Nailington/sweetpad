@@ -29,6 +29,10 @@ There's nothing to install. The injection client ships inside the `sweetpad` bin
 on a fresh machine with only Homebrew and Xcode. (If you happen to have InjectionNext installed,
 SweetPad falls back to its client when the bundled one can't be used.)
 
+A `sweetpad` you built from source has the client only if
+`sweetpad-cli/vendor/injection-client/build.sh` ran before `cargo build`. Without one, `--hot` stops
+before building and tells you so. You can also point `SWEETPAD_HOTRELOAD_DYLIB` at a client dylib.
+
 ## Setting up SwiftUI
 
 UIKit and AppKit apps need no changes at all. Method bodies are swapped in the running process and
@@ -84,7 +88,15 @@ hot = true
 ```
 
 `--no-hot` overrides that for a single run, which is what you want when you're checking real
-cold-start behavior.
+cold-start behavior. You don't need it for `--no-logs`, `--detach`, or `--wait-for-debugger`: a hot
+session can't honor those, so the default steps aside for them, and the run says so in one line:
+
+```console
+$ sweetpad run --no-logs
+hot reload off for this run: the '[run] hot = true' default yields to '--no-logs'
+```
+
+Only a typed `--hot` refuses them.
 
 ## Choosing a recompiler
 
@@ -92,7 +104,9 @@ Each save has to be turned back into compiled code, and there are two ways to wo
 arguments for one file. `--hot-recompiler` picks between them:
 
 - **`resolver`** (the default) resolves the build settings itself and does a whole-module compile.
-  Slower per save, but it doesn't depend on anything left over from an earlier build.
+  Slower per save, but it doesn't depend on anything left over from an earlier build. It resolves
+  them with the build's `KEY=VALUE`, `-xcconfig`, and `-derivedDataPath` arguments, from
+  `sweetpad.toml` and the `--` tail alike.
 - **`buildlog`** recovers the single-file compile from the build transcript. Noticeably faster, and
   the right choice once a project is building cleanly and you're iterating hard.
 
@@ -118,6 +132,9 @@ injection preflight, which prints the manual fix.
 **An unsandboxed run doesn't use the sandbox container.** Preferences and files the app writes land in
 your home Library rather than in the container it normally uses, so a hot session won't see data a
 sandboxed run wrote, and vice versa.
+
+If the app exits on its own, the session prints `✗ <bundle id> exited`, as a plain `sweetpad run`
+does, and `sweetpad app logs --exits` shows how it ended. `r` rebuilds and relaunches it.
 
 ## When the port is stuck
 

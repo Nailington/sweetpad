@@ -27,7 +27,7 @@ pub enum ExportMethod {
     Enterprise,
     /// macOS Developer ID distribution (notarizable, outside the App Store).
     DeveloperId,
-    /// macOS application distribution (a signed `.app`, no installer).
+    /// macOS application distribution (a signed '.app', no installer).
     MacApplication,
 }
 
@@ -107,7 +107,11 @@ impl Render for ArchiveReport {
 
 pub fn run(ctx: &mut Context, args: &ArchiveArgs) -> CommandResult {
     ctx.targeting = args.target.clone().into();
-    let passthrough = ctx.xcodebuild_args(&args.passthrough)?;
+    resolve::reject_on_destination_conflict(ctx)?;
+    if let Some(on) = &ctx.targeting.on {
+        on_platform(on)?;
+    }
+    let passthrough = ctx.xcodebuild_args(xcodebuild::Action::Archive, &args.passthrough)?;
     let mut resolved = resolve::resolve(ctx)?;
     if matches!(resolved.container, Container::SwiftPackage(_)) {
         return Err(CliError::new(
@@ -122,12 +126,11 @@ pub fn run(ctx: &mut Context, args: &ArchiveArgs) -> CommandResult {
 
     // A relative output dir must mean the same directory for the CLI's own
     // writes (create_dir_all, the generated plist) and for xcodebuild, which
-    // runs from the container's parent — absolutize once against the CLI cwd.
-    let out_dir = args
-        .output_file
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("build"));
-    let out_dir = std::path::absolute(&out_dir).unwrap_or(out_dir);
+    // runs from the container's parent — absolutize once against the CLI cwd,
+    // collapsing `.` and `..` so the paths the report prints read cleanly.
+    let out_dir = sweetpad_lib::project::absolutize(
+        args.output_file.as_deref().unwrap_or(Path::new("build")),
+    );
     let archive_path = out_dir.join(format!("{scheme}.xcarchive"));
 
     let mut archive_args: Vec<String> = vec![
@@ -150,11 +153,10 @@ pub fn run(ctx: &mut Context, args: &ArchiveArgs) -> CommandResult {
 
     let cwd = xcodebuild::working_dir(&resolved.container);
     let export_dir = out_dir.join("export");
-    let plist_path = args
-        .export_options
-        .clone()
-        .unwrap_or_else(|| out_dir.join("ExportOptions.plist"));
-    let plist_path = std::path::absolute(&plist_path).unwrap_or(plist_path);
+    let plist_path = args.export_options.as_deref().map_or_else(
+        || out_dir.join("ExportOptions.plist"),
+        sweetpad_lib::project::absolutize,
+    );
     let export_args: Vec<String> = vec![
         "-exportArchive".into(),
         "-archivePath".into(),
@@ -244,17 +246,14 @@ fn archive_configuration(
 }
 
 /// The archive's `-destination`: an explicit `--destination` passes through
-/// verbatim; `--on` takes a platform word (`mac`, `ios`, `watchos`, `tvos`,
-/// `visionos`) or `device` and maps it to the matching `generic/platform=…`;
-/// default iOS. Archives target device platforms, so a simulator reference
-/// is rejected rather than resolved.
+/// verbatim; `--on` names a platform ([`on_platform`]) and maps to the
+/// matching `generic/platform=…`; default iOS.
 fn archive_destination(
     ctx: &Context,
     resolved: &resolve::Resolved,
     scheme: &str,
     configuration: &str,
 ) -> Result<String, CliError> {
-    resolve::reject_on_destination_conflict(ctx)?;
     if let Some(dest) = &ctx.targeting.destination {
         return Ok(dest.clone());
     }
@@ -262,28 +261,40 @@ fn archive_destination(
         // Without an explicit target, follow what the scheme actually builds
         // for — a mac-only project archived as `generic/platform=iOS` just
         // fails inside xcodebuild. Mirrors the build path's auto-targeting.
-        let mac_only = resolve::SupportedPlatforms::resolve(resolved, scheme, configuration)
-            .is_some_and(|p| p.is_mac_only());
+        let mac_only =
+            resolve::SupportedPlatforms::resolve(resolved.container.path(), scheme, configuration)
+                .is_some_and(|p| p.is_mac_only());
         return Ok(if mac_only {
             "generic/platform=macOS".to_string()
         } else {
             "generic/platform=iOS".to_string()
         });
     };
-    let platform = match on.to_ascii_lowercase().as_str() {
-        "mac" | "macos" => "macOS",
-        "ios" | "iphone" | "ipad" | "device" => "iOS",
-        "watchos" => "watchOS",
-        "tvos" => "tvOS",
-        "visionos" | "xros" => "visionOS",
-        other => {
-            return Err(CliError::new(format!(
+    Ok(format!("generic/platform={}", on_platform(on)?))
+}
+
+/// The platform an archive's `--on` names: a platform word (`mac`, `ios`,
+/// `watchos`, `tvos`, `visionos`) or `device`. Archives target device
+/// platforms, so a simulator reference is refused rather than resolved. The
+/// word alone decides the refusal, so it is a usage error, and [`run`]
+/// checks it before looking for the project.
+fn on_platform(on: &str) -> Result<&'static str, CliError> {
+    let other = on.to_ascii_lowercase();
+    let family = if other == "device" {
+        Some("iOS")
+    } else {
+        resolve::platform_word(&other)
+    };
+    family
+        .and_then(sweetpad_lib::destination::Platform::device_for_os)
+        .map(|p| p.label)
+        .ok_or_else(|| {
+            CliError::new(format!(
                 "archive targets a generic device platform; --on {other:?} doesn't name one \
                  (use mac, ios, watchos, tvos, or visionos — or --destination for the raw form)"
-            )));
-        }
-    };
-    Ok(format!("generic/platform={platform}"))
+            ))
+            .kind(ErrorKind::Usage)
+        })
 }
 
 /// The `--show-command` payload: both xcodebuild invocations, and the
@@ -374,6 +385,17 @@ fn export_options_plist(method: ExportMethod) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A word that names no device platform is refused by the word alone,
+    /// so it exits 2 like the refusals clap makes itself.
+    #[test]
+    fn an_on_that_names_no_platform_is_a_usage_error() {
+        assert_eq!(on_platform("Mac").unwrap(), "macOS");
+        assert_eq!(on_platform("device").unwrap(), "iOS");
+        let err = on_platform("toaster").expect_err("toaster named a platform");
+        assert_eq!(err.error_kind(), ErrorKind::Usage);
+        assert!(err.to_string().contains("--on \"toaster\""), "{err}");
+    }
 
     #[test]
     fn export_options_carry_method_and_automatic_signing() {

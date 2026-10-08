@@ -9,6 +9,8 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use sweetpad_core::test_markers;
+
 use crate::cli::output::Output;
 use crate::cli::progress::Spinner;
 use crate::cli::{CliError, process};
@@ -37,6 +39,8 @@ pub enum Event {
     TestPassed { name: String, duration: String },
     /// A failed test case.
     TestFailed { name: String },
+    /// A skipped test case (`XCTSkip`, or a disabled Swift Testing test).
+    TestSkipped { name: String },
     /// A test suite that just started.
     SuiteStarted { name: String },
     /// A terminal `** … **` banner.
@@ -50,6 +54,18 @@ pub enum DiagKind {
     Warning,
     Error,
     Note,
+}
+
+impl DiagKind {
+    /// The kind a recorded diagnostic's `severity` names.
+    #[must_use]
+    pub fn from_severity(severity: &str) -> Self {
+        match severity {
+            "error" => Self::Error,
+            "warning" => Self::Warning,
+            _ => Self::Note,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -72,11 +88,12 @@ pub fn parse_line(line: &str) -> Event {
         .unwrap_or_else(|| parse_task(line, t))
 }
 
-/// Terminal `** … **` banners.
+/// Terminal `** … **` banners. `build-for-testing` closes on `** TEST BUILD
+/// … **`, which is a build's outcome, not a test run's.
 fn parse_banner(t: &str) -> Option<Event> {
-    let kind = if t.contains("** BUILD SUCCEEDED **") {
+    let kind = if t.contains("** BUILD SUCCEEDED **") || t.contains("** TEST BUILD SUCCEEDED **") {
         ResultKind::BuildSucceeded
-    } else if t.contains("** BUILD FAILED **") {
+    } else if t.contains("** BUILD FAILED **") || t.contains("** TEST BUILD FAILED **") {
         ResultKind::BuildFailed
     } else if t.contains("** TEST SUCCEEDED **") {
         ResultKind::TestSucceeded
@@ -90,31 +107,28 @@ fn parse_banner(t: &str) -> Option<Event> {
     Some(Event::Result(kind))
 }
 
-/// Test case and suite lines.
+/// A test case's end, or a suite's start, in any of the forms XCTest, Swift
+/// Testing and a parallel run print ([`test_markers`]). A case's start is left
+/// to the other parsers, as unrecognized output.
 fn parse_test(t: &str) -> Option<Event> {
-    if let Some(rest) = t.strip_prefix("Test Case '")
-        && let Some((name, tail)) = rest.split_once("' ")
-    {
-        let name = clean_test_name(name);
-        if tail.starts_with("passed") {
-            return Some(Event::TestPassed {
+    if let Some(marker) = test_markers::parse_case(t) {
+        let name = marker.display_name();
+        return match marker.status {
+            test_markers::Status::Started => None,
+            test_markers::Status::Passed => Some(Event::TestPassed {
                 name,
-                duration: parse_paren(tail),
-            });
-        }
-        if tail.starts_with("failed") {
-            return Some(Event::TestFailed { name });
-        }
+                duration: marker
+                    .seconds
+                    .map(|s| format!("{s} seconds"))
+                    .unwrap_or_default(),
+            }),
+            test_markers::Status::Failed => Some(Event::TestFailed { name }),
+            test_markers::Status::Skipped => Some(Event::TestSkipped { name }),
+        };
     }
-    if let Some(rest) = t.strip_prefix("Test Suite '")
-        && t.contains("started")
-        && let Some((name, _)) = rest.split_once('\'')
-    {
-        return Some(Event::SuiteStarted {
-            name: name.to_string(),
-        });
-    }
-    None
+    test_markers::parse_suite_started(t).map(|name| Event::SuiteStarted {
+        name: name.to_string(),
+    })
 }
 
 /// Compiler/linker diagnostics, with or without a `file:line:col` prefix.
@@ -175,7 +189,8 @@ fn parse_task(line: &str, t: &str) -> Event {
         return Event::Other(line.to_string());
     }
     let stripped = strip_target_annotation(t);
-    match t.split_whitespace().next().unwrap_or("") {
+    let verb = t.split_whitespace().next().unwrap_or("");
+    match verb {
         "CompileSwift" | "SwiftCompile" | "CompileC" | "CompileXIB" | "CompileStoryboard" => {
             match swift_batch_len(t) {
                 // A one-file batch header names the same file as the per-file
@@ -187,8 +202,17 @@ fn parse_task(line: &str, t: &str) -> Event {
                 Some(n) => Event::Compile {
                     name: format!("{n} files"),
                 },
-                None => Event::Compile {
-                    name: source_name(t).unwrap_or_else(|| "source".to_string()),
+                None => match source_name(t) {
+                    Some(name) => Event::Compile { name },
+                    // Xcode 27 opens each target's Swift work with a bare
+                    // `SwiftCompile normal arm64 (in target …)` that names no
+                    // file; the per-file lines behind it announce the work.
+                    None if matches!(verb, "CompileSwift" | "SwiftCompile") => {
+                        Event::Other(line.to_string())
+                    }
+                    None => Event::Compile {
+                        name: "source".to_string(),
+                    },
                 },
             }
         }
@@ -299,19 +323,11 @@ pub fn render(event: &Event, color: bool, verbose: bool, quiet: bool) -> Option<
             kind,
             location,
             message,
-        } => {
-            let loc = location
-                .as_deref()
-                .map(|l| format!("{l}: "))
-                .unwrap_or_default();
-            match kind {
-                DiagKind::Error => Some(c.red(&format!("error: {loc}{message}"))),
-                DiagKind::Warning => Some(c.yellow(&format!("warning: {loc}{message}"))),
-                DiagKind::Note => verbose.then(|| c.dim(&format!("note: {loc}{message}"))),
-            }
-        }
+        } => (verbose || *kind != DiagKind::Note)
+            .then(|| diagnostic_line(kind, location.as_deref(), message, color)),
         Event::TestPassed { name, duration } => Some(c.green(&format!("  ✓ {name} ({duration})"))),
         Event::TestFailed { name } => Some(c.red(&format!("  ✗ {name}"))),
+        Event::TestSkipped { name } => Some(c.yellow(&format!("  ⊘ {name} (skipped)"))),
         Event::SuiteStarted { name } => Some(c.bold(&format!("Suite {name}"))),
         Event::Result(kind) => Some(match kind {
             ResultKind::BuildSucceeded => c.green_bold("✓ Build succeeded"),
@@ -338,6 +354,11 @@ pub struct BuildProgress {
     verbose: bool,
     quiet: bool,
     gh_annotations: bool,
+    /// The last line rendered was an error announcing a list of details, so
+    /// the indented lines that follow belong to it (see [`opens_a_list`]).
+    continues: bool,
+    /// A `✗` banner has closed the stream (see [`close_failed`](Self::close_failed)).
+    closed_failed: bool,
 }
 
 impl BuildProgress {
@@ -357,6 +378,8 @@ impl BuildProgress {
             verbose: out.is_verbose(),
             quiet: out.is_quiet(),
             gh_annotations: out.gh_annotations(),
+            continues: false,
+            closed_failed: false,
         }
     }
 
@@ -366,24 +389,350 @@ impl BuildProgress {
     /// `--gh-annotations`, a diagnostic also carries its `::error`/`::warning`
     /// workflow-command line.
     pub fn line(&mut self, raw: &str) -> Option<String> {
-        let event = parse_line(raw);
-        let mut rendered = render(&event, self.color, self.verbose, self.quiet)?;
+        self.parsed(&Parsed {
+            raw: raw.to_string(),
+            event: parse_line(raw),
+        })
+    }
+
+    /// [`line`](Self::line) for a line [`LogParser`] has already parsed.
+    pub fn parsed(&mut self, parsed: &Parsed) -> Option<String> {
+        let Parsed { raw, event } = parsed;
+        if self.continues {
+            if raw.starts_with(char::is_whitespace) && !raw.trim().is_empty() {
+                return Some(Colors::new(self.color).red(&format!("  {}", raw.trim())));
+            }
+            self.continues = false;
+        }
+        if matches!(
+            event,
+            Event::Result(ResultKind::BuildFailed | ResultKind::TestFailed)
+        ) {
+            self.closed_failed = true;
+        }
+        let mut rendered = render(event, self.color, self.verbose, self.quiet)?;
+        self.continues = opens_a_list(event);
         // First line through — hand the terminal over from the spinner to the
         // streamed output (dropping the spinner erases its line).
         self.spinner = None;
         if self.gh_annotations
-            && let Some(annotation) = gh_annotation(&event)
+            && let Some(annotation) = gh_annotation(event)
         {
             rendered.push('\n');
             rendered.push_str(&annotation);
         }
         Some(stamp_time(
             rendered,
-            &event,
+            event,
             self.start.elapsed(),
             self.color,
         ))
     }
+
+    /// The `kind` banner (`✗ Build failed`, `✗ Tests failed`) for a run that
+    /// failed without printing xcodebuild's own, or `None` once a failure
+    /// banner has gone by. A destination xcodebuild cannot use fails before
+    /// any build starts, so its output ends on the destination listing with
+    /// no `** BUILD FAILED **`; this closes it like every other failed run.
+    pub fn close_failed(&mut self, kind: ResultKind) -> Option<String> {
+        if self.closed_failed {
+            return None;
+        }
+        self.closed_failed = true;
+        self.spinner = None;
+        render(&Event::Result(kind), self.color, self.verbose, self.quiet)
+    }
+}
+
+/// Whether an error announces details on the lines after it. `xcodebuild:
+/// error: Could not resolve package dependencies:` puts the actual reason on
+/// the indented lines that follow, which parse as unrecognized output and would
+/// otherwise be hidden. Only a location-less error ending in a colon counts, so
+/// the indented source excerpt under a compiler error is left alone.
+fn opens_a_list(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Diagnostic {
+            kind: DiagKind::Error,
+            location: None,
+            message,
+        } if message.ends_with(':')
+    )
+}
+
+/// The errors of a run as the tool printed them: each error diagnostic's
+/// line, and under one that announces a list ([`opens_a_list`]) the indented
+/// lines that follow it. These are the lines [`BuildProgress`] shows in red,
+/// kept for an error message that has to explain the failure where those
+/// streamed lines are not in front of it.
+#[derive(Debug, Default)]
+pub struct ErrorLines {
+    lines: Vec<String>,
+    continues: bool,
+}
+
+impl ErrorLines {
+    /// Take one line [`LogParser`] has parsed.
+    pub fn parsed(&mut self, parsed: &Parsed) {
+        let Parsed { raw, event } = parsed;
+        if self.continues {
+            if raw.starts_with(char::is_whitespace) && !raw.trim().is_empty() {
+                self.lines.push(format!("  {}", raw.trim()));
+                return;
+            }
+            self.continues = false;
+        }
+        if let Event::Diagnostic {
+            kind: DiagKind::Error,
+            ..
+        } = event
+        {
+            self.lines.push(raw.trim().to_string());
+            self.continues = opens_a_list(event);
+        }
+    }
+
+    /// The lines taken, in the order they came.
+    #[must_use]
+    pub fn into_lines(self) -> Vec<String> {
+        self.lines
+    }
+}
+
+/// One line of output and the event it parsed to.
+#[derive(Debug)]
+pub struct Parsed {
+    pub raw: String,
+    pub event: Event,
+}
+
+/// xcodebuild's output as events, one per line, except where an error owns the
+/// lines printed under it.
+///
+/// A destination xcodebuild cannot use fails with one line (`Timed out waiting
+/// for all destinations matching the provided destination specifier to become
+/// available`, `Unable to find a device matching the provided destination
+/// specifier:`), and the reason comes after a blank line, in xcodebuild's own
+/// listing of the destinations it considered. A locked phone or one without
+/// Developer Mode is named only there. So the error is held until the listing
+/// ends and carries the part of it that explains the failure
+/// ([`DestinationListing`]), and every consumer (human, `-o json`,
+/// `-o ndjson`) gets the same diagnostic.
+#[derive(Debug, Default)]
+pub struct LogParser {
+    held: Option<(String, DestinationListing)>,
+}
+
+impl LogParser {
+    /// Parse one raw line and return what it completes: usually just that
+    /// line; nothing while a destination error is still reading its listing;
+    /// and the error followed by this line once a line at column 0 ends the
+    /// listing.
+    pub fn push(&mut self, line: &str) -> Vec<Parsed> {
+        let mut done = Vec::new();
+        if let Some((_, listing)) = &mut self.held {
+            if line.trim().is_empty() || line.starts_with(char::is_whitespace) {
+                listing.line(line.trim());
+                return done;
+            }
+            done.extend(self.finish());
+        }
+        let event = parse_line(line);
+        match &event {
+            Event::Diagnostic {
+                kind: DiagKind::Error,
+                location: None,
+                message,
+            } if is_destination_error(message) => {
+                self.held = Some((line.to_string(), DestinationListing::new(message)));
+            }
+            _ => done.push(Parsed {
+                raw: line.to_string(),
+                event,
+            }),
+        }
+        done
+    }
+
+    /// The destination error still waiting when the output ends — xcodebuild
+    /// exits right after printing the listing, so this is where it usually
+    /// comes out.
+    pub fn finish(&mut self) -> Option<Parsed> {
+        let (raw, listing) = self.held.take()?;
+        Some(Parsed {
+            raw,
+            event: Event::Diagnostic {
+                kind: DiagKind::Error,
+                location: None,
+                message: listing.message(),
+            },
+        })
+    }
+}
+
+/// Whether a location-less error's message is xcodebuild failing to use the
+/// requested destination: `Timed out waiting for all destinations matching the
+/// provided destination specifier …`, `Unable to find a device matching the
+/// provided destination specifier:`.
+#[must_use]
+pub fn is_destination_error(message: &str) -> bool {
+    message.contains("provided destination specifier")
+}
+
+/// How many listed destinations a destination error carries at most.
+const MAX_LISTED: usize = 8;
+
+/// The listing xcodebuild prints under a destination error, cut down to the
+/// part that explains it.
+///
+/// xcodebuild lists every destination the scheme can use and every one it
+/// cannot, which on a machine with the usual simulators is dozens of lines,
+/// nearly all beside the point. Kept: the specifier xcodebuild echoes as the
+/// requested destination and the entries for it, every usable destination
+/// with an `error:` (the locked phone, Developer Mode off), and the prose
+/// between sections. The rest are counted. Only the "Unable to find" error
+/// echoes a specifier; under a timeout, the `error:` entries are what explain
+/// it.
+#[derive(Debug)]
+struct DestinationListing {
+    lines: Vec<String>,
+    requested: Option<Vec<(String, String)>>,
+    section: Option<Section>,
+    kept: usize,
+    omitted: usize,
+}
+
+/// One `Destinations compatible with the "App" scheme:` block of the listing.
+#[derive(Debug)]
+struct Section {
+    header: String,
+    /// The "compatible" (older Xcode: "available") side, as opposed to
+    /// "incompatible" / "ineligible", whose every entry has an `error:` saying
+    /// its platform does not match.
+    usable: bool,
+    /// The header is written once, ahead of the first entry kept under it.
+    written: bool,
+}
+
+impl DestinationListing {
+    fn new(message: &str) -> Self {
+        Self {
+            lines: vec![message.to_string()],
+            requested: None,
+            section: None,
+            kept: 0,
+            omitted: 0,
+        }
+    }
+
+    /// Take one trimmed line of the listing.
+    fn line(&mut self, t: &str) {
+        if t.is_empty() {
+            return;
+        }
+        if t.starts_with('{') && t.ends_with('}') {
+            let fields = listing_fields(t);
+            let Some(section) = &mut self.section else {
+                // An entry ahead of any section is the specifier echoed back.
+                self.lines.push(format!("  {t}"));
+                self.requested.get_or_insert(fields);
+                return;
+            };
+            let requested = self
+                .requested
+                .as_deref()
+                .is_some_and(|r| is_requested(r, &fields));
+            let explains = section.usable && field(&fields, "error").is_some();
+            if (requested || explains) && self.kept < MAX_LISTED {
+                if !section.written {
+                    self.lines.push(format!("  {}", section.header));
+                    section.written = true;
+                }
+                self.lines.push(format!("    {t}"));
+                self.kept += 1;
+            } else {
+                self.omitted += 1;
+            }
+        } else if t.ends_with(':') && t.to_ascii_lowercase().contains("destinations") {
+            let lower = t.to_ascii_lowercase();
+            let usable = !(lower.contains("incompatible") || lower.contains("ineligible"));
+            self.section = Some(Section {
+                header: t.to_string(),
+                usable,
+                written: false,
+            });
+        } else {
+            self.lines.push(format!("  {t}"));
+        }
+    }
+
+    /// The error's message with the kept lines under it.
+    fn message(&self) -> String {
+        let mut lines = self.lines.clone();
+        match self.omitted {
+            0 => {}
+            1 => lines.push("  (1 other destination omitted)".to_string()),
+            n => lines.push(format!("  ({n} other destinations omitted)")),
+        }
+        lines.join("\n")
+    }
+}
+
+/// The `key:value` fields of one `{ platform:iOS, id:…, name:…, error:… }`
+/// listing entry. `error:` comes last and is free text that can hold ", " of
+/// its own, so it is split off whole first; a piece of the rest without a
+/// `key:` of its own belongs to the value before it (a name with a comma).
+fn listing_fields(entry: &str) -> Vec<(String, String)> {
+    let inner = entry.trim_start_matches('{').trim_end_matches('}').trim();
+    let (head, error) = match inner.strip_prefix("error:") {
+        Some(error) => ("", Some(error)),
+        None => inner
+            .split_once(", error:")
+            .map_or((inner, None), |(head, error)| (head, Some(error))),
+    };
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for piece in head.split(", ").filter(|p| !p.is_empty()) {
+        match piece.split_once(':') {
+            Some((key, value)) if !key.is_empty() && key.chars().all(char::is_alphanumeric) => {
+                fields.push((key.to_string(), value.to_string()));
+            }
+            _ => {
+                if let Some((_, value)) = fields.last_mut() {
+                    value.push_str(", ");
+                    value.push_str(piece);
+                }
+            }
+        }
+    }
+    if let Some(error) = error {
+        fields.push(("error".to_string(), error.trim().to_string()));
+    }
+    fields
+}
+
+/// Whether a listing entry is the destination xcodebuild echoed as requested:
+/// the same id, else the same name (on the same platform, when one was
+/// given), else, for a bare platform such as `generic/platform=iOS`, that
+/// platform's placeholder ("Any iOS Device").
+fn is_requested(requested: &[(String, String)], entry: &[(String, String)]) -> bool {
+    if let Some(id) = field(requested, "id") {
+        return field(entry, "id").is_some_and(|e| e.eq_ignore_ascii_case(id));
+    }
+    let platform = field(requested, "platform");
+    let same_platform = platform.is_none() || field(entry, "platform") == platform;
+    if let Some(name) = field(requested, "name") {
+        return same_platform && field(entry, "name") == Some(name);
+    }
+    platform.is_some()
+        && same_platform
+        && field(entry, "id").is_some_and(|id| id.ends_with(":placeholder"))
+}
+
+fn field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 /// Whether a diagnostic prefix names a source location (`file[:line[:col]]`)
@@ -499,34 +848,109 @@ pub fn run(
     out: &Output,
     label: &str,
 ) -> Result<bool, CliError> {
-    Ok(run_collecting(program, args, cwd, out, label)?.0)
+    Ok(stream(program, args, cwd, out, label, None)?.0)
 }
 
-/// Like [`run`], but also collects each diagnostic as its
-/// [`event_json`]-shaped object — the input to the last-build diagnostics
-/// artifact.
+/// Like [`run`], but also returns the error lines it showed ([`ErrorLines`]).
+pub fn run_keeping_errors(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    out: &Output,
+    label: &str,
+) -> Result<(bool, Vec<String>), CliError> {
+    let mut progress = BuildProgress::start(out, label);
+    let mut errors = ErrorLines::default();
+    let mut parser = LogParser::default();
+    let mut show = |parsed: &Parsed| {
+        errors.parsed(parsed);
+        if let Some(rendered) = progress.parsed(parsed) {
+            out.line(&rendered);
+        }
+    };
+    let ok = process::stream_lines(program, args, cwd, |line| {
+        parser.push(line).iter().for_each(&mut show);
+    })?;
+    parser.finish().iter().for_each(&mut show);
+    Ok((ok, errors.into_lines()))
+}
+
+/// Like [`run`], for an xcodebuild build or test run: also collects each
+/// diagnostic its build step printed ([`BuildDiagnostics`]) as its
+/// [`event_json`]-shaped object (the input to the last-build diagnostics
+/// artifact), and a failed run whose output printed no failure banner closes
+/// on `failed`'s (see [`BuildProgress::close_failed`]).
 pub fn run_collecting(
     program: &str,
     args: &[&str],
     cwd: Option<&Path>,
     out: &Output,
     label: &str,
+    failed: ResultKind,
+) -> Result<(bool, Vec<serde_json::Value>, Option<String>), CliError> {
+    stream(program, args, cwd, out, label, Some(failed))
+}
+
+fn stream(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    out: &Output,
+    label: &str,
+    failed: Option<ResultKind>,
 ) -> Result<(bool, Vec<serde_json::Value>, Option<String>), CliError> {
     let mut progress = BuildProgress::start(out, label);
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = BuildDiagnostics::default();
     let mut watch = BlockerWatch::default();
-    let ok = process::stream_lines(program, args, cwd, |line| {
-        watch.line(line);
-        if let Event::Diagnostic { .. } = parse_line(line)
-            && let Some(json) = event_json(&parse_line(line))
-        {
-            diagnostics.push(json);
-        }
-        if let Some(rendered) = progress.line(line) {
+    let mut parser = LogParser::default();
+    let mut show = |parsed: &Parsed| {
+        diagnostics.take(parsed);
+        if let Some(rendered) = progress.parsed(parsed) {
             out.line(&rendered);
         }
+    };
+    let ok = process::stream_lines(program, args, cwd, |line| {
+        watch.line(line);
+        parser.push(line).iter().for_each(&mut show);
     })?;
-    Ok((ok, diagnostics, watch.hint()))
+    parser.finish().iter().for_each(&mut show);
+    if !ok
+        && let Some(kind) = failed
+        && let Some(banner) = progress.close_failed(kind)
+    {
+        out.line(&banner);
+    }
+    Ok((ok, diagnostics.list, watch.hint()))
+}
+
+/// The diagnostics a run's build step printed, taken line by line. A test run
+/// goes on to print its tests' output, where XCTest writes a failed assertion
+/// as `<file>:<line>: error: -[…] : …`. Those are not the build's, so taking
+/// stops at the run's first test line ([`starts_the_tests`]). A build prints
+/// none, and keeps every diagnostic.
+#[derive(Debug, Default)]
+struct BuildDiagnostics {
+    list: Vec<serde_json::Value>,
+    testing: bool,
+}
+
+impl BuildDiagnostics {
+    fn take(&mut self, parsed: &Parsed) {
+        self.testing = self.testing || starts_the_tests(&parsed.raw);
+        if !self.testing
+            && matches!(parsed.event, Event::Diagnostic { .. })
+            && let Some(json) = event_json(&parsed.event)
+        {
+            self.list.push(json);
+        }
+    }
+}
+
+/// Whether `line` is a test run's own output rather than its build step's:
+/// a suite or case marker of XCTest, Swift Testing or a parallel run, or
+/// Swift Testing's `◇ Test run started.` ([`test_markers::is_test_output`]).
+fn starts_the_tests(line: &str) -> bool {
+    test_markers::is_test_output(line)
 }
 
 /// Watches a build's output for a failure that no diagnostic describes and no
@@ -594,17 +1018,18 @@ pub fn blocker_from_transcript(text: &str) -> Option<String> {
     watch.hint()
 }
 
-/// Diagnostics parsed out of a full captured transcript (the `--json` path).
+/// The diagnostics a full captured transcript's build step printed (the
+/// `--json` path; see [`BuildDiagnostics`]).
 #[must_use]
 pub fn diagnostics_from_transcript(text: &str) -> Vec<serde_json::Value> {
-    text.lines()
-        .filter_map(|line| {
-            let event = parse_line(line);
-            matches!(event, Event::Diagnostic { .. })
-                .then(|| event_json(&event))
-                .flatten()
-        })
-        .collect()
+    let mut parser = LogParser::default();
+    let mut parsed: Vec<Parsed> = text.lines().flat_map(|line| parser.push(line)).collect();
+    parsed.extend(parser.finish());
+    let mut diagnostics = BuildDiagnostics::default();
+    for p in &parsed {
+        diagnostics.take(p);
+    }
+    diagnostics.list
 }
 
 /// One parsed [`Event`] as an NDJSON object for `-o ndjson` consumers, or
@@ -639,55 +1064,67 @@ pub fn event_json(event: &Event) -> Option<serde_json::Value> {
             json!({ "event": "test", "status": "passed", "name": name, "duration": duration })
         }
         Event::TestFailed { name } => json!({ "event": "test", "status": "failed", "name": name }),
+        Event::TestSkipped { name } => {
+            json!({ "event": "test", "status": "skipped", "name": name })
+        }
         Event::SuiteStarted { name } => json!({ "event": "suite", "name": name }),
         Event::Result(_) | Event::Other(_) => return None,
     })
 }
 
-/// Error/warning counts, elapsed time, and the diagnostic events accumulated
-/// by [`run_ndjson`] — counts fold into the terminal result payload, the
-/// diagnostics into the last-build artifact.
-#[derive(Debug, Default)]
-pub struct StreamStats {
-    pub errors: u32,
-    pub warnings: u32,
+/// A finished build's error/warning counts and elapsed time, for the terminal
+/// result payload. Tallied from the parsed diagnostics rather than by any one
+/// runner, so every mode that parsed them reports the same numbers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BuildStats {
+    pub errors: usize,
+    pub warnings: usize,
     pub duration_ms: u64,
-    pub diagnostics: Vec<serde_json::Value>,
-    /// Set when the build was blocked rather than broken — see [`BlockerWatch`].
-    pub blocker: Option<String>,
+}
+
+impl BuildStats {
+    #[must_use]
+    pub fn tally(diagnostics: &[serde_json::Value], elapsed: Duration) -> Self {
+        let count = |severity: &str| {
+            diagnostics
+                .iter()
+                .filter(|d| d["severity"] == severity)
+                .count()
+        };
+        Self {
+            errors: count("error"),
+            warnings: count("warning"),
+            duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        }
+    }
 }
 
 /// Run a command emitting each parsed event as an NDJSON line on stdout — the
-/// `-o ndjson` path for builds/tests. The caller folds the returned
-/// [`StreamStats`] into its terminal `{"event":"result"}` payload, so the
-/// stream ends with exactly one summary line.
+/// `-o ndjson` path for builds/tests. Returns whether it succeeded, the
+/// build step's diagnostics, and the blocker hint, as [`run_collecting`] does;
+/// the caller closes the stream with its terminal `{"event":"result"}` line, so
+/// the stream ends with exactly one summary line.
 pub fn run_ndjson(
     program: &str,
     args: &[&str],
     cwd: Option<&Path>,
     out: &Output,
-) -> Result<(bool, StreamStats), CliError> {
-    let start = Instant::now();
-    let mut stats = StreamStats::default();
+) -> Result<(bool, Vec<serde_json::Value>, Option<String>), CliError> {
+    let mut diagnostics = BuildDiagnostics::default();
     let mut watch = BlockerWatch::default();
-    let ok = process::stream_lines(program, args, cwd, |line| {
-        watch.line(line);
-        let event = parse_line(line);
-        if let Some(json) = event_json(&event) {
-            if let Event::Diagnostic { kind, .. } = &event {
-                match kind {
-                    DiagKind::Error => stats.errors += 1,
-                    DiagKind::Warning => stats.warnings += 1,
-                    DiagKind::Note => {}
-                }
-                stats.diagnostics.push(json.clone());
-            }
+    let mut parser = LogParser::default();
+    let mut emit = |parsed: &Parsed| {
+        diagnostics.take(parsed);
+        if let Some(json) = event_json(&parsed.event) {
             out.ndjson_event(&json);
         }
+    };
+    let ok = process::stream_lines(program, args, cwd, |line| {
+        watch.line(line);
+        parser.push(line).iter().for_each(&mut emit);
     })?;
-    stats.duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    stats.blocker = watch.hint();
-    Ok((ok, stats))
+    parser.finish().iter().for_each(&mut emit);
+    Ok((ok, diagnostics.list, watch.hint()))
 }
 
 // --- helpers ---
@@ -720,18 +1157,30 @@ fn last_token(line: &str) -> Option<String> {
     line.split_whitespace().last().map(str::to_string)
 }
 
-/// `-[AppTests testArithmetic]` → `AppTests.testArithmetic`.
-fn clean_test_name(raw: &str) -> String {
-    raw.trim_matches(|c| c == '-' || c == '+' || c == '[' || c == ']')
-        .replace(' ', ".")
+/// One diagnostic as the build log shows it, `error: <location>: <message>`:
+/// red for an error, yellow for a warning, dim for a note.
+#[must_use]
+pub fn diagnostic_line(
+    kind: &DiagKind,
+    location: Option<&str>,
+    message: &str,
+    color: bool,
+) -> String {
+    let c = Colors::new(color);
+    let loc = location.map(|l| format!("{l}: ")).unwrap_or_default();
+    match kind {
+        DiagKind::Error => c.red(&format!("error: {loc}{message}")),
+        DiagKind::Warning => c.yellow(&format!("warning: {loc}{message}")),
+        DiagKind::Note => c.dim(&format!("note: {loc}{message}")),
+    }
 }
 
-/// Extract `0.123 seconds` from `passed (0.123 seconds).`.
-fn parse_paren(tail: &str) -> String {
-    match (tail.find('('), tail.find(')')) {
-        (Some(a), Some(b)) if b > a + 1 => tail[a + 1..b].to_string(),
-        _ => String::new(),
-    }
+/// The word a build's outcome is reported by, colored the way the build log's
+/// closing line is: green for a success, bold red for a failure.
+#[must_use]
+pub fn outcome_word(ok: bool, word: &str, color: bool) -> String {
+    let c = Colors::new(color);
+    if ok { c.green(word) } else { c.red_bold(word) }
 }
 
 /// ANSI color helpers, no-ops when color is disabled.
@@ -775,6 +1224,36 @@ impl Colors {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_recorded_diagnostic_is_colored_like_the_live_one() {
+        let line = |severity: &str, color| {
+            diagnostic_line(
+                &DiagKind::from_severity(severity),
+                Some("A.swift:3:1"),
+                "boom",
+                color,
+            )
+        };
+        assert_eq!(
+            line("error", true),
+            "\x1b[31merror: A.swift:3:1: boom\x1b[0m"
+        );
+        assert_eq!(
+            line("warning", true),
+            "\x1b[33mwarning: A.swift:3:1: boom\x1b[0m"
+        );
+        assert_eq!(
+            line("remark", true),
+            "\x1b[2mnote: A.swift:3:1: boom\x1b[0m"
+        );
+        assert_eq!(line("error", false), "error: A.swift:3:1: boom");
+        assert_eq!(
+            outcome_word(false, "FAILED", true),
+            "\x1b[1;31mFAILED\x1b[0m"
+        );
+        assert_eq!(outcome_word(true, "succeeded", false), "succeeded");
+    }
 
     /// The Xcode 26 shape: the validation step is named only in the list of
     /// failed build commands, with curly quotes.
@@ -827,6 +1306,367 @@ The following build commands failed:
         assert!(blocker_from_transcript(other).is_none());
     }
     use super::*;
+
+    fn plain_progress() -> BuildProgress {
+        BuildProgress {
+            spinner: None,
+            start: Instant::now(),
+            color: false,
+            verbose: false,
+            quiet: false,
+            gh_annotations: false,
+            continues: false,
+            closed_failed: false,
+        }
+    }
+
+    /// A failed run gets its `✗` banner exactly once: from xcodebuild's own
+    /// `** … FAILED **` line when it printed one, else from `close_failed`.
+    #[test]
+    fn a_failed_run_closes_on_one_banner() {
+        let mut progress = plain_progress();
+        let _ = progress.line("xcodebuild: error: Unable to find a device matching …");
+        assert_eq!(
+            progress.close_failed(ResultKind::BuildFailed).as_deref(),
+            Some("✗ Build failed")
+        );
+        assert_eq!(progress.close_failed(ResultKind::BuildFailed), None);
+
+        let mut progress = plain_progress();
+        assert_eq!(
+            progress.line("** TEST FAILED **").as_deref(),
+            Some("✗ Tests failed")
+        );
+        assert_eq!(progress.close_failed(ResultKind::TestFailed), None);
+    }
+
+    /// `xcodebuild -resolvePackageDependencies` prints why it failed on the
+    /// indented lines under its header. Those lines are shown with it, and the
+    /// first line that is not indented ends them.
+    #[test]
+    fn the_reason_under_an_xcodebuild_error_is_shown_with_it() {
+        let mut progress = plain_progress();
+        let shown: Vec<String> = [
+            "Resolve Package Graph",
+            "xcodebuild: error: Could not resolve package dependencies:",
+            "  Disabled default traits on package 'swift-collections' that declares no traits.",
+            "  fatalError",
+            "Writing error result bundle",
+            "  still hidden",
+        ]
+        .iter()
+        .filter_map(|line| progress.line(line))
+        .collect();
+        assert_eq!(
+            shown,
+            [
+                "error: xcodebuild: Could not resolve package dependencies:",
+                "  Disabled default traits on package 'swift-collections' that declares no traits.",
+                "  fatalError",
+            ]
+        );
+    }
+
+    /// The error lines kept for an error message are the ones shown in red,
+    /// as the tool printed them: no warning, no source excerpt, and the
+    /// reason under a header that ends in a colon.
+    #[test]
+    fn the_errors_kept_are_the_errors_shown() {
+        let mut parser = LogParser::default();
+        let mut errors = ErrorLines::default();
+        for line in [
+            "Resolve Package Graph",
+            "warning: 'swift-numerics': skipping cache due to an error",
+            "/src/Package.swift:12:5: error: cannot find 'x' in scope",
+            "    let y = x",
+            "xcodebuild: error: Could not resolve package dependencies:",
+            "  Disabled default traits on package 'swift-collections' that declares no traits.",
+            "  fatalError",
+            "Writing error result bundle",
+            "  still hidden",
+        ] {
+            parser.push(line).iter().for_each(|p| errors.parsed(p));
+        }
+        parser.finish().iter().for_each(|p| errors.parsed(p));
+        assert_eq!(
+            errors.into_lines(),
+            [
+                "/src/Package.swift:12:5: error: cannot find 'x' in scope",
+                "xcodebuild: error: Could not resolve package dependencies:",
+                "  Disabled default traits on package 'swift-collections' that declares no traits.",
+                "  fatalError",
+            ]
+        );
+    }
+
+    /// The indented source excerpt under a compiler error stays hidden: the
+    /// error has a location and does not announce a list.
+    #[test]
+    fn a_compiler_errors_source_excerpt_is_not_a_continuation() {
+        let mut progress = plain_progress();
+        let shown: Vec<String> = [
+            "/src/Foo.swift:12:5: error: cannot find 'x' in scope",
+            "    let y = x",
+            "            ^",
+        ]
+        .iter()
+        .filter_map(|line| progress.line(line))
+        .collect();
+        assert_eq!(
+            shown,
+            ["error: /src/Foo.swift:12:5: cannot find 'x' in scope"]
+        );
+    }
+
+    /// Xcode 27 building for a paired iPhone that is locked: the timeout line,
+    /// two blank lines, then the listing with the reason. Captured from
+    /// `sweetpad build --on <udid> -v` on the CI fixture app.
+    const DESTINATION_TIMEOUT_27: &str = "\
+Writing result bundle at path:
+\t/Users/me/.local/state/sweetpad/results/SweetpadCIApp-07bf27757d6d516c-build.xcresult
+
+xcodebuild: error: Timed out waiting for all destinations matching the provided destination specifier to become available
+
+
+\tDestinations compatible with the \"SweetpadCIApp\" scheme:
+\t\t{ platform:iOS, arch:arm64, id:00008110-000559182E90401E, name:Iphone 13, error:Iphone 13 needs to be unlocked to enable development services Please unlock the device. }
+";
+
+    /// Xcode 27 with a destination id that matches nothing, from the same
+    /// fixture with `--destination id=00000000-0000000000000000`. Captured
+    /// verbatim except that the listing is cut to a few entries per section
+    /// (the machine listed 16 compatible and 10 incompatible).
+    const DESTINATION_NOT_FOUND_27: &str = "\
+xcodebuild: error: Unable to find a device matching the provided destination specifier:
+\t\t{ id:00000000-0000000000000000 }
+
+\tThe requested device could not be found because no available devices matched the request.
+
+\tDestinations compatible with the \"SweetpadCIApp\" scheme:
+\t\t{ platform:macOS, arch:arm64, variant:Designed for [iPad,iPhone], id:00006030-0018296E1A28001C, name:My Mac }
+\t\t{ platform:iOS, arch:arm64, id:00008110-000559182E90401E, name:Iphone 13 }
+\t\t{ platform:iOS, id:dvtdevice-DVTiPhonePlaceholder-iphoneos:placeholder, name:Any iOS Device }
+\t\t{ platform:iOS Simulator, arch:arm64, id:F13C004A-0824-4870-B4F2-29AAEE36636E, OS:27.0, name:iPhone 17 }
+
+\tDestinations incompatible with the \"SweetpadCIApp\" scheme:
+\t\t{ platform:macOS, arch:arm64e, id:00006030-0018296E1A28001C, name:My Mac, error:My Mac\u{2019}s macOS platform doesn\u{2019}t match SweetpadCIApp.app\u{2019}s supported platforms. You can change SweetpadCIApp.app\u{2019}s Base SDK or Supported Platforms to support My Mac. }
+\t\t{ platform:tvOS Simulator, arch:arm64, id:2CD2A3F5-8763-46B5-B7FC-F04117966B44, OS:27.0, name:Apple TV 4K (3rd generation), error:Apple TV 4K (3rd generation)\u{2019}s tvOS Simulator platform doesn\u{2019}t match SweetpadCIApp.app\u{2019}s supported platforms. You can change SweetpadCIApp.app\u{2019}s Base SDK or Supported Platforms to support Apple TV 4K (3rd generation). }
+";
+
+    /// A serial test run on Xcode 27, cut down: the build's warning, then the
+    /// host app's launch chatter, XCTest's markers and a failed assertion,
+    /// then Swift Testing's run with a line an app could print.
+    const TEST_RUN_27: &str = "\
+SwiftCompile normal arm64 /app/Tests/MacTests/XCTests.swift (in target 'AppTests' from project 'App')
+/app/Tests/MacTests/XCTests.swift:5:39: warning: initialization of immutable value 'unused' was never used
+2026-09-27 01:16:41.215013+0200 App[8044:21987686] [Connection] Unable to get synchronousRemoteObjectProxy, error: Error Domain=NSCocoaErrorDomain Code=4097
+Test Suite 'All tests' started at 2026-09-27 01:16:41.452.
+Test Case '-[AppTests.ArithmeticTests testArithmetic]' started.
+/app/Tests/MacTests/XCTests.swift:5: error: -[AppTests.ArithmeticTests testArithmetic] : XCTAssertEqual failed: (\"4\") is not equal to (\"5\")
+Test Case '-[AppTests.ArithmeticTests testArithmetic]' failed (0.056 seconds).
+\u{25c7} Test run started.
+App: error: something the app logged
+** TEST FAILED **
+";
+
+    /// A test run's output after its first test line is the tests' own, and
+    /// XCTest's `file:line: error:` for a failed assertion is not the build's.
+    #[test]
+    fn a_test_runs_diagnostics_stop_at_its_first_test_line() {
+        let diagnostics = diagnostics_from_transcript(TEST_RUN_27);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0]["severity"], "warning");
+        assert_eq!(
+            diagnostics[0]["location"],
+            "/app/Tests/MacTests/XCTests.swift:5:39"
+        );
+    }
+
+    #[test]
+    fn a_test_line_is_any_of_the_markers_a_run_opens_with() {
+        for line in [
+            "Test Suite 'All tests' started at 2026-09-27 01:16:41.452.",
+            "Test Case '-[AppTests.ArithmeticTests testArithmetic]' started.",
+            "Test suite 'ArithmeticTests' started on 'My Mac - App (21220)'",
+            "Test case 'ParallelSuite/b()' passed on 'My Mac - App (21220)' (0.101 seconds)",
+            "\u{25c7} Test run started.",
+        ] {
+            assert!(starts_the_tests(line), "{line}");
+        }
+        for line in [
+            "/app/A.swift:1:1: error: cannot find 'x' in scope",
+            "Testing started",
+            "Test session results, code coverage, and logs:",
+        ] {
+            assert!(!starts_the_tests(line), "{line}");
+        }
+    }
+
+    fn only_message(transcript: &str) -> String {
+        let diagnostics = diagnostics_from_transcript(transcript);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0]["severity"], "error");
+        assert!(diagnostics[0]["location"].is_null());
+        diagnostics[0]["message"].as_str().unwrap().to_string()
+    }
+
+    /// The reason a device timed out is in the listing after the blank lines,
+    /// so the timeout diagnostic carries it.
+    #[test]
+    fn a_destination_timeout_carries_the_reason_from_the_listing() {
+        assert_eq!(
+            only_message(DESTINATION_TIMEOUT_27),
+            "xcodebuild: Timed out waiting for all destinations matching the provided \
+             destination specifier to become available\n  \
+             Destinations compatible with the \"SweetpadCIApp\" scheme:\n    \
+             { platform:iOS, arch:arm64, id:00008110-000559182E90401E, name:Iphone 13, \
+             error:Iphone 13 needs to be unlocked to enable development services Please \
+             unlock the device. }"
+        );
+    }
+
+    /// Nothing listed is the requested id, and no usable destination reports
+    /// an error: the echo and the explanation stay, every entry is counted.
+    /// The incompatible side's errors are only platform mismatches.
+    #[test]
+    fn a_destination_not_found_keeps_the_echo_and_counts_the_listing() {
+        assert_eq!(
+            only_message(DESTINATION_NOT_FOUND_27),
+            "xcodebuild: Unable to find a device matching the provided destination specifier:\n  \
+             { id:00000000-0000000000000000 }\n  \
+             The requested device could not be found because no available devices matched \
+             the request.\n  \
+             (6 other destinations omitted)"
+        );
+    }
+
+    /// The older headers ("Available" / "Ineligible destinations for …"), in
+    /// the shape the feedback log quotes from a timed out wireless iPhone.
+    /// The simulators around it are the noise the listing drops.
+    #[test]
+    fn the_older_listing_headers_are_read_the_same_way() {
+        let transcript = "\
+xcodebuild: error: Timed out waiting for all destinations matching the provided destination specifier to become available
+
+\tAvailable destinations for the \"Reflow\" scheme:
+\t\t{ platform:iOS, arch:arm64, id:00008110-000559182E90401E, name:Iphone 13, error:Browsing on the local area network for Iphone 13, which has previously reported preparation errors. The device must be opted into Developer Mode to connect wirelessly. }
+\t\t{ platform:iOS Simulator, arch:arm64, id:F13C004A-0824-4870-B4F2-29AAEE36636E, OS:18.0, name:iPhone 16 }
+\t\t{ platform:iOS Simulator, arch:arm64, id:C25725CE-4886-4E68-B032-55EB2918FF60, OS:18.0, name:iPhone 16 Pro }
+
+\tIneligible destinations for the \"Reflow\" scheme:
+\t\t{ platform:watchOS Simulator, id:ABD4EBF9-910F-4A29-89D7-9B40DB2D7D18, OS:11.0, name:Apple Watch Series 10, error:watchOS doesn't match Reflow's supported platforms. }
+";
+        let message = only_message(transcript);
+        assert!(
+            message.contains("\n  Available destinations for the \"Reflow\" scheme:\n    "),
+            "{message}"
+        );
+        assert!(
+            message.contains("must be opted into Developer Mode to connect wirelessly"),
+            "{message}"
+        );
+        assert!(!message.contains("iPhone 16"), "{message}");
+        assert!(!message.contains("Ineligible"), "{message}");
+        assert!(
+            message.ends_with("(3 other destinations omitted)"),
+            "{message}"
+        );
+    }
+
+    /// A requested destination that is listed as unusable is the cause, so it
+    /// is kept even from the incompatible side; the others there are not.
+    #[test]
+    fn the_requested_destination_is_kept_from_either_side() {
+        let transcript = "\
+xcodebuild: error: Unable to find a destination matching the provided destination specifier:
+\t\t{ generic:1, platform:iOS }
+
+\tIneligible destinations for the \"App\" scheme:
+\t\t{ platform:iOS, id:dvtdevice-DVTiPhonePlaceholder-iphoneos:placeholder, name:Any iOS Device, error:iOS 27.0 is not installed. Please download and install the platform from Xcode > Settings > Components. }
+\t\t{ platform:tvOS, id:dvtdevice-DVTiOSDevicePlaceholder-appletvos:placeholder, name:Any tvOS Device, error:tvOS 27.0 is not installed. }
+";
+        let message = only_message(transcript);
+        assert!(message.contains("name:Any iOS Device"), "{message}");
+        assert!(!message.contains("Any tvOS Device"), "{message}");
+        assert!(
+            message.ends_with("(1 other destination omitted)"),
+            "{message}"
+        );
+
+        let by_id = [("id".to_string(), "abc".to_string())];
+        let by_name = [
+            ("platform".to_string(), "iOS Simulator".to_string()),
+            ("name".to_string(), "iPhone 17".to_string()),
+        ];
+        let entry = listing_fields(
+            "{ platform:iOS Simulator, arch:arm64, id:ABC, OS:27.0, name:iPhone 17 }",
+        );
+        assert!(is_requested(&by_id, &entry));
+        assert!(is_requested(&by_name, &entry));
+        assert!(!is_requested(
+            &[("name".to_string(), "iPhone 17 Pro".to_string())],
+            &entry
+        ));
+    }
+
+    /// `error:` is free text with commas of its own, and a device name can
+    /// hold one too.
+    #[test]
+    fn listing_fields_keep_commas_inside_values() {
+        let fields = listing_fields(
+            "{ platform:iOS, id:X, name:Bob, Work, error:Browsing for Bob, which failed. }",
+        );
+        assert_eq!(field(&fields, "name"), Some("Bob, Work"));
+        assert_eq!(
+            field(&fields, "error"),
+            Some("Browsing for Bob, which failed.")
+        );
+        assert_eq!(
+            field(
+                &listing_fields("{ platform:macOS, variant:Designed for [iPad,iPhone], id:Y }"),
+                "variant"
+            ),
+            Some("Designed for [iPad,iPhone]")
+        );
+    }
+
+    /// The live paths see the same diagnostic as the transcript: held while
+    /// the listing prints, rendered once it ends (here by the end of output),
+    /// with a line at column 0 ending the listing early.
+    #[test]
+    fn the_stream_holds_a_destination_error_until_its_listing_ends() {
+        let mut parser = LogParser::default();
+        let mut progress = plain_progress();
+        let mut shown: Vec<String> = Vec::new();
+        for line in DESTINATION_TIMEOUT_27.lines() {
+            for parsed in parser.push(line) {
+                shown.extend(progress.parsed(&parsed));
+            }
+        }
+        assert!(shown.is_empty(), "{shown:?}");
+        let last = parser.finish().expect("the error is held");
+        let rendered = progress.parsed(&last).unwrap();
+        assert!(
+            rendered.starts_with("error: xcodebuild: Timed out"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("needs to be unlocked"), "{rendered}");
+
+        let mut parser = LogParser::default();
+        let mut events: Vec<Event> = Vec::new();
+        for line in [
+            "xcodebuild: error: Unable to find a device matching the provided destination specifier:",
+            "\t\t{ id:00000000-0000000000000000 }",
+            "",
+            "** BUILD FAILED **",
+        ] {
+            events.extend(parser.push(line).into_iter().map(|p| p.event));
+        }
+        assert!(parser.finish().is_none());
+        assert!(matches!(&events[0], Event::Diagnostic { message, .. }
+            if message.ends_with("{ id:00000000-0000000000000000 }")));
+        assert_eq!(events[1], Event::Result(ResultKind::BuildFailed));
+    }
 
     #[test]
     fn gh_annotations_carry_location_and_escapes() {
@@ -975,6 +1815,16 @@ The following build commands failed:
     }
 
     #[test]
+    fn a_swift_compile_that_names_no_file_is_not_a_compile_line() {
+        // Xcode 27 prints this once per target ahead of the per-file lines.
+        let bare =
+            "SwiftCompile normal arm64 (in target 'SweetpadCIApp' from project 'SweetpadCIApp')";
+        assert_eq!(parse_line(bare), Event::Other(bare.to_string()));
+        assert!(render(&parse_line(bare), false, false, false).is_none());
+        assert!(event_json(&parse_line(bare)).is_none());
+    }
+
+    #[test]
     fn batch_entries_survive_escaped_spaces_in_a_filename() {
         // `My File.swift` arrives as two tokens; the separator count keeps it one entry.
         let header = "SwiftCompile normal arm64 Compiling\\ My\\ File.swift \
@@ -1094,6 +1944,77 @@ The following build commands failed:
                 name: "AppTests.testBoom".to_string()
             }
         );
+        assert_eq!(
+            parse_line("Test Case '-[App.BetaTests testSkipped]' skipped (0.002 seconds)."),
+            Event::TestSkipped {
+                name: "App.BetaTests.testSkipped".to_string()
+            }
+        );
+        // A case's start is output, not a result.
+        assert!(matches!(
+            parse_line("Test Case '-[AppTests testBoom]' started."),
+            Event::Other(_)
+        ));
+    }
+
+    /// A parallel run reports every test in `xcodebuild`'s own form, and a
+    /// serial run prints Swift Testing's lines as they are (Xcode 27.0).
+    #[test]
+    fn parses_parallel_and_swift_testing_cases() {
+        let passed = |name: &str, duration: &str| Event::TestPassed {
+            name: name.to_string(),
+            duration: duration.to_string(),
+        };
+        let failed = |name: &str| Event::TestFailed {
+            name: name.to_string(),
+        };
+        let on = "on 'Clone 1 of iPhone 17 - App (27767)'";
+        assert_eq!(
+            parse_line(&format!(
+                "Test case 'BetaTests.testPassesToo()' passed {on} (0.206 seconds)"
+            )),
+            passed("BetaTests.testPassesToo", "0.206 seconds")
+        );
+        assert_eq!(
+            parse_line(&format!(
+                "Test case 'AlphaTests.testFails()' failed {on} (0.422 seconds)"
+            )),
+            failed("AlphaTests.testFails")
+        );
+        assert_eq!(
+            parse_line(&format!(
+                "Test case 'GammaSuite/disabled()' skipped {on} (0.000 seconds)"
+            )),
+            Event::TestSkipped {
+                name: "GammaSuite/disabled()".to_string()
+            }
+        );
+        assert_eq!(
+            parse_line("Test suite 'AlphaTests' started on 'My Mac - xctest (27838)'"),
+            Event::SuiteStarted {
+                name: "AlphaTests".to_string()
+            }
+        );
+        assert_eq!(
+            parse_line("✔ Test passing() passed after 0.001 seconds."),
+            passed("passing()", "0.001 seconds")
+        );
+        assert_eq!(
+            parse_line("✘ Test \"Named failing test\" failed after 0.001 seconds with 1 issue."),
+            failed("Named failing test")
+        );
+        assert_eq!(
+            parse_line("◇ Suite GammaSuite started."),
+            Event::SuiteStarted {
+                name: "GammaSuite".to_string()
+            }
+        );
+        assert!(matches!(
+            parse_line(
+                "✘ Test run with 5 tests in 1 suite failed after 0.002 seconds with 1 issue."
+            ),
+            Event::Other(_)
+        ));
     }
 
     #[test]
@@ -1105,6 +2026,16 @@ The following build commands failed:
         assert_eq!(
             parse_line("** TEST FAILED **"),
             Event::Result(ResultKind::TestFailed)
+        );
+        // `build-for-testing` ran no test, so its banner is a build's: it
+        // stamps the time on success and survives `-q` on failure.
+        assert_eq!(
+            parse_line("** TEST BUILD SUCCEEDED **"),
+            Event::Result(ResultKind::BuildSucceeded)
+        );
+        assert_eq!(
+            parse_line("** TEST BUILD FAILED **"),
+            Event::Result(ResultKind::BuildFailed)
         );
     }
 

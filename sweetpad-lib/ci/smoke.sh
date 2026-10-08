@@ -2,10 +2,29 @@
 #
 # End-to-end coverage for the standalone `sweetpad` CLI, exercising every command
 # against a real Xcode app (ci/fixture-app) and a real Swift package
-# (ci/fixture-spm) on a macOS runner with Xcode. Run by .github/workflows/cli-smoke.yaml.
+# (ci/fixture-spm) on a macOS runner with Xcode. Run by .github/workflows/cli-smoke.yaml
+# and xcode-tests.yaml.
 #
 # Requires: SWEETPAD_BIN pointing at the built binary; the app fixture already
 # generated with `xcodegen generate`.
+#
+# Safe to run on a dev Mac: it edits only scratch copies, never a tracked
+# file, and the iOS simulator it boots, shuts down and erases is its own.
+# SWEETPAD_SMOKE_DEST names one to use instead, as a destination
+# ('platform=iOS Simulator,id=<UDID>'); that simulator is erased at teardown
+# too. Without it the script makes a simulator for the run, modelled on the
+# first iOS simulator 'destination list' reports, and deletes it on exit.
+# sweetpad's state, config and caches (XDG_STATE_HOME, XDG_CONFIG_HOME,
+# XDG_CACHE_HOME) live in a directory the run makes and removes, so the run
+# reads none of your config and leaves no remembered context behind.
+#
+# Runs from two checkouts can share a Mac. Each builds into its own
+# DerivedData, and the CLI finds a running macOS app by its executable path,
+# so neither stops the other's app. The macOS app a run scaffolds gets a
+# bundle id of its own, but the committed fixture's, dev.sweetpad.ci.mac, is
+# the same in every run: macOS keys the app's preferences and saved state on
+# it, and 'app logs --exits' looks its exits up by it. Two runs from one
+# checkout also share its DerivedData, so run those one at a time.
 set -euo pipefail
 
 BIN="${SWEETPAD_BIN:?set SWEETPAD_BIN to the sweetpad binary}"
@@ -13,6 +32,37 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="$ROOT/fixture-app"
 SPM_DIR="$ROOT/fixture-spm"
 APP="$APP_DIR/SweetpadCIApp.xcodeproj"
+
+XDG_DIR="$(mktemp -d)"
+export XDG_STATE_HOME="$XDG_DIR/state" XDG_CONFIG_HOME="$XDG_DIR/config" \
+  XDG_CACHE_HOME="$XDG_DIR/cache"
+
+# Whatever the run makes outside the repo goes when it ends, pass or fail: the
+# simulator it created, the DerivedData its scratch projects built into (a
+# project-scoped purge takes only that project's own folder), the scratch
+# directories, and the XDG directory last, since the purges run the CLI. A
+# simulator from SWEETPAD_SMOKE_DEST is the caller's and stays.
+CREATED_SIM=""
+cleanup() {
+  local rc=$?
+  if [ -n "$CREATED_SIM" ]; then
+    xcrun simctl shutdown "$CREATED_SIM" >/dev/null 2>&1 || true
+    xcrun simctl delete "$CREATED_SIM" >/dev/null 2>&1 || true
+  fi
+  local proj dir
+  for proj in "${GEN_PROJ:-}" "${MAC_PROJ:-}" "${TREE_PROJ:-}"; do
+    if [ -n "$proj" ] && [ -d "$proj" ]; then
+      "$BIN" derived-data purge --project "$proj" --yes >/dev/null 2>&1 || true
+    fi
+  done
+  for dir in "${GEN_DIR:-}" "${TREE_DIR:-}" "${ARCH_DIR:-}" "${FORMAT_DIR:-}" "${SHOT:-}" "$XDG_DIR"; do
+    if [ -n "$dir" ]; then
+      rm -rf "$dir"
+    fi
+  done
+  exit "$rc"
+}
+trap cleanup EXIT
 
 CHECKS=0
 section() { echo; echo "==== $* ===="; }
@@ -46,7 +96,9 @@ expect_code_in() {
   [ "$rc" -eq "$want" ] || fail "expected exit $want in $dir, got $rc: $*"
 }
 
-# Run a streaming command for N seconds, then stop it (SIGTERM is success).
+# Run a streaming command for N seconds, then stop it (SIGTERM is success). One
+# still running 30s after the SIGTERM is killed and fails the run, instead of
+# hanging the job until its timeout.
 run_briefly() {
   local secs="$1"
   shift
@@ -54,7 +106,13 @@ run_briefly() {
   local pid=$!
   sleep "$secs"
   kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  ( sleep 30; kill -KILL "$pid" 2>/dev/null ) &
+  local watchdog=$!
+  local rc=0
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  [ "$rc" -ne 137 ] || fail "still running 30s after SIGTERM: $*"
 }
 
 # A JSON field assertion via python3: <json> <python-expr over `d`> <expected>.
@@ -124,11 +182,45 @@ ok "destination list (human)"
 "$BIN" simulator list --json >/dev/null
 ok "simulator list"
 
-DEST=$(python3 -c "import json,subprocess;d=json.loads(subprocess.check_output(['$BIN','destination','list','--json']))['data']['destinations'];print(next(x['destination'] for x in d if x['kind']=='simulator' and x['os']=='iOS'))")
-UDID="${DEST##*id=}"
+if [ -n "${SWEETPAD_SMOKE_DEST:-}" ]; then
+  DEST="$SWEETPAD_SMOKE_DEST"
+  UDID=$(printf '%s' "$DEST" | sed -n 's/.*id=\([^,]*\).*/\1/p')
+  [ -n "$UDID" ] || fail "SWEETPAD_SMOKE_DEST needs an id: 'platform=iOS Simulator,id=<UDID>', got: $DEST"
+else
+  # A simulator of the run's own, so a shared one (and whatever is installed
+  # on it) is never the one erased at teardown. It is modelled on the first
+  # iOS simulator, and cloned from a shut-down one of that model, or else of
+  # that runtime, when there is one: a clone of a simulator that has booted
+  # before skips the first boot's data migration, which a freshly created
+  # one can sit in indefinitely.
+  TEMPLATE=$(python3 -c "import json,subprocess;d=json.loads(subprocess.check_output(['$BIN','destination','list','--json']))['data']['destinations'];print(next(x['destination'] for x in d if x['kind']=='simulator' and x['os']=='iOS'))")
+  SOURCE=$(python3 - "${TEMPLATE##*id=}" <<'PY'
+import json, subprocess, sys
+devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "-j"]))["devices"]
+listed = [(runtime, device) for runtime, entries in devices.items() for device in entries]
+template = next((pair for pair in listed if pair[1]["udid"] == sys.argv[1]), None)
+if template is None:
+    sys.exit(f"simulator {sys.argv[1]} is not in 'simctl list devices'")
+runtime, model = template[0], template[1]["deviceTypeIdentifier"]
+idle = [d for r, d in listed if r == runtime and d.get("isAvailable") and d["state"] == "Shutdown"]
+idle.sort(key=lambda d: d["deviceTypeIdentifier"] != model)
+print(f"clone {idle[0]['udid']}" if idle else f"create {model} {runtime}")
+PY
+)
+  case "$SOURCE" in
+    clone\ *) UDID=$(xcrun simctl clone "${SOURCE#clone }" "sweetpad-smoke-$$") ;;
+    *) read -r _ SIM_TYPE SIM_RUNTIME <<<"$SOURCE"
+       UDID=$(xcrun simctl create "sweetpad-smoke-$$" "$SIM_TYPE" "$SIM_RUNTIME") ;;
+  esac
+  CREATED_SIM="$UDID"
+  DEST="platform=iOS Simulator,id=$UDID"
+fi
 echo "  using $DEST"
 xcrun simctl boot "$UDID" || true
-xcrun simctl bootstatus "$UDID" -b || true
+# Bounded, so a boot that never finishes fails the run instead of hanging it.
+BOOT_RC=0
+perl -e 'alarm shift; exec @ARGV' 600 xcrun simctl bootstatus "$UDID" -b >/dev/null || BOOT_RC=$?
+[ "$BOOT_RC" -ne 142 ] || fail "simulator $UDID was still booting after 10 minutes"
 "$BIN" simulator boot "$UDID" >/dev/null 2>&1 || true   # already booted is fine
 ok "simulator boot"
 
@@ -179,8 +271,8 @@ assert_json "$out" "d['schemes']" "['SmokeGen']"
 ok "generated project resolves (target + shared scheme)"
 "$BIN" build start --project "$GEN_PROJ" --scheme SmokeGen --destination "$DEST"
 ok "build start on generated project (iOS simulator)"
-# Same, for a generated macOS app.
-( cd "$GEN_DIR" && "$BIN" project new MacGen --platform macos --bundle-id dev.sweetpad.ci.macgen --no-git )
+# Same, for a generated macOS app, under a bundle id no other run uses.
+( cd "$GEN_DIR" && "$BIN" project new MacGen --platform macos --bundle-id "dev.sweetpad.ci.macgen-$$" --no-git )
 MAC_PROJ="$GEN_DIR/MacGen/MacGen.xcodeproj"
 out=$("$BIN" project info --project "$MAC_PROJ" --json)
 assert_json "$out" "d['targets']" "['MacGen']"
@@ -286,7 +378,7 @@ assert_json "$out" "len([r for r in d['refs'] if r['resolved']=='Sources/App/Con
 ok "pbxproj fileref list (references resolve to real paths)"
 
 GROUP=$("$BIN" pbxproj group list --project "$TREE_PROJ" --json \
-  | python3 -c "import json,sys; print(next(g['id'] for g in json.load(sys.stdin)['data']['groups'] if g['resolved']=='Sources/App'))")
+  | python3 -c "import json,sys; print(next(g['address'] for g in json.load(sys.stdin)['data']['groups'] if g['resolved']=='Sources/App'))")
 
 # The gap this closes: a new file on disk becomes a compiled file in explicit
 # steps, with no generator in the loop.
@@ -303,8 +395,8 @@ out=$("$BIN" pbxproj fileref add Added.swift Batched.swift --type sourcecode.swi
 assert_json "$out" "[r['resolved'] for r in d['refs']]" \
   "['Sources/App/Added.swift', 'Sources/App/Batched.swift']"
 assert_json "$out" "sorted({r['group'] for r in d['refs']})" "['$GROUP']"
-REF=$(printf '%s' "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['refs'][0]['id'])")
-BATCHED=$(printf '%s' "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['refs'][1]['id'])")
+REF=$(printf '%s' "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['refs'][0]['address'])")
+BATCHED=$(printf '%s' "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['refs'][1]['address'])")
 ok "pbxproj fileref add (batched, and a directory names the group)"
 
 # A directory that names no group, or two, is an error rather than a pick.
@@ -327,7 +419,9 @@ ok "pbxproj group remove refuses a group that still has children"
 out=$("$BIN" pbxproj membership list --target SweetpadCIApp --project "$TREE_PROJ" --json)
 assert_json "$out" "[e['phase'] for e in d['targets'][0]['explicit'] if 'Added' in e['path']]" "['sources']"
 assert_json "$out" "[e['phase'] for e in d['targets'][0]['explicit'] if 'Batched' in e['path']]" "['sources']"
-expect_code 1 "$BIN" pbxproj membership add --target SweetpadCIApp --phase sources \
+# Naming no file is a usage error; naming a group where a file reference goes
+# depends on the project, so it is not.
+expect_code 2 "$BIN" pbxproj membership add --target SweetpadCIApp --phase sources \
   --project "$TREE_PROJ"
 expect_code 1 "$BIN" pbxproj membership add --fileref "$GROUP" --target SweetpadCIApp \
   --phase sources --project "$TREE_PROJ"
@@ -352,15 +446,22 @@ ok "membership remove reports the reference its cascade deleted"
 
 # detach/attach move only the child entry; the object itself survives both.
 CV=$("$BIN" pbxproj fileref list --project "$TREE_PROJ" --json \
-  | python3 -c "import json,sys; print(next(r['id'] for r in json.load(sys.stdin)['data']['refs'] if r['resolved']=='Sources/App/ContentView.swift'))")
+  | python3 -c "import json,sys; print(next(r['address'] for r in json.load(sys.stdin)['data']['refs'] if r['resolved']=='Sources/App/ContentView.swift'))")
 out=$("$BIN" pbxproj group detach "$CV" --group "$GROUP" --project "$TREE_PROJ" --json)
 assert_json "$out" "d['changed']" "True"
+assert_json "$out" "d['address']" "$CV"
 out=$("$BIN" pbxproj fileref list --project "$TREE_PROJ" --json)
-assert_json "$out" "[r['group'] for r in d['refs'] if r['id']=='$CV']" "[None]"
+assert_json "$out" "[r['group'] for r in d['refs'] if r['address']=='$CV']" "[None]"
 out=$("$BIN" pbxproj group attach "$CV" --group "$GROUP" --project "$TREE_PROJ" --json)
 assert_json "$out" "d['changed']" "True"
 ok "pbxproj group attach/detach (child entry only, the object survives)"
-rm -rf "$TREE_DIR"
+
+# The copy built into a DerivedData folder of its own, named like the
+# fixture's; the derived-data section purges around it, then removes it.
+out=$("$BIN" derived-data path --project "$TREE_PROJ" --json)
+assert_json "$out" "len(d['paths'])" "1"
+TREE_DD=$(printf '%s' "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['paths'][0])")
+ok "derived-data path finds the copy's own folder"
 
 # ---------------------------------------------------------------------------
 section "test (iOS)"
@@ -391,6 +492,23 @@ run_briefly 12 "$BIN" app run --project "$APP" --scheme SweetpadCIApp --destinat
 ok "app run (logs follow, streamed briefly)"
 "$BIN" app stop --project "$APP" --scheme SweetpadCIApp --destination "$DEST"
 ok "app stop"
+
+# ---------------------------------------------------------------------------
+section "debug adapter (dap; §9u)"
+"$BIN" dap doctor
+ok "dap doctor"
+# One real session the way an editor drives it: launch, a breakpoint in the
+# app's init, the stop and its frame, a disconnect, and the adapter exiting.
+python3 "$ROOT/dap-session.py" "$BIN" --cwd "$APP_DIR" --scheme SweetpadCIApp \
+  --destination "$UDID" --breakpoint "$APP_DIR/Sources/App/SweetpadCIApp.swift:10"
+ok "dap launch on the simulator stops at a breakpoint"
+# Outside any project the editor files land in the working directory; the
+# .git marker stops the project walk-up there.
+mkdir -p "$GEN_DIR/dap-init/.git"
+( cd "$GEN_DIR/dap-init" && "$BIN" dap init --editor nvim >/dev/null && grep -q 'dap.adapters.sweetpad' .nvim.lua )
+ok "dap init --editor nvim"
+( cd "$GEN_DIR/dap-init" && "$BIN" dap init --editor zed >/dev/null && grep -q '"adapter": "Swift"' .zed/debug.json )
+ok "dap init --editor zed"
 
 # ---------------------------------------------------------------------------
 section "app screenshot (§9h)"
@@ -451,13 +569,23 @@ if command -v lldb >/dev/null 2>&1; then
   "$BIN" app stop --project "$APP" --scheme SweetpadCIMac --mac >/dev/null 2>&1 || true
 fi
 
+# The adapter's macOS route: lldb-dap launches the app itself.
+if python3 "$ROOT/dap-session.py" "$BIN" --cwd "$APP_DIR" --scheme SweetpadCIMac \
+    --destination mac --breakpoint "$APP_DIR/Sources/App/SweetpadCIApp.swift:10" \
+    > "$GEN_DIR/dap-mac.out" 2>&1; then
+  ok "dap launch on macOS stops at a breakpoint"
+else
+  echo "  (macOS dap session skipped: $(tail -1 "$GEN_DIR/dap-mac.out"))"
+fi
+
 # install/uninstall stay simulator/device-only — a macOS app is built in place.
 expect_code 1 "$BIN" app install --project "$APP" --scheme SweetpadCIMac --mac
 ok "app install --mac still refused (built in place)"
 
-# --detach and --hot are contradictory: hot reload must stay attached.
-expect_code 1 "$BIN" app run --project "$APP" --scheme SweetpadCIMac --mac --detach --hot
-ok "--detach with --hot rejected"
+# --detach and --hot are contradictory: hot reload must stay attached. The
+# command line alone decides that, so it is a usage error.
+expect_code 2 "$BIN" app run --project "$APP" --scheme SweetpadCIMac --mac --detach --hot
+ok "--detach with --hot rejected (usage error)"
 
 # A committed `[run] hot = true` must not send a macOS run down the hot path —
 # the config default applies to simulators, and on macOS you type `--hot`. The
@@ -486,7 +614,10 @@ ok "device list (no devices)"
 
 # ---------------------------------------------------------------------------
 section "format"
-"$BIN" format run "$APP_DIR/Sources/App/ContentView.swift"
+# A copy, so the committed fixture stays as it is.
+FORMAT_DIR="$(mktemp -d)"
+cp "$APP_DIR/Sources/App/ContentView.swift" "$FORMAT_DIR/"
+"$BIN" format run "$FORMAT_DIR/ContentView.swift"
 ok "format run (swift-format, in place)"
 
 # ---------------------------------------------------------------------------
@@ -504,11 +635,19 @@ ok "derived-data path --project (folder present)"
 out=$("$BIN" derived-data size --project "$APP" --json)
 assert_json "$out" "d['folders']>=1" "True"
 ok "derived-data size --project"
-# Purge just this project's folder(s), then confirm they're gone.
-"$BIN" derived-data purge --project "$APP" --yes
+# Purge just this project's folder(s), then confirm they're gone. The copy of
+# the fixture shares its name but not its path, so its folder stays.
+out=$("$BIN" derived-data purge --project "$APP" --yes --json)
+assert_json "$out" "len(d['removed'])>=1" "True"
+assert_json "$out" "'$TREE_DD' in d['others']" "True"
+test -d "$TREE_DD" || fail "purging the fixture deleted its copy's DerivedData: $TREE_DD"
 out=$("$BIN" derived-data path --project "$APP" --json)
 assert_json "$out" "len(d['paths'])" "0"
-ok "derived-data purge --project (roundtrip)"
+ok "derived-data purge --project (roundtrip, a same-named copy's folder stays)"
+out=$("$BIN" derived-data purge --project "$TREE_PROJ" --yes --json)
+assert_json "$out" "d['removed']" "['$TREE_DD']"
+rm -rf "$TREE_DIR"
+ok "derived-data purge --project on the copy takes only the copy's folder"
 
 # ---------------------------------------------------------------------------
 section "archive"
@@ -552,8 +691,8 @@ assert_json "$out" "'generic/platform=macOS' in d['commands'][0]['command']" "Tr
 out=$("$BIN" archive --project "$APP" --scheme SweetpadCIApp --show-command --json)
 assert_json "$out" "'generic/platform=iOS' in d['commands'][0]['command']" "True"
 ok "archive auto-targets each scheme's own platform"
-expect_code 1 "$BIN" archive --project "$APP" --scheme SweetpadCIApp --on toaster --show-command
-ok "archive --on with a non-platform exits 1"
+expect_code 2 "$BIN" archive --project "$APP" --scheme SweetpadCIApp --on toaster --show-command
+ok "archive --on with a non-platform exits 2 (usage error)"
 
 expect_code_in "$SPM_DIR" 1 "$BIN" archive
 ok "archive refused for a Swift package"
@@ -619,7 +758,7 @@ section "error paths"
 expect_code 2 "$BIN" bogus-command
 ok "unknown command exits 2"
 # Unknown scheme / simulator / missing container are all TargetResolution
-# errors, which the CLI's exit-code taxonomy maps to 4 (Generic is 1,
+# errors, which the CLI's exit-code taxonomy maps to 4 (Generic is 1, Usage 2,
 # BuildFailure 3, TargetResolution 4, ToolMissing 5 — see ErrorKind::exit_code).
 expect_code 4 "$BIN" build start --project "$APP" --scheme NoSuchScheme --destination "$DEST"
 ok "unknown scheme exits 4 (target resolution)"

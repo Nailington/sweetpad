@@ -95,9 +95,22 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Open a `.xcworkspace` directory and extract referenced projects + schemes.
+///
+/// A project's embedded workspace (`Foo.xcodeproj/project.xcworkspace`) with
+/// no `contents.xcworkspacedata` stands for the project around it, as the
+/// `self:` reference Xcode writes there would: `xcodebuild -list -workspace`
+/// lists that project's schemes for one. A checkout that commits the embedded
+/// workspace's `xcuserdata` but not its contents has exactly that.
 pub fn open(workspace_path: &Path) -> Result<Workspace, Error> {
     let contents = workspace_path.join("contents.xcworkspacedata");
-    let root = xcscheme::parse_file(&contents)?;
+    let root = match xcscheme::parse_file(&contents) {
+        Err(xcscheme::Error::Io(e))
+            if e.kind() == io::ErrorKind::NotFound && is_embedded(workspace_path) =>
+        {
+            xcscheme::parse(EMBEDDED_CONTENTS).map_err(xcscheme::Error::from)?
+        }
+        parsed => parsed?,
+    };
     if root.name != "Workspace" {
         return Err(Error::BadWorkspace(format!(
             "expected root <Workspace>, got <{}>",
@@ -139,6 +152,41 @@ pub fn open(workspace_path: &Path) -> Result<Workspace, Error> {
     })
 }
 
+/// What Xcode writes into a project's embedded workspace: the project itself.
+const EMBEDDED_CONTENTS: &str =
+    "<Workspace version = \"1.0\"><FileRef location = \"self:\"></FileRef></Workspace>";
+
+/// Whether `workspace_path` is an existing `project.xcworkspace` inside a
+/// `.xcodeproj` bundle.
+fn is_embedded(workspace_path: &Path) -> bool {
+    embedding_project(workspace_path).is_some() && workspace_path.is_dir()
+}
+
+/// The `.xcodeproj` whose embedded workspace `path` names
+/// (`Foo.xcodeproj/project.xcworkspace` gives `Foo.xcodeproj`), or `None` for
+/// any other path. Lexical: nothing is read from disk.
+#[must_use]
+pub fn embedding_project(path: &Path) -> Option<&Path> {
+    let parent = path.parent()?;
+    (path.file_name() == Some(OsStr::new("project.xcworkspace"))
+        && parent.extension() == Some(OsStr::new("xcodeproj")))
+    .then_some(parent)
+}
+
+/// Collapse a project's embedded workspace to the project around it, and
+/// leave every other path alone.
+///
+/// Xcode writes a `project.xcworkspace` inside every `.xcodeproj`, and naming
+/// it opens the project: `xcodebuild -workspace Foo.xcodeproj/project.xcworkspace`
+/// builds into `Foo-<hash of Foo.xcodeproj>`, whose `info.plist` records the
+/// `.xcodeproj` as its `WorkspacePath` (Xcode 27.0). Anything that keys on
+/// the container, DerivedData above all, has to key on the project: hashing
+/// the stub names a `project-<hash>` folder nothing writes (issue #285).
+#[must_use]
+pub fn normalize_stub_workspace(container: &Path) -> PathBuf {
+    embedding_project(container).map_or_else(|| container.to_path_buf(), Path::to_path_buf)
+}
+
 impl Workspace {
     /// Schemes that `xcodebuild -list -workspace` would surface: the
     /// workspace's own schemes UNION every member project's schemes — scheme
@@ -151,13 +199,9 @@ impl Workspace {
     #[must_use]
     pub fn merged_schemes(&self) -> Vec<String> {
         let mut set: std::collections::BTreeSet<String> = self.schemes.iter().cloned().collect();
-        let autocreate = crate::scheme::autocreation_allowed(&self.path);
+        let references = crate::scheme::SchemeReferences::of(&self.path);
         for project_path in &self.project_refs {
-            if autocreate && let Ok(proj) = project::open(project_path) {
-                set.extend(proj.schemes);
-                continue;
-            }
-            set.extend(crate::scheme::container_schemes(project_path));
+            set.extend(self.member_schemes(project_path, &references));
         }
         for package_path in &self.package_refs {
             set.extend(crate::scheme::container_schemes(&package_scheme_root(
@@ -298,15 +342,44 @@ impl Workspace {
         out
     }
 
+    /// What one member project contributes to [`Workspace::merged_schemes`]:
+    /// its scheme files, plus its autocreated per-target schemes while the
+    /// workspace allows autocreation. `references` are what the workspace's
+    /// own scheme files point at ([`crate::scheme::SchemeReferences`]): Xcode
+    /// 27.0 autocreates no scheme for a member target a workspace scheme runs
+    /// (or builds, for one that doesn't run), as for one its project's own
+    /// scheme does.
+    fn member_schemes(
+        &self,
+        project_path: &Path,
+        references: &crate::scheme::SchemeReferences,
+    ) -> Vec<String> {
+        let files = crate::scheme::container_schemes(project_path);
+        if !crate::scheme::autocreation_allowed(&self.path) {
+            return files;
+        }
+        let Ok(proj) = project::open(project_path) else {
+            return files;
+        };
+        let runs = |name: &str| proj.targets.iter().any(|t| t.name == name && t.runs());
+        proj.schemes
+            .iter()
+            .filter(|name| {
+                files.contains(name) || !references.cover(Some(project_path), name, runs(name))
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Locate the `.xcodeproj` member that owns a scheme by name. Returns
     /// the first project with a `<name>.xcscheme` file (shared or per-user).
-    /// Otherwise — under the same autocreation gate as
-    /// [`Workspace::merged_schemes`] — falls back to the first project whose
-    /// scheme list ([`project::open`]'s files-plus-autocreated set) includes
-    /// the name: scheme files elsewhere do NOT suppress a member's
+    /// Otherwise falls back to the first project whose share of
+    /// [`Workspace::merged_schemes`] (its files-plus-autocreated set) includes
+    /// the name: scheme files elsewhere do NOT suppress a member's other
     /// autocreated per-target schemes, so every name `merged_schemes`
-    /// surfaces must dispatch. Used by callers (the CLI) that need to route
-    /// a scheme-driven build to the right project.
+    /// surfaces must dispatch. Used by callers (the CLI, the build-settings
+    /// resolver) that need to route a scheme-driven build to the right
+    /// project.
     #[must_use]
     pub fn project_for_scheme(&self, scheme_name: &str) -> Option<&Path> {
         if let Some(p) = self
@@ -316,15 +389,13 @@ impl Workspace {
         {
             return Some(p.as_path());
         }
-        if !crate::scheme::autocreation_allowed(&self.path) {
-            return None;
-        }
+        let references = crate::scheme::SchemeReferences::of(&self.path);
         self.project_refs
             .iter()
             .find(|p| {
-                project::open(p)
-                    .map(|proj| proj.schemes.iter().any(|s| s == scheme_name))
-                    .unwrap_or(false)
+                self.member_schemes(p, &references)
+                    .iter()
+                    .any(|s| s == scheme_name)
             })
             .map(PathBuf::as_path)
     }
@@ -409,7 +480,44 @@ fn resolve_location(location: &str, group_base: &Path, container_base: &Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdir::TempDir;
     use std::fs;
+
+    /// `normalize_stub_workspace` is pure-lexical (no filesystem), so pin it
+    /// with a table. It must collapse ONLY the `.xcodeproj/project.xcworkspace`
+    /// stub down to its bundle; everything else passes through untouched.
+    #[test]
+    fn normalize_stub_workspace_collapses_only_the_bundle_stub() {
+        let cases: &[(&str, &str)] = &[
+            // The auto-generated stub collapses to its containing bundle…
+            (
+                "/root/Foo.xcodeproj/project.xcworkspace",
+                "/root/Foo.xcodeproj",
+            ),
+            // …even spelled with a trailing slash (Path ignores it).
+            (
+                "/root/Foo.xcodeproj/project.xcworkspace/",
+                "/root/Foo.xcodeproj",
+            ),
+            // A real, user-authored workspace is left untouched.
+            ("/root/Foo.xcworkspace", "/root/Foo.xcworkspace"),
+            // A `project.xcworkspace` NOT inside an `.xcodeproj` is not the
+            // stub — don't eat a real directory that merely shares the name.
+            (
+                "/root/weird/project.xcworkspace",
+                "/root/weird/project.xcworkspace",
+            ),
+            // A bare `.xcodeproj` is already the container.
+            ("/root/Foo.xcodeproj", "/root/Foo.xcodeproj"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                normalize_stub_workspace(Path::new(input)),
+                PathBuf::from(expected),
+                "normalize_stub_workspace({input})"
+            );
+        }
+    }
 
     fn fixtures_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
@@ -511,11 +619,7 @@ mod tests {
     fn container_refs_anchor_at_workspace_dir_even_inside_groups() {
         // `container:` is always relative to the directory containing the
         // workspace; only `group:` re-anchors with the enclosing Group.
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("sweetpad-ws-container-{}-{n}", std::process::id()));
+        let root = TempDir::new("sweetpad-ws-container");
         let ws = root.join("Test.xcworkspace");
         fs::create_dir_all(&ws).unwrap();
         fs::write(
@@ -538,18 +642,13 @@ mod tests {
                 root.join("Sub/Nested.xcodeproj")
             ],
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// A scratch workspace under the OS temp dir containing one copy of the
     /// synthetic `Scratch.xcodeproj` (a single `Scratch` target, no scheme
-    /// files), referenced via `group:`.
-    fn scratch_workspace(tag: &str) -> (PathBuf, PathBuf) {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("sweetpad-ws-{tag}-{}-{n}", std::process::id()));
+    /// files), referenced via `group:`. Both go when the returned guard drops.
+    fn scratch_workspace(tag: &str) -> (TempDir, PathBuf, PathBuf) {
+        let root = TempDir::new(&format!("sweetpad-ws-{tag}"));
         let proj = root.join("Scratch.xcodeproj");
         fs::create_dir_all(&proj).unwrap();
         fs::copy(
@@ -566,7 +665,7 @@ mod tests {
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version=\"1.0\">\n  <FileRef location=\"group:Scratch.xcodeproj\"/>\n</Workspace>\n",
         )
         .unwrap();
-        (ws, proj)
+        (root, ws, proj)
     }
 
     /// Add a local SwiftPM package next to `ws_path`'s project and reference
@@ -589,7 +688,7 @@ mod tests {
 
     #[test]
     fn a_local_package_member_is_kept_apart_from_the_projects() {
-        let (ws_path, _proj) = scratch_workspace("pkg-refs");
+        let (_root, ws_path, _proj) = scratch_workspace("pkg-refs");
         let pkg = add_package(&ws_path, "MyLib");
         let ws = open(&ws_path).unwrap();
         assert_eq!(
@@ -597,24 +696,22 @@ mod tests {
             vec![ws_path.parent().unwrap().join("Scratch.xcodeproj")]
         );
         assert_eq!(ws.package_refs, vec![pkg]);
-        let _ = fs::remove_dir_all(ws_path.parent().unwrap());
     }
 
     #[test]
     fn a_directory_without_a_manifest_is_not_a_package_member() {
-        let (ws_path, _proj) = scratch_workspace("pkg-nomanifest");
+        let (_root, ws_path, _proj) = scratch_workspace("pkg-nomanifest");
         let pkg = add_package(&ws_path, "NotAPackage");
         fs::remove_file(pkg.join("Package.swift")).unwrap();
         let ws = open(&ws_path).unwrap();
         // A `FileRef` at a plain folder (a group of loose files) is neither a
         // project nor a package, and must not be reported as either.
         assert!(ws.package_refs.is_empty());
-        let _ = fs::remove_dir_all(ws_path.parent().unwrap());
     }
 
     #[test]
     fn a_packages_own_scheme_files_live_under_dot_swiftpm() {
-        let (ws_path, _proj) = scratch_workspace("pkg-schemefiles");
+        let (_root, ws_path, _proj) = scratch_workspace("pkg-schemefiles");
         let pkg = add_package(&ws_path, "MyLib");
         let shared = package_scheme_root(&pkg).join("xcshareddata/xcschemes");
         fs::create_dir_all(&shared).unwrap();
@@ -624,12 +721,11 @@ mod tests {
         // Read straight from the package with no manifest evaluation — a
         // customized scheme is a file like any other.
         assert_eq!(ws.merged_schemes(), vec!["CustomLib", "Scratch"]);
-        let _ = fs::remove_dir_all(ws_path.parent().unwrap());
     }
 
     #[test]
     fn resolved_package_schemes_merge_in_from_across_the_graph() {
-        let (ws_path, _proj) = scratch_workspace("pkg-merge");
+        let (_root, ws_path, _proj) = scratch_workspace("pkg-merge");
         let pkg = add_package(&ws_path, "MyLib");
         let ws = open(&ws_path).unwrap();
 
@@ -649,12 +745,11 @@ mod tests {
         );
         // With nothing resolved it degrades to exactly `merged_schemes`.
         assert_eq!(ws.merged_schemes_with_packages(&[]), ws.merged_schemes());
-        let _ = fs::remove_dir_all(ws_path.parent().unwrap());
     }
 
     #[test]
     fn resolved_package_targets_append_after_the_projects() {
-        let (ws_path, _proj) = scratch_workspace("pkg-targets");
+        let (_root, ws_path, _proj) = scratch_workspace("pkg-targets");
         let pkg = add_package(&ws_path, "MyLib");
         let ws = open(&ws_path).unwrap();
 
@@ -678,19 +773,18 @@ mod tests {
             vec!["Scratch", "LibA", "LibATests", "NestedLib"]
         );
         assert_eq!(ws.merged_targets_with_packages(&[]), ws.merged_targets());
-        let _ = fs::remove_dir_all(ws_path.parent().unwrap());
     }
 
     /// A workspace holding the `_synthetic-spm` fixture project, which
     /// declares `XCLocalSwiftPackageReference "Dep"`. `absolute:` keeps the
-    /// scratch workspace from having to copy the fixture.
-    fn workspace_over_the_spm_fixture(tag: &str, also_reference_the_package: bool) -> PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
+    /// scratch workspace from having to copy the fixture. The workspace goes
+    /// when the returned guard drops.
+    fn workspace_over_the_spm_fixture(
+        tag: &str,
+        also_reference_the_package: bool,
+    ) -> (TempDir, PathBuf) {
         let spm = fixtures_root().join("_synthetic-spm/project");
-        let root =
-            std::env::temp_dir().join(format!("sweetpad-ws-{tag}-{}-{n}", std::process::id()));
+        let root = TempDir::new(&format!("sweetpad-ws-{tag}"));
         let ws_path = root.join("Test.xcworkspace");
         fs::create_dir_all(&ws_path).unwrap();
         let package_ref = if also_reference_the_package {
@@ -709,12 +803,12 @@ mod tests {
             ),
         )
         .unwrap();
-        ws_path
+        (root, ws_path)
     }
 
     #[test]
     fn a_member_projects_local_packages_are_reported_apart_from_the_workspaces_own() {
-        let ws_path = workspace_over_the_spm_fixture("project-pkg", false);
+        let (_root, ws_path) = workspace_over_the_spm_fixture("project-pkg", false);
         let ws = open(&ws_path).unwrap();
 
         // The workspace declares no package itself; the project it holds does,
@@ -724,12 +818,11 @@ mod tests {
             ws.project_package_refs(),
             vec![fixtures_root().join("_synthetic-spm/project/Dep")]
         );
-        let _ = fs::remove_dir_all(ws_path.parent().unwrap());
     }
 
     #[test]
     fn a_package_the_workspace_already_names_is_not_reported_twice() {
-        let ws_path = workspace_over_the_spm_fixture("both-ways", true);
+        let (_root, ws_path) = workspace_over_the_spm_fixture("both-ways", true);
         let ws = open(&ws_path).unwrap();
 
         // Referenced by the workspace *and* by its project: the membership
@@ -739,12 +832,11 @@ mod tests {
             vec![fixtures_root().join("_synthetic-spm/project/Dep")]
         );
         assert!(ws.project_package_refs().is_empty());
-        let _ = fs::remove_dir_all(ws_path.parent().unwrap());
     }
 
     #[test]
     fn a_package_only_workspace_falls_back_to_debug_and_release() {
-        let (ws_path, _proj) = scratch_workspace("pkg-only-configs");
+        let (_root, ws_path, _proj) = scratch_workspace("pkg-only-configs");
         add_package(&ws_path, "MyLib");
         // Drop the project reference so packages are the only members.
         fs::write(
@@ -755,12 +847,11 @@ mod tests {
         let ws = open(&ws_path).unwrap();
         assert!(ws.project_refs.is_empty());
         assert_eq!(ws.merged_configurations(), vec!["Debug", "Release"]);
-        let _ = fs::remove_dir_all(ws_path.parent().unwrap());
     }
 
     #[test]
     fn a_package_never_adds_to_a_projects_configurations() {
-        let (ws_path, _proj) = scratch_workspace("mixed-configs");
+        let (_root, ws_path, _proj) = scratch_workspace("mixed-configs");
         let without_package = open(&ws_path).unwrap().merged_configurations();
         add_package(&ws_path, "MyLib");
         let with_package = open(&ws_path).unwrap();
@@ -769,12 +860,11 @@ mod tests {
         assert!(!without_package.is_empty());
         // The fallback applies only when no project names a configuration.
         assert_eq!(with_package.merged_configurations(), without_package);
-        let _ = fs::remove_dir_all(ws_path.parent().unwrap());
     }
 
     #[test]
     fn merged_schemes_autocreates_per_target_when_no_scheme_files() {
-        let (ws_path, _proj) = scratch_workspace("autocreate");
+        let (_root, ws_path, _proj) = scratch_workspace("autocreate");
         let ws = open(&ws_path).unwrap();
         // Neither the workspace nor the project has any scheme file, so the
         // autocreated per-target schemes surface (matching xcodebuild -list).
@@ -783,7 +873,7 @@ mod tests {
 
     #[test]
     fn merged_schemes_includes_workspace_and_project_user_schemes() {
-        let (ws_path, proj) = scratch_workspace("user-schemes");
+        let (_root, ws_path, proj) = scratch_workspace("user-schemes");
         let user = crate::scheme::visible_user();
         let ws_user = ws_path.join(format!("xcuserdata/{user}.xcuserdatad/xcschemes"));
         fs::create_dir_all(&ws_user).unwrap();
@@ -814,10 +904,33 @@ mod tests {
         // No scheme file exists anywhere, so the autocreated per-target
         // scheme "Scratch" must dispatch to the member project owning the
         // same-named target.
-        let (ws_path, proj) = scratch_workspace("autocreate-dispatch");
+        let (_root, ws_path, proj) = scratch_workspace("autocreate-dispatch");
         let ws = open(&ws_path).unwrap();
         assert_eq!(ws.project_for_scheme("Scratch"), Some(proj.as_path()));
         assert_eq!(ws.project_for_scheme("NotATarget"), None);
+    }
+
+    /// A checkout holding the embedded workspace's `xcuserdata` but not its
+    /// `contents.xcworkspacedata` (issue #339) still names the project.
+    #[test]
+    fn an_embedded_workspace_without_contents_is_its_project() {
+        let (_root, ws_path, proj) = scratch_workspace("embedded-stub");
+        let embedded = proj.join("project.xcworkspace");
+        fs::create_dir_all(embedded.join("xcuserdata/me.xcuserdatad")).unwrap();
+        let ws = open(&embedded).unwrap();
+        assert_eq!(ws.project_refs, [proj]);
+        assert_eq!(
+            ws.merged_schemes(),
+            open(&ws_path).unwrap().merged_schemes()
+        );
+        assert!(!ws.merged_schemes().is_empty());
+
+        // A missing contents file still fails where the bundle isn't a
+        // project's embedded workspace, or doesn't exist at all.
+        fs::remove_file(ws_path.join("contents.xcworkspacedata")).unwrap();
+        assert!(matches!(open(&ws_path), Err(Error::Parse(_))));
+        fs::remove_dir_all(&embedded).unwrap();
+        assert!(open(&embedded).is_err());
     }
 
     #[test]

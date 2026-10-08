@@ -6,8 +6,8 @@
 //! matches what xcodebuild actually synthesizes, and that the `swift`-driven
 //! build/test path succeeds on a real package:
 //!
-//! - **fixture mode** (default): compare our `scheme_names()` (parsed from a
-//!   captured `dump-package.json`) against the captured `xcodebuild -list`
+//! - **fixture mode** (default): compare the schemes we synthesize from a
+//!   captured `dump-package.json` against the captured `xcodebuild -list`
 //!   schemes, and check the captured `swift build`/`swift test` succeeded.
 //!   Skips cleanly when no captures exist (e.g. on a non-macOS host), so it
 //!   never fails a Linux/CI run — capture with `scripts/22_spm_cli_oracle.py`.
@@ -17,12 +17,15 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use common::TempDir;
 use sweetpad_cli::cli::resolve::Container;
-use sweetpad_cli::cli::swiftpm::{self, Manifest};
+use sweetpad_cli::cli::swiftpm;
 
 fn fixtures_root() -> PathBuf {
     Path::new(env!("SWEETPAD_LIB_DIR")).join("fixtures/_synthetic-spm-cli")
@@ -59,9 +62,12 @@ fn xcodebuild_list_schemes(json: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn our_schemes_from_dump(dump: &str) -> Vec<String> {
-    let manifest: Manifest = serde_json::from_str(dump).expect("dump-package json deserializes");
-    manifest.scheme_names()
+/// The schemes we give the package a dump describes. The capture holds no
+/// `.swiftpm/xcode` container, so the manifest decides them alone.
+fn our_schemes_from_dump(dir: &Path, dump: &str) -> Vec<String> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(dump).expect("dump-package json deserializes");
+    sweetpad_core::package_members::standalone_from_dump(dir, &manifest).schemes
 }
 
 #[test]
@@ -83,7 +89,7 @@ fn schemes_match_captured_xcodebuild_list() {
         let list = std::fs::read_to_string(dir.join("list.json")).unwrap();
         let dump = std::fs::read_to_string(dir.join("dump-package.json")).unwrap();
         let theirs: BTreeSet<String> = xcodebuild_list_schemes(&list).into_iter().collect();
-        let ours: BTreeSet<String> = our_schemes_from_dump(&dump).into_iter().collect();
+        let ours: BTreeSet<String> = our_schemes_from_dump(dir, &dump).into_iter().collect();
         if ours != theirs {
             failures.push(format!(
                 "{}: ours={ours:?} xcodebuild={theirs:?} (missing={:?}, extra={:?})",
@@ -208,5 +214,135 @@ fn live_schemes_match_xcodebuild() {
     assert_eq!(
         ours, theirs,
         "live SPM scheme mismatch: ours={ours:?} xcodebuild={theirs:?}"
+    );
+}
+
+/// Reading a package's manifest leaves nothing behind. `swift package
+/// dump-package` makes a `.build/` in the package, and its `swiftc
+/// -print-target-info` probe a `TemporaryDirectory.*` and a lock file in
+/// `$TMPDIR`, unless it runs with a scratch path and `TMPDIR` of its own.
+#[test]
+fn reading_a_manifest_leaves_nothing_behind() {
+    let root = TempDir::new("sweetpad-spm-manifest");
+    let probe = root.join("probe-tmp");
+    std::fs::create_dir_all(&probe).unwrap();
+    let have_swift = Command::new("swift")
+        .arg("--version")
+        .env("TMPDIR", &probe)
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !have_swift {
+        eprintln!("skipping: needs the Swift toolchain to evaluate a manifest");
+        return;
+    }
+    let package = root.join("Dumped");
+    let temp = root.join("tmp");
+    std::fs::create_dir_all(package.join(".git")).unwrap();
+    std::fs::create_dir_all(&temp).unwrap();
+    std::fs::write(
+        package.join("Package.swift"),
+        "// swift-tools-version:5.9\nimport PackageDescription\n\
+         let package = Package(name: \"Dumped\")\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_sweetpad"))
+        .args(["project", "info", "--json"])
+        .current_dir(&package)
+        .env("XDG_STATE_HOME", &root)
+        .env("XDG_CONFIG_HOME", &root)
+        .env("XDG_CACHE_HOME", &root)
+        .env("TMPDIR", &temp)
+        .output()
+        .expect("failed to run the sweetpad binary");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let info: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(info["data"]["name"], "Dumped", "{info}");
+
+    assert!(!package.join(".build").exists(), "a .build/ in the package");
+    let left: Vec<_> = std::fs::read_dir(&temp)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left in TMPDIR: {left:?}");
+}
+
+/// A package's manifest is read with the Xcode its `sweetpad.toml` pins, also
+/// when the package is found below the working directory, where nothing else
+/// loads that file before the read. The pinned Xcode is a stub whose `xcrun`,
+/// which the `swift` shim in `/usr/bin` hands every call to, answers
+/// `dump-package` with a manifest of its own.
+#[test]
+fn a_manifest_is_read_with_the_xcode_its_sweetpad_toml_pins() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !Path::new("/usr/bin/swift").exists() {
+        eprintln!("skipping: needs the /usr/bin/swift shim that follows DEVELOPER_DIR");
+        return;
+    }
+    let root = TempDir::new("sweetpad-spm-pinned-xcode");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let xcrun = root.join("Pinned.app/Contents/Developer/usr/bin/xcrun");
+    std::fs::create_dir_all(xcrun.parent().unwrap()).unwrap();
+    std::fs::write(
+        &xcrun,
+        "#!/bin/sh\n\
+         case \"$*\" in\n\
+         *dump-package*) echo '{\"name\": \"FromPinnedXcode\", \"dependencies\": \
+         [{\"fileSystem\": [{\"identity\": \"pinned-dep\", \"path\": \"/pinned/dep\"}]}]}' ;;\n\
+         *) exit 1 ;;\n\
+         esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let package = root.join("packages/Dumped");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("Package.swift"),
+        "// swift-tools-version:5.9\nimport PackageDescription\n\
+         let package = Package(name: \"FromDefaultXcode\")\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("sweetpad.toml"),
+        format!(
+            "developer_dir = \"{}\"\n",
+            root.join("Pinned.app/Contents/Developer").display()
+        ),
+    )
+    .unwrap();
+    let temp = root.join("tmp");
+    std::fs::create_dir_all(&temp).unwrap();
+
+    let sweetpad = |args: &[&str]| -> serde_json::Value {
+        let out = Command::new(env!("CARGO_BIN_EXE_sweetpad"))
+            .args(args)
+            .current_dir(&*root)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env_remove("DEVELOPER_DIR")
+            .env("XDG_STATE_HOME", &*root)
+            .env("XDG_CONFIG_HOME", &*root)
+            .env("XDG_CACHE_HOME", &*root)
+            .env("TMPDIR", &temp)
+            .output()
+            .expect("failed to run the sweetpad binary");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    let info = sweetpad(&["project", "info", "--json"]);
+    assert_eq!(info["data"]["name"], "FromPinnedXcode", "{info}");
+    let deps = sweetpad(&["dependency", "list", "--json"]);
+    assert_eq!(
+        deps["data"]["direct"][0]["identity"], "pinned-dep",
+        "{deps}"
     );
 }

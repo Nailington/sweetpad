@@ -1,82 +1,24 @@
 //! Thin wrapper over `xcrun simctl` — enumerating, finding, and driving iOS
 //! simulators. Shared by the `simulator`, `destination`, and `app` commands.
-//! Mirrors the device shape the VS Code extension parses from
-//! `simctl list --json devices`.
+//! The listing and process parsing live in `sweetpad_core::devices::simctl`,
+//! which the VS Code extension reads through the addon too.
 
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::process::{Output, Stdio};
+use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+pub use sweetpad_core::devices::simctl::{Simulator, find};
 
 use crate::cli::{CliError, ErrorContext, process};
 
-/// `simctl list --json devices` output: runtime identifier → its devices.
-#[derive(Debug, Deserialize)]
-struct ListOutput {
-    devices: BTreeMap<String, Vec<RawDevice>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawDevice {
-    udid: String,
-    name: String,
-    state: String,
-    #[serde(default)]
-    is_available: bool,
-}
-
-/// A simulator, with its runtime parsed into a friendly OS + version.
-#[derive(Debug, Clone)]
-pub struct Simulator {
-    pub udid: String,
-    pub name: String,
-    /// `Booted` / `Shutdown` (as reported by simctl).
-    pub state: String,
-    pub available: bool,
-    /// e.g. `iOS`, `watchOS`, `tvOS`, `xrOS`.
-    pub os: String,
-    /// e.g. `17.0`.
-    pub os_version: String,
-}
-
-impl Simulator {
-    #[must_use]
-    pub fn is_booted(&self) -> bool {
-        self.state.eq_ignore_ascii_case("Booted")
-    }
-
-    /// `"iPhone 15 (17.0)"`.
-    #[must_use]
-    pub fn label(&self) -> String {
-        format!("{} ({})", self.name, self.os_version)
-    }
-
-    /// The `xcodebuild -destination` specifier targeting this simulator,
-    /// e.g. `platform=iOS Simulator,id=<udid>`.
-    #[must_use]
-    pub fn destination(&self) -> String {
-        format!("platform={},id={}", platform(&self.os), self.udid)
-    }
-
-    /// Destination kind for the remembered recents/usage records, e.g.
-    /// `iOSSimulator`. Pairs the OS with the simulator role.
-    #[must_use]
-    pub fn kind(&self) -> String {
-        format!("{}Simulator", self.os)
-    }
-}
-
-/// Map a simulator OS to its xcodebuild destination platform name.
-#[must_use]
-pub fn platform(os: &str) -> &'static str {
-    match os {
-        "watchOS" => "watchOS Simulator",
-        "tvOS" => "tvOS Simulator",
-        "xrOS" => "visionOS Simulator",
-        _ => "iOS Simulator",
-    }
-}
+/// How long an install, launch or terminate may run before the simulator
+/// counts as stuck. A healthy simulator answers each in under a second: a
+/// launch or terminate in about 0.2s, an install in about 0.5s even for a
+/// 2 GB bundle, which APFS clones rather than copies. The slow case is the
+/// first launch on a freshly booted simulator, which a loaded CI machine can
+/// hold for tens of seconds. A wedged simulator never answers, and without a
+/// bound the run waits on it forever; two minutes clears the slow case with
+/// room to spare and still ends a hung run.
+const STEP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Enumerate every available simulator in picker order — platform first (iOS
 /// before the rest), then newest OS version, then device family (iPhone before
@@ -84,130 +26,103 @@ pub fn platform(os: &str) -> &'static str {
 /// can't be booted/targeted).
 pub fn list() -> Result<Vec<Simulator>, CliError> {
     let raw = process::capture("xcrun", &["simctl", "list", "--json", "devices"], None)?;
-    parse_devices(&raw)
+    sweetpad_core::devices::simctl::parse_list(&raw).map_err(CliError::new)
 }
 
-/// Parse `simctl list --json devices` output into sorted, available
-/// simulators. Split out from [`list`] so it's testable without `simctl`.
-fn parse_devices(raw: &str) -> Result<Vec<Simulator>, CliError> {
-    let parsed: ListOutput = serde_json::from_str(raw)
-        .map_err(|e| CliError::new(format!("parsing simctl output: {e}")))?;
+/// Run one `xcrun simctl` step on `udid` to completion with its output
+/// captured, within [`STEP_TIMEOUT`].
+fn bounded_step(argv: &[&str], env: &[(String, String)], udid: &str) -> Result<Output, CliError> {
+    bounded_step_within("xcrun", argv, env, udid, STEP_TIMEOUT)
+}
 
-    let mut sims = Vec::new();
-    for (runtime, devices) in parsed.devices {
-        let (os, os_version) = parse_runtime(&runtime);
-        for d in devices {
-            if !d.is_available {
-                continue;
+/// [`bounded_step`] with the program and its limit given. A step still
+/// running at `limit` is killed and reported as stuck ([`stuck`]).
+fn bounded_step_within(
+    program: &str,
+    argv: &[&str],
+    env: &[(String, String)],
+    udid: &str,
+    limit: Duration,
+) -> Result<Output, CliError> {
+    let verb = argv.get(1).copied().unwrap_or_default();
+    let failed =
+        |e: std::io::Error| CliError::new(format!("failed to run 'xcrun simctl {verb}': {e}"));
+    match output_within(program, argv, env, limit) {
+        Ok(Some(output)) => Ok(output),
+        Ok(None) => Err(stuck(verb, udid, limit)),
+        Err(e) => Err(failed(e)),
+    }
+}
+
+/// Run `program` with stdout and stderr captured, as `Command::output` does,
+/// killing it once `limit` has passed. `Ok(None)` means it was killed. The
+/// pipes are drained on their own threads so a full pipe can't stall the
+/// child. A grandchild can hold them open past the child's exit, so once the
+/// child is gone they get a short grace rather than a wait for their end.
+fn output_within(
+    program: &str,
+    argv: &[&str],
+    env: &[(String, String)],
+    limit: Duration,
+) -> std::io::Result<Option<Output>> {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
             }
-            sims.push(Simulator {
-                udid: d.udid,
-                name: d.name,
-                state: d.state,
-                available: d.is_available,
-                os: os.clone(),
-                os_version: os_version.clone(),
-            });
+            let _ = tx.send(buf);
+        });
+        rx
+    }
+
+    let deadline = Instant::now() + limit;
+    let mut child = std::process::Command::new(program)
+        .args(argv)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
-    }
-    sims.sort_by(cmp_for_picker);
-    Ok(sims)
-}
-
-/// Order simulators for pickers and listings: platform priority, then newest OS
-/// version, then device family, then a numeric-aware name sort. Each tier is
-/// explicit so the order is intentional rather than a byte-compare side effect
-/// (which is what made 17.0 sort before 9.0 and "iPad" before "iPhone").
-fn cmp_for_picker(a: &Simulator, b: &Simulator) -> Ordering {
-    platform_rank(&a.os)
-        .cmp(&platform_rank(&b.os))
-        .then_with(|| version_key(&b.os_version).cmp(&version_key(&a.os_version))) // newest first
-        .then_with(|| device_rank(&a.name).cmp(&device_rank(&b.name)))
-        .then_with(|| natural_cmp(&a.name, &b.name))
-}
-
-/// Platform display order: iOS first (the common case), then the other
-/// families; anything unrecognized sorts last (so a future platform lands in a
-/// defined place rather than wherever its name's bytes happen to fall).
-fn platform_rank(os: &str) -> u8 {
-    match os {
-        "iOS" => 0,
-        "tvOS" => 1,
-        "watchOS" => 2,
-        "xrOS" => 3,
-        _ => 4,
-    }
-}
-
-/// Device-family order within a platform: iPhone before iPad (the common pick),
-/// then everything else. Platforms with a single family (Apple TV/Watch/Vision)
-/// all land in the last bucket and fall through to the name sort.
-fn device_rank(name: &str) -> u8 {
-    if name.starts_with("iPhone") {
-        0
-    } else if name.starts_with("iPad") {
-        1
-    } else {
-        2
-    }
-}
-
-/// Parse a dotted version ("26.5") into numeric components so it orders
-/// numerically: 9.0 before 17.0, where a byte compare puts "17.0" first.
-/// Missing or garbled components count as 0.
-fn version_key(version: &str) -> Vec<u32> {
-    version.split('.').map(|p| p.parse().unwrap_or(0)).collect()
-}
-
-/// Compare names so embedded numbers order numerically: "iPhone 9" before
-/// "iPhone 15", which a plain byte compare reverses. Digit runs compare as
-/// numbers; everything else compares byte-wise.
-fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
-    loop {
-        match (a.peek().copied(), b.peek().copied()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
-                match take_number(&mut a).cmp(&take_number(&mut b)) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-            }
-            (Some(x), Some(y)) => {
-                a.next();
-                b.next();
-                match x.cmp(&y) {
-                    Ordering::Equal => {}
-                    ord => return ord,
-                }
-            }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
         }
-    }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let collect =
+        |rx: mpsc::Receiver<Vec<u8>>| rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    Ok(Some(Output {
+        status,
+        stdout: collect(stdout),
+        stderr: collect(stderr),
+    }))
 }
 
-/// Consume a leading run of digits as a number (saturating, so a pathologically
-/// long run can't overflow).
-fn take_number(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> u64 {
-    let mut n: u64 = 0;
-    while let Some(d) = it.peek().and_then(|c| c.to_digit(10)) {
-        n = n.saturating_mul(10).saturating_add(u64::from(d));
-        it.next();
-    }
-    n
-}
-
-/// Find a simulator by UDID (case-insensitive) or exact name. When several
-/// share a name, the booted one wins, else the first.
-#[must_use]
-pub fn find<'a>(sims: &'a [Simulator], query: &str) -> Option<&'a Simulator> {
-    if let Some(s) = sims.iter().find(|s| s.udid.eq_ignore_ascii_case(query)) {
-        return Some(s);
-    }
-    let mut by_name: Vec<&Simulator> = sims.iter().filter(|s| s.name == query).collect();
-    by_name.sort_by_key(|s| !s.is_booted());
-    by_name.first().copied()
+/// The error for a step a simulator never answered: which one, how long it
+/// waited, and how to get the simulator back. A wedged simulator answers
+/// nothing until it restarts, so the tip names the two commands that restart
+/// it. Exit 1: the destination resolved, and the simulator failed at it.
+fn stuck(verb: &str, udid: &str, limit: Duration) -> CliError {
+    CliError::new(format!(
+        "'xcrun simctl {verb}' didn't finish within {}s, so the simulator looks stuck",
+        limit.as_secs()
+    ))
+    .tip(Some(format!(
+        "restart the simulator with 'sweetpad simulator shutdown {udid}' and \
+         'sweetpad simulator boot {udid}', then run the command again"
+    )))
 }
 
 /// Boot a simulator. Already-booted is treated as success so the run/install
@@ -218,7 +133,7 @@ pub fn boot(udid: &str) -> Result<(), CliError> {
     let output = std::process::Command::new("xcrun")
         .args(["simctl", "boot", udid])
         .output()
-        .map_err(|e| CliError::new(format!("failed to run `xcrun simctl boot`: {e}")))?;
+        .map_err(|e| CliError::new(format!("failed to run 'xcrun simctl boot': {e}")))?;
     if output.status.success() {
         return Ok(());
     }
@@ -235,29 +150,18 @@ pub fn boot(udid: &str) -> Result<(), CliError> {
     )))
 }
 
-/// Install an `.app` bundle onto a booted simulator.
+/// Install an `.app` bundle onto a booted simulator, within [`STEP_TIMEOUT`].
 pub fn install(udid: &str, app_path: &str) -> Result<(), CliError> {
-    process::stream("xcrun", &["simctl", "install", udid, app_path], None)
-        .context("installing the app on the simulator")
-}
-
-/// Launch an installed app by bundle id; returns simctl's stdout (`bundle: pid`).
-/// `--terminate-running-process` replaces any already-running instance, so the
-/// freshly-installed build actually starts — a plain `simctl launch` attaches to the
-/// existing process and the new binary never runs.
-pub fn launch(udid: &str, bundle_id: &str) -> Result<String, CliError> {
-    process::capture(
-        "xcrun",
-        &[
-            "simctl",
-            "launch",
-            "--terminate-running-process",
-            udid,
-            bundle_id,
-        ],
-        None,
-    )
-    .context("launching the app on the simulator")
+    let output = bounded_step(&["simctl", "install", udid, app_path], &[], udid)
+        .context("installing the app on the simulator")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(CliError::new(format!(
+        "simctl install failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+    .context("installing the app on the simulator"))
 }
 
 /// Extra launch inputs: process arguments, environment pairs (forwarded via
@@ -271,28 +175,13 @@ pub struct LaunchOptions<'a> {
     pub wait_for_debugger: bool,
 }
 
-/// Launch with extra environment forwarded to `xcrun simctl`. Used by `--hot` to
-/// pass `SIMCTL_CHILD_*` vars so the injection client dylib is
-/// `DYLD_INSERT_LIBRARIES`-loaded. Returns stdout.
-pub fn launch_with_env(
-    udid: &str,
-    bundle_id: &str,
-    env: &[(String, String)],
-) -> Result<String, CliError> {
-    launch_opts(
-        udid,
-        bundle_id,
-        &LaunchOptions {
-            env,
-            ..LaunchOptions::default()
-        },
-    )
-}
-
-/// Launch with [`LaunchOptions`]. Returns stdout (`<bundle>: <pid>`).
-/// `--terminate-running-process` forces a fresh launch: forwarded env and args
-/// only take effect on a new process, so an already-running instance must be
-/// replaced or they silently never apply.
+/// Launch an installed app with [`LaunchOptions`], within [`STEP_TIMEOUT`].
+/// Returns stdout (`<bundle>: <pid>`). `--terminate-running-process` forces a
+/// fresh launch: a plain `simctl launch` attaches to a running instance, so a
+/// freshly installed build would never run and forwarded env and args would
+/// never apply.
+/// `--wait-for-debugger` returns once the app is started suspended, so it
+/// fits the same bound.
 pub fn launch_opts(udid: &str, bundle_id: &str, opts: &LaunchOptions) -> Result<String, CliError> {
     let mut argv: Vec<&str> = vec!["simctl", "launch", "--terminate-running-process"];
     if opts.wait_for_debugger {
@@ -301,11 +190,8 @@ pub fn launch_opts(udid: &str, bundle_id: &str, opts: &LaunchOptions) -> Result<
     argv.push(udid);
     argv.push(bundle_id);
     argv.extend(opts.args.iter().map(String::as_str));
-    let output = std::process::Command::new("xcrun")
-        .args(&argv)
-        .envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .output()
-        .map_err(|e| CliError::new(format!("failed to run `xcrun simctl launch`: {e}")))?;
+    let output =
+        bounded_step(&argv, opts.env, udid).context("launching the app on the simulator")?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -347,18 +233,107 @@ pub fn spawn_console(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     cmd.spawn()
-        .map_err(|e| CliError::new(format!("failed to run `xcrun simctl launch`: {e}")))
+        .map_err(|e| CliError::new(format!("failed to run 'xcrun simctl launch': {e}")))
 }
 
-/// Terminate a running app by bundle id. Already-stopped is treated as success
-/// (idempotent, mirroring [`boot`]/[`shutdown`]): `simctl` errors with "found
-/// nothing to terminate" when the app isn't running, which is not a failure for
-/// `app stop` / session teardown.
+/// Wait for a [`spawn_console`] launch to start, within [`STEP_TIMEOUT`].
+/// The console child lives as long as the app, so only its start is bounded:
+/// it has started once it has output (the app's first line, or simctl's
+/// error), once it exits, or once `app_up` sees the app's process, which is
+/// how a launch of an app that prints nothing shows it got going. A healthy
+/// launch gets there in about a second. A wedged simulator never does: the
+/// console child is killed at the limit and the launch reported stuck
+/// ([`stuck`]).
+pub fn await_console_start(
+    child: &mut std::process::Child,
+    udid: &str,
+    app_up: impl FnMut() -> bool,
+) -> Result<(), CliError> {
+    await_console_start_within(child, udid, app_up, STEP_TIMEOUT)
+}
+
+/// [`await_console_start`] with its limit given.
+fn await_console_start_within(
+    child: &mut std::process::Child,
+    udid: &str,
+    mut app_up: impl FnMut() -> bool,
+    limit: Duration,
+) -> Result<(), CliError> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if has_output(child, Duration::from_millis(200)) {
+            return Ok(());
+        }
+        if !matches!(child.try_wait(), Ok(None)) || app_up() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(stuck("launch", udid, limit).context("launching the app on the simulator"));
+        }
+    }
+}
+
+/// Whether either of `child`'s piped streams has something to read, its
+/// output or its end, waiting up to `wait`. Nothing is consumed, so the
+/// renderer that takes the pipes afterwards still reads every line.
+fn has_output(child: &std::process::Child, wait: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fds: Vec<libc::pollfd> = [
+        child.stdout.as_ref().map(AsRawFd::as_raw_fd),
+        child.stderr.as_ref().map(AsRawFd::as_raw_fd),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    })
+    .collect();
+    if fds.is_empty() {
+        std::thread::sleep(wait);
+        return false;
+    }
+    let count = libc::nfds_t::try_from(fds.len()).unwrap_or(libc::nfds_t::MAX);
+    let millis = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+    // Safety: `fds` is a live array of `count` pollfd entries for the whole
+    // call, and poll only writes their `revents`.
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, millis) };
+    ready > 0
+}
+
+/// The pids of `executable` running out of an `.app` named `app_dir` on the
+/// simulator `udid`. A simulator app is a host process under the device's
+/// data directory, so the host's `ps` sees it without asking the simulator,
+/// which a wedged one would never answer. Empty when `ps` fails.
+#[must_use]
+pub fn app_pids(udid: &str, app_dir: &str, executable: &str) -> Vec<u32> {
+    process::capture("ps", &["-axww", "-o", "pid=,comm="], None)
+        .map(|ps| sweetpad_core::devices::simctl::parse_app_pids(&ps, udid, app_dir, executable))
+        .unwrap_or_default()
+}
+
+/// Terminate a running app by bundle id, within [`STEP_TIMEOUT`].
+/// Already-stopped is treated as success (idempotent, mirroring
+/// [`boot`]/[`shutdown`]): `simctl` errors with "found nothing to terminate"
+/// when the app isn't running, which is not a failure for `app stop` /
+/// session teardown.
 pub fn terminate(udid: &str, bundle_id: &str) -> Result<(), CliError> {
-    let output = std::process::Command::new("xcrun")
-        .args(["simctl", "terminate", udid, bundle_id])
-        .output()
-        .map_err(|e| CliError::new(format!("failed to run `xcrun simctl terminate`: {e}")))?;
+    terminate_within("xcrun", udid, bundle_id, STEP_TIMEOUT)
+}
+
+/// [`terminate`] with the program and its limit given.
+pub(crate) fn terminate_within(
+    program: &str,
+    udid: &str,
+    bundle_id: &str,
+    limit: Duration,
+) -> Result<(), CliError> {
+    let argv = ["simctl", "terminate", udid, bundle_id];
+    let output = bounded_step_within(program, &argv, &[], udid, limit)
+        .context("terminating the app on the simulator")?;
     if output.status.success() {
         return Ok(());
     }
@@ -381,7 +356,7 @@ pub fn shutdown(udid: &str) -> Result<(), CliError> {
     let output = std::process::Command::new("xcrun")
         .args(["simctl", "shutdown", udid])
         .output()
-        .map_err(|e| CliError::new(format!("failed to run `xcrun simctl shutdown`: {e}")))?;
+        .map_err(|e| CliError::new(format!("failed to run 'xcrun simctl shutdown': {e}")))?;
     if output.status.success() {
         return Ok(());
     }
@@ -415,6 +390,62 @@ pub fn uninstall(udid: &str, bundle_id: &str) -> Result<(), CliError> {
 pub fn open_url(udid: &str, url: &str) -> Result<(), CliError> {
     process::stream("xcrun", &["simctl", "openurl", udid, url], None)
         .context("opening the URL on the simulator")
+}
+
+/// The `simctl get_app_container` argv for one of an installed app's
+/// containers: `app` (the installed `.app`), `data`, or `groups`.
+fn app_container_args<'a>(udid: &'a str, bundle_id: &'a str, container: &'a str) -> [&'a str; 5] {
+    ["simctl", "get_app_container", udid, bundle_id, container]
+}
+
+/// Where one of an installed app's containers lives on the host, as simctl
+/// prints it — for `groups`, one line per App Group (see
+/// [`parse_app_groups`]). `Ok(None)` when the app isn't installed on this
+/// simulator, so the caller can name both. The simulator must be booted: a
+/// shut-down one answers every lookup with "Unable to lookup in current state".
+pub fn app_container(
+    udid: &str,
+    bundle_id: &str,
+    container: &str,
+) -> Result<Option<String>, CliError> {
+    let output = std::process::Command::new("xcrun")
+        .args(app_container_args(udid, bundle_id, container))
+        .output()
+        .map_err(|e| {
+            CliError::new(format!(
+                "failed to run 'xcrun simctl get_app_container': {e}"
+            ))
+        })?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if not_installed(&stderr) {
+        return Ok(None);
+    }
+    Err(CliError::new(format!(
+        "simctl get_app_container failed: {}",
+        stderr.trim()
+    )))
+}
+
+/// Whether a failed `get_app_container` is simctl saying the bundle id isn't
+/// installed: it reports that as a bare ENOENT (`NSPOSIXErrorDomain, code=2`),
+/// where an unknown simulator is `Invalid device` and a shut-down one a
+/// CoreSimulator state error.
+fn not_installed(stderr: &str) -> bool {
+    stderr.contains("No such file or directory")
+}
+
+/// Parse `get_app_container … groups` output: one `<group id>\t<path>` line
+/// per App Group, in simctl's order. An app with no groups prints nothing.
+#[must_use]
+pub fn parse_app_groups(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(id, path)| (id.trim().to_string(), path.trim_end().to_string()))
+        .filter(|(id, path)| !id.is_empty() && !path.is_empty())
+        .collect()
 }
 
 /// Capture a PNG screenshot of a booted simulator to `path`.
@@ -626,200 +657,94 @@ pub fn record(udid: &str, path: &str, quiet_stdout: bool) -> Result<bool, CliErr
     }
 }
 
-/// `com.apple.CoreSimulator.SimRuntime.iOS-17-0` → (`iOS`, `17.0`).
-fn parse_runtime(runtime: &str) -> (String, String) {
-    let tail = runtime.rsplit('.').next().unwrap_or(runtime); // iOS-17-0
-    match tail.split_once('-') {
-        Some((os, version)) => (os.to_string(), version.replace('-', ".")),
-        None => (tail.to_string(), String::new()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"{
-      "devices": {
-        "com.apple.CoreSimulator.SimRuntime.iOS-17-0": [
-          {"udid":"AAAA","name":"iPhone 15","state":"Booted","isAvailable":true},
-          {"udid":"BBBB","name":"iPhone 14","state":"Shutdown","isAvailable":true},
-          {"udid":"DEAD","name":"Old","state":"Shutdown","isAvailable":false}
-        ],
-        "com.apple.CoreSimulator.SimRuntime.watchOS-10-0": [
-          {"udid":"CCCC","name":"Apple Watch","state":"Shutdown","isAvailable":true}
-        ]
-      }
-    }"#;
-
     #[test]
-    fn parses_and_filters_unavailable() {
-        let sims = parse_devices(SAMPLE).unwrap();
-        // The unavailable "Old" device is dropped.
-        assert_eq!(sims.len(), 3);
-        assert!(sims.iter().all(|s| s.udid != "DEAD"));
-    }
-
-    #[test]
-    fn sorts_ios_before_watchos_then_by_name() {
-        let sims = parse_devices(SAMPLE).unwrap();
-        let order: Vec<&str> = sims.iter().map(|s| s.name.as_str()).collect();
-        // iOS before watchOS; within iOS, name order.
-        assert_eq!(order, vec!["iPhone 14", "iPhone 15", "Apple Watch"]);
-    }
-
-    // Several runtimes and families, to exercise every ordering tier at once.
-    const MIXED: &str = r#"{
-      "devices": {
-        "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
-          {"udid":"A","name":"iPhone 15","state":"Shutdown","isAvailable":true},
-          {"udid":"B","name":"iPhone 9","state":"Shutdown","isAvailable":true},
-          {"udid":"C","name":"iPad Air","state":"Shutdown","isAvailable":true}
-        ],
-        "com.apple.CoreSimulator.SimRuntime.iOS-17-0": [
-          {"udid":"D","name":"iPhone 14","state":"Shutdown","isAvailable":true}
-        ],
-        "com.apple.CoreSimulator.SimRuntime.tvOS-26-0": [
-          {"udid":"E","name":"Apple TV","state":"Shutdown","isAvailable":true}
-        ],
-        "com.apple.CoreSimulator.SimRuntime.watchOS-11-0": [
-          {"udid":"F","name":"Apple Watch","state":"Shutdown","isAvailable":true}
-        ],
-        "com.apple.CoreSimulator.SimRuntime.xrOS-2-0": [
-          {"udid":"G","name":"Apple Vision Pro","state":"Shutdown","isAvailable":true}
-        ]
-      }
-    }"#;
-
-    #[test]
-    fn picker_order_is_platform_then_newest_then_family_then_natural() {
-        let sims = parse_devices(MIXED).unwrap();
-        let order: Vec<&str> = sims.iter().map(|s| s.name.as_str()).collect();
+    fn app_container_asks_simctl_for_the_named_container() {
         assert_eq!(
-            order,
-            vec![
-                // iOS first; newest (26.5) before 17.0; iPhone before iPad;
-                // "iPhone 9" before "iPhone 15" (numeric, not byte order).
-                "iPhone 9",
-                "iPhone 15",
-                "iPad Air",
-                "iPhone 14",
-                // then the remaining platforms in priority order.
-                "Apple TV",
-                "Apple Watch",
-                "Apple Vision Pro",
+            app_container_args("AAAA", "dev.sweetpad.ci.app", "data"),
+            [
+                "simctl",
+                "get_app_container",
+                "AAAA",
+                "dev.sweetpad.ci.app",
+                "data"
             ]
         );
-    }
-
-    #[test]
-    fn natural_cmp_orders_numbers_numerically() {
-        assert_eq!(natural_cmp("iPhone 9", "iPhone 15"), Ordering::Less);
-        assert_eq!(natural_cmp("iPhone 15", "iPhone 15"), Ordering::Equal);
-        assert_eq!(natural_cmp("iPhone 15 Pro", "iPhone 15"), Ordering::Greater);
-        // A byte compare would put "iPhone 15" before "iPhone 9"; this must not.
-        assert_eq!("iPhone 15".cmp("iPhone 9"), Ordering::Less);
-        assert_eq!(natural_cmp("iPhone 15", "iPhone 9"), Ordering::Greater);
-    }
-
-    #[test]
-    fn version_key_compares_numerically() {
-        assert!(version_key("9.0") < version_key("17.0"));
-        assert!(version_key("26.5") > version_key("26.4"));
-        assert_eq!(version_key("26.5"), vec![26, 5]);
-    }
-
-    #[test]
-    fn ranks_put_ios_and_iphone_first() {
-        assert!(platform_rank("iOS") < platform_rank("tvOS"));
-        assert!(platform_rank("watchOS") < platform_rank("unknownOS"));
-        assert!(device_rank("iPhone 15") < device_rank("iPad Air"));
-        assert!(device_rank("iPad Air") < device_rank("Apple TV"));
-    }
-
-    #[test]
-    fn parses_runtime_into_os_and_version() {
         assert_eq!(
-            parse_runtime("com.apple.CoreSimulator.SimRuntime.iOS-17-0"),
-            ("iOS".to_string(), "17.0".to_string())
+            app_container_args("AAAA", "dev.sweetpad.ci.app", "groups")[4],
+            "groups"
+        );
+    }
+
+    // `get_app_container <udid> com.apple.Bridge groups` on Xcode 27, home
+    // directory renamed.
+    const GROUPS: &str = "group.com.apple.weather\t/Users/someone/Library/Developer/CoreSimulator/Devices/F13C004A-0824-4870-B4F2-29AAEE36636E/data/Containers/Shared/AppGroup/8100592D-0F4B-4803-849C-67B4B7FF148B
+group.com.apple.stocks\t/Users/someone/Library/Developer/CoreSimulator/Devices/F13C004A-0824-4870-B4F2-29AAEE36636E/data/Containers/Shared/AppGroup/3BE35442-E367-4CDD-BA59-337B672C900B
+243LU875E5.groups.com.apple.podcasts\t/Users/someone/Library/Developer/CoreSimulator/Devices/F13C004A-0824-4870-B4F2-29AAEE36636E/data/Containers/Shared/AppGroup/4E042FCD-BE10-4C9B-9B2B-23D485FB85D7
+";
+
+    #[test]
+    fn app_groups_pair_each_id_with_its_path_in_simctls_order() {
+        let groups = parse_app_groups(GROUPS);
+        let ids: Vec<&str> = groups.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "group.com.apple.weather",
+                "group.com.apple.stocks",
+                "243LU875E5.groups.com.apple.podcasts",
+            ]
         );
         assert_eq!(
-            parse_runtime("com.apple.CoreSimulator.SimRuntime.watchOS-10-2"),
-            ("watchOS".to_string(), "10.2".to_string())
+            groups[0].1,
+            "/Users/someone/Library/Developer/CoreSimulator/Devices/\
+             F13C004A-0824-4870-B4F2-29AAEE36636E/data/Containers/Shared/AppGroup/\
+             8100592D-0F4B-4803-849C-67B4B7FF148B"
         );
     }
 
     #[test]
-    fn destination_specifier_maps_platform() {
-        let sims = parse_devices(SAMPLE).unwrap();
-        let watch = sims.iter().find(|s| s.os == "watchOS").unwrap();
-        assert_eq!(
-            watch.destination(),
-            format!("platform=watchOS Simulator,id={}", watch.udid)
-        );
-        let iphone = sims.iter().find(|s| s.name == "iPhone 15").unwrap();
-        assert_eq!(iphone.destination(), "platform=iOS Simulator,id=AAAA");
+    fn an_app_without_groups_has_none() {
+        assert!(parse_app_groups("").is_empty());
+        assert!(parse_app_groups("\n").is_empty());
     }
 
     #[test]
-    fn find_matches_udid_case_insensitively() {
-        let sims = parse_devices(SAMPLE).unwrap();
-        assert_eq!(find(&sims, "aaaa").unwrap().name, "iPhone 15");
+    fn only_enoent_reads_as_not_installed() {
+        // The captured stderr for a bundle id the simulator doesn't have.
+        let missing = "An error was encountered processing the command \
+                       (domain=NSPOSIXErrorDomain, code=2):\n\
+                       The operation couldn’t be completed. No such file or directory\n\
+                       No such file or directory\n";
+        assert!(not_installed(missing));
+        assert!(!not_installed(
+            "Invalid device: 00000000-0000-0000-0000-000000000000\n"
+        ));
+        assert!(!not_installed(
+            "An error was encountered processing the command \
+             (domain=com.apple.CoreSimulator.SimError, code=405):\n\
+             Unable to lookup in current state: Shutdown\n"
+        ));
     }
 
-    #[test]
-    fn find_by_name_prefers_booted() {
-        let sims = vec![
-            Simulator {
-                udid: "1".into(),
-                name: "Dup".into(),
-                state: "Shutdown".into(),
-                available: true,
-                os: "iOS".into(),
-                os_version: "17.0".into(),
-            },
-            Simulator {
-                udid: "2".into(),
-                name: "Dup".into(),
-                state: "Booted".into(),
-                available: true,
-                os: "iOS".into(),
-                os_version: "17.0".into(),
-            },
-        ];
-        assert_eq!(find(&sims, "Dup").unwrap().udid, "2");
-    }
-
-    #[test]
-    fn label_includes_version() {
-        let s = Simulator {
-            udid: "x".into(),
-            name: "iPhone 15".into(),
-            state: "Booted".into(),
-            available: true,
-            os: "iOS".into(),
-            os_version: "17.0".into(),
-        };
-        assert_eq!(s.label(), "iPhone 15 (17.0)");
-        assert!(s.is_booted());
-    }
-
-    fn fake_xcode(tag: &str, bundle: &str) -> std::path::PathBuf {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let xcode = std::env::temp_dir().join(format!("sweetpad-test-{tag}-{n}/Xcode.app"));
+    /// An `Xcode.app` in a fresh directory, holding `bundle` unless it is
+    /// empty. The directory goes when the returned guard drops.
+    fn fake_xcode(tag: &str, bundle: &str) -> (crate::cli::testdir::TempDir, std::path::PathBuf) {
+        let dir = crate::cli::testdir::TempDir::new(&format!("sweetpad-test-{tag}"));
+        let xcode = dir.join("Xcode.app");
         std::fs::create_dir_all(xcode.join("Contents/Developer")).unwrap();
         if !bundle.is_empty() {
             std::fs::create_dir_all(xcode.join(bundle)).unwrap();
         }
-        xcode
+        (dir, xcode)
     }
 
     #[test]
     fn simulator_app_finds_the_bundle_in_the_developer_dir() {
-        let xcode = fake_xcode("sim26", "Contents/Developer/Applications/Simulator.app");
+        let (_dir, xcode) = fake_xcode("sim26", "Contents/Developer/Applications/Simulator.app");
         let dev = xcode.join("Contents/Developer");
         assert_eq!(
             simulator_app_in(&dev),
@@ -829,7 +754,7 @@ mod tests {
 
     #[test]
     fn simulator_app_finds_device_hub_beside_the_developer_dir() {
-        let xcode = fake_xcode("sim27", "Contents/Applications/DeviceHub.app");
+        let (_dir, xcode) = fake_xcode("sim27", "Contents/Applications/DeviceHub.app");
         assert_eq!(
             simulator_app_in(&xcode.join("Contents/Developer")),
             xcode
@@ -839,9 +764,157 @@ mod tests {
         );
     }
 
+    /// A stand-in for `xcrun` that runs `body`, in a directory that goes
+    /// when the returned guard drops.
+    fn stub_xcrun(tag: &str, body: &str) -> (crate::cli::testdir::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::cli::testdir::TempDir::new(&format!("sweetpad-test-{tag}"));
+        let stub = dir.join("xcrun");
+        std::fs::write(&stub, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = stub.display().to_string();
+        (dir, path)
+    }
+
+    /// A wedged simulator never answers a launch. The step is killed at its
+    /// limit and fails naming the step and how to restart the simulator,
+    /// rather than holding the run forever.
+    #[test]
+    fn a_simctl_step_that_never_returns_is_stopped_at_its_limit() {
+        let (_dir, xcrun) = stub_xcrun("simctl-stuck", "exec sleep 30");
+        let argv = [
+            "simctl",
+            "launch",
+            "--terminate-running-process",
+            "UDID",
+            "dev.app",
+        ];
+        let started = Instant::now();
+        let err =
+            bounded_step_within(&xcrun, &argv, &[], "UDID", Duration::from_secs(1)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(err.error_kind(), crate::cli::ErrorKind::Generic);
+        assert_eq!(
+            err.to_string(),
+            "'xcrun simctl launch' didn't finish within 1s, so the simulator looks stuck"
+        );
+        assert_eq!(
+            err.tip_text(),
+            Some(
+                "restart the simulator with 'sweetpad simulator shutdown UDID' and \
+                 'sweetpad simulator boot UDID', then run the command again"
+            )
+        );
+        assert!(!format!("{err} {:?}", err.tip_text()).contains('`'));
+    }
+
+    /// A step that answers in time comes back whole: its exit status and both
+    /// streams, with the environment it was given.
+    #[test]
+    fn a_simctl_step_that_answers_keeps_its_output() {
+        let (_dir, xcrun) = stub_xcrun(
+            "simctl-answers",
+            "echo \"dev.app: $SIMCTL_CHILD_PORT\"\necho 'a note' >&2\nexit 3",
+        );
+        let env = [("SIMCTL_CHILD_PORT".to_string(), "4242".to_string())];
+        let output =
+            bounded_step_within(&xcrun, &["simctl", "launch"], &env, "UDID", STEP_TIMEOUT).unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "dev.app: 4242\n");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "a note\n");
+    }
+
+    /// A stand-in for the session's `simctl launch --console-pty` child,
+    /// running `script` with both streams piped.
+    fn console_child(script: &str) -> std::process::Child {
+        std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    /// A console launch that never prints, never exits, and whose app never
+    /// shows up is a wedged simulator: it is killed at the limit and reported
+    /// as the stuck launch.
+    #[test]
+    fn a_console_launch_that_never_starts_is_stopped_at_its_limit() {
+        let mut child = console_child("exec sleep 30");
+        let started = Instant::now();
+        let err = await_console_start_within(&mut child, "UDID", || false, Duration::from_secs(1))
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(child.try_wait().unwrap().is_some(), "the child was killed");
+        assert_eq!(
+            err.to_string(),
+            "launching the app on the simulator: 'xcrun simctl launch' didn't finish within 1s, \
+             so the simulator looks stuck"
+        );
+        assert!(
+            err.tip_text()
+                .unwrap()
+                .contains("sweetpad simulator shutdown UDID")
+        );
+    }
+
+    /// Only the start is bounded: output, an exit, or the app's process
+    /// ends the wait, and the output stays in the pipe for the renderer.
+    #[test]
+    fn a_console_launch_starts_on_output_exit_or_the_apps_process() {
+        let limit = Duration::from_secs(30);
+        for script in [
+            "echo 'app line'; exec sleep 30",
+            "echo 'an error' >&2; exec sleep 30",
+        ] {
+            let mut child = console_child(script);
+            await_console_start_within(&mut child, "UDID", || false, limit).unwrap();
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "{script}: still running"
+            );
+            let _ = child.kill();
+            let mut out = String::new();
+            std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+            std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut out).unwrap();
+            assert!(
+                out.contains("app line") || out.contains("an error"),
+                "{script}: {out:?}"
+            );
+            let _ = child.wait();
+        }
+
+        let mut child = console_child("exit 4");
+        await_console_start_within(&mut child, "UDID", || false, limit).unwrap();
+
+        let mut child = console_child("exec sleep 30");
+        let mut polls = 0;
+        await_console_start_within(
+            &mut child,
+            "UDID",
+            || {
+                polls += 1;
+                polls == 2
+            },
+            limit,
+        )
+        .unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn simulator_app_falls_back_to_the_bare_name() {
-        let xcode = fake_xcode("simnone", "");
+        let (_dir, xcode) = fake_xcode("simnone", "");
         assert_eq!(
             simulator_app_in(&xcode.join("Contents/Developer")),
             "Simulator"

@@ -8,22 +8,32 @@
 
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+mod common;
 
+use std::path::Path;
+use std::process::{Command, Output};
+
+use common::TempDir;
 use serde_json::Value;
 
 /// Run the `sweetpad` binary with an isolated XDG/HOME so the test never reads
 /// the developer's real config/state and DerivedData resolution is deterministic.
+/// `TMPDIR` points into the home too, so whatever a spawned tool leaves there
+/// goes with the home.
 fn sweetpad(args: &[&str], cwd: &Path, home: &Path) -> Output {
+    sweetpad_with_tmpdir(args, cwd, home, home)
+}
+
+fn sweetpad_with_tmpdir(args: &[&str], cwd: &Path, home: &Path, tmpdir: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sweetpad"))
         .args(args)
         .current_dir(cwd)
         .env("HOME", home)
+        .env("CFFIXED_USER_HOME", home)
         .env("XDG_STATE_HOME", home)
         .env("XDG_CONFIG_HOME", home)
         .env("XDG_CACHE_HOME", home)
+        .env("TMPDIR", tmpdir)
         .env_remove("NO_COLOR")
         .env_remove("FORCE_COLOR")
         .env_remove("CLICOLOR_FORCE")
@@ -32,13 +42,8 @@ fn sweetpad(args: &[&str], cwd: &Path, home: &Path) -> Output {
         .expect("failed to run the sweetpad binary")
 }
 
-fn tmp(tag: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("sweetpad-json-{tag}-{n}"));
-    std::fs::create_dir_all(&dir).unwrap();
+fn tmp(tag: &str) -> TempDir {
+    let dir = TempDir::new(&format!("sweetpad-json-{tag}"));
     // A `.git` marker stops walk-up discovery at this directory — without it
     // the CLI would walk into the shared temp root, where concurrently-running
     // tests drop `.xcodeproj` fixtures.
@@ -153,6 +158,24 @@ fn tool_backed_commands_are_enveloped_or_error() {
     }
 }
 
+/// `doctor` runs `swift --version`, which leaves a `TemporaryDirectory.*` in
+/// `$TMPDIR` unless it is handed a `TMPDIR` of its own: the driver hands the
+/// run to a `swift-frontend` that takes its place, so nothing removes it.
+#[test]
+fn doctor_leaves_nothing_in_tmpdir() {
+    let home = tmp("doctor-home");
+    let cwd = tmp("doctor-cwd");
+    let tmpdir = TempDir::new("sweetpad-json-doctor-tmp");
+    let args: &[&str] = &["doctor", "--json", "--non-interactive"];
+    let out = sweetpad_with_tmpdir(args, &cwd, &home, &tmpdir);
+    assert!(out.status.code().is_some(), "{args:?}: {out:?}");
+    let left: Vec<_> = std::fs::read_dir(&*tmpdir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "doctor left {left:?} in TMPDIR");
+}
+
 /// An unresolved target under `--json --non-interactive` is the canonical error
 /// path: empty stdout, a `target_resolution` error envelope on stderr, exit 4.
 #[test]
@@ -204,4 +227,291 @@ fn app_run_rejects_json() {
     );
     assert!(!out.status.success(), "app run --json must exit non-zero");
     parse_stderr_error(&out, args);
+}
+
+/// A command line clap parses but the command refuses on its own is a usage
+/// error: a flag on a verb it means nothing to (a run flag on 'test build', a
+/// start flag on 'build diagnostics'), an argument or flag value no project
+/// could make valid. Exit 2, the code clap's own usage errors get, and a
+/// 'usage_error' envelope under '--json'. Each is refused before any project
+/// is looked for, so no fixture is needed.
+#[test]
+fn a_refused_flag_is_a_usage_error() {
+    let home = tmp("usage-home");
+    let cwd = tmp("usage-cwd");
+    let refused: &[&[&str]] = &[
+        &["test", "build", "--failed"],
+        &["test", "attachments", "--junit", "x.xml"],
+        &["test", "output", "--coverage"],
+        &["build", "diagnostics", "--clean"],
+        &["build", "diagnostics", "--mac"],
+        &[
+            "pbxproj",
+            "membership",
+            "add",
+            "--target",
+            "App",
+            "--phase",
+            "sources",
+        ],
+        &["pbxproj", "settings", "set", "NO_EQUALS_SIGN"],
+        &["pbxproj", "settings", "unset", "SWIFT_VERSION=5.0"],
+        &["archive", "--on", "toaster"],
+        &["app", "ui", "click", "--label", "Save", "--nth", "0"],
+        &["app", "screenshot", "--window", "0"],
+        &["context", "alias", "mac", "iPhone 17"],
+        &["context", "set", "sdk", "iphoneos", "--testing"],
+        &["context", "select", "sdk", "--testing"],
+        &["context", "remove", "target"],
+        &["project", "new", "my app", "--no-git"],
+        &[
+            "project",
+            "new",
+            "App",
+            "--bundle-id",
+            "not a bundle id",
+            "--no-git",
+        ],
+        &[
+            "project",
+            "new",
+            "App",
+            "--deployment-target",
+            "latest",
+            "--no-git",
+        ],
+        &["help", "no-such-topic"],
+        // A '--' tail naming what sweetpad passes xcodebuild itself would
+        // fail inside xcodebuild ("may only be provided once"), so the flag
+        // that sets it is named instead.
+        &["build", "--", "-scheme", "App"],
+        &["test", "build", "--", "-configuration", "Release"],
+        &["test", "--", "-resultBundlePath", "r.xcresult"],
+        &["test", "--coverage", "--", "-enableCodeCoverage", "NO"],
+        &["test", "--retry-flaky", "2", "--", "-test-iterations", "3"],
+        &["archive", "--", "-archivePath", "App.xcarchive"],
+        &["app", "run", "--mac", "--", "-sdk", "macosx"],
+        &["app", "install", "--", "-project", "Other.xcodeproj"],
+        &["settings", "show", "--", "-workspace", "Other.xcworkspace"],
+    ];
+    for args in refused {
+        let human = sweetpad(args, &cwd, &home);
+        assert_eq!(human.status.code(), Some(2), "{args:?}: {human:?}");
+        let stderr = String::from_utf8(human.stderr).unwrap();
+        assert!(stderr.contains("error:"), "{args:?}: {stderr}");
+
+        // Ahead of any '--' tail, which would take it as xcodebuild's.
+        let tail = args.iter().position(|a| *a == "--").unwrap_or(args.len());
+        let json_args = [&args[..tail], &["--json"], &args[tail..]].concat();
+        let out = sweetpad(&json_args, &cwd, &home);
+        assert_eq!(out.status.code(), Some(2), "{json_args:?}: {out:?}");
+        let err = parse_stderr_error(&out, &json_args);
+        assert_eq!(err["error"]["code"], "usage_error", "{json_args:?}");
+    }
+
+    // A flag that conflicts with the output mode is refused the same way.
+    for args in [
+        &["build", "--gh-annotations", "--json"][..],
+        &["app", "debug", "--batch", "--json"],
+    ] {
+        let out = sweetpad(args, &cwd, &home);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        assert_eq!(
+            parse_stderr_error(&out, args)["error"]["code"],
+            "usage_error",
+            "{args:?}"
+        );
+    }
+    // A refused scaffold wrote nothing into the working directory.
+    let left: Vec<_> = std::fs::read_dir(&*cwd)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|name| name != ".git")
+        .collect();
+    assert!(left.is_empty(), "a refused command wrote {left:?}");
+}
+
+/// A Swift package's '--' tail goes to 'swift build' or 'swift test', which
+/// know none of xcodebuild's flags, so the tail checks for those don't apply:
+/// a compiler flag forwarded with '-Xswiftc' may be spelled like one sweetpad
+/// passes xcodebuild itself. The same tail on an Xcode project is refused.
+#[test]
+fn a_packages_tail_skips_the_xcodebuild_checks() {
+    let home = tmp("package-tail-home");
+    let cwd = tmp("package-tail-cwd");
+    std::fs::write(
+        cwd.join("Package.swift"),
+        "// swift-tools-version: 5.9\nimport PackageDescription\nlet package = \
+         Package(name: \"Tool\")\n",
+    )
+    .unwrap();
+    let tail = ["-Xswiftc", "-sdk", "-Xswiftc", "/sdk"];
+    for verb in [&["build"][..], &["test"], &["test", "build"]] {
+        let args = [verb, &["--show-command", "--json", "--"], &tail].concat();
+        let out = sweetpad(&args, &cwd, &home);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let command = parse_stdout(&out, &args)["data"]["command"].clone();
+        let command: Vec<&str> = command
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(command[0], "swift", "{args:?}: {command:?}");
+        assert!(command.ends_with(&tail), "{args:?}: {command:?}");
+    }
+    // Nor does the one that keeps '--coverage' and a typed
+    // '-enableCodeCoverage' apart: 'swift test' takes neither.
+    let twin_tail = ["-Xswiftc", "-enableCodeCoverage"];
+    let args = [
+        &["test", "--coverage", "--show-command", "--json", "--"][..],
+        &twin_tail,
+    ]
+    .concat();
+    let out = sweetpad(&args, &cwd, &home);
+    assert!(out.status.success(), "{args:?}: {out:?}");
+    let command = parse_stdout(&out, &args)["data"]["command"].clone();
+    let command: Vec<&str> = command
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert!(command.ends_with(&twin_tail), "{args:?}: {command:?}");
+
+    let project = Path::new(env!("SWEETPAD_LIB_DIR"))
+        .join("fixtures/_synthetic-objectversion-110/project/SweetpadCIApp.xcodeproj");
+    let args = [
+        &["build", "--project", project.to_str().unwrap(), "--"][..],
+        &tail,
+    ]
+    .concat();
+    let out = sweetpad(&args, &cwd, &home);
+    assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("sweetpad sets the SDK itself; pass '--sdk' instead of '-sdk' after '--'"),
+        "{stderr}"
+    );
+    let args = [
+        &[
+            "test",
+            "--coverage",
+            "--project",
+            project.to_str().unwrap(),
+            "--",
+        ][..],
+        &twin_tail,
+    ]
+    .concat();
+    let out = sweetpad(&args, &cwd, &home);
+    assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("'--coverage' passes '-enableCodeCoverage' itself"),
+        "{stderr}"
+    );
+}
+
+/// Off a terminal, a command that would have asked names the flag that
+/// answers it instead, and that is a usage error: the same run goes through
+/// once the flag is typed. These need no project, so no fixture either.
+#[test]
+fn a_prompt_off_a_terminal_is_a_usage_error() {
+    let home = tmp("prompt-home");
+    let cwd = tmp("prompt-cwd");
+    // A non-empty directory where 'project new App' would scaffold.
+    std::fs::create_dir_all(cwd.join("App")).unwrap();
+    std::fs::write(cwd.join("App/keep.txt"), "mine").unwrap();
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["project", "new", "--no-git"],
+            "a project name is required",
+        ),
+        (
+            &["project", "new", "App", "--no-git"],
+            "use --force to scaffold into it anyway",
+        ),
+        (
+            &["context", "select"],
+            "'sweetpad context set <variable> <value>'",
+        ),
+    ];
+    for (args, hint) in cases {
+        let human = sweetpad(args, &cwd, &home);
+        assert_eq!(human.status.code(), Some(2), "{args:?}: {human:?}");
+        let stderr = String::from_utf8(human.stderr).unwrap();
+        assert!(stderr.contains(hint), "{args:?}: {stderr}");
+
+        let json_args = [*args, &["--json"]].concat();
+        let out = sweetpad(&json_args, &cwd, &home);
+        assert_eq!(out.status.code(), Some(2), "{json_args:?}: {out:?}");
+        let err = parse_stderr_error(&out, &json_args);
+        assert_eq!(err["error"]["code"], "usage_error", "{json_args:?}");
+    }
+    assert_eq!(
+        std::fs::read_dir(cwd.join("App")).unwrap().count(),
+        1,
+        "the refused scaffold left the directory as it was"
+    );
+}
+
+/// 'build', 'test' and 'test build' take '--mac' as '--on mac', so a typed
+/// '--on' or '--destination' beside it is a usage error, found before any
+/// project is looked for.
+#[test]
+fn a_typed_destination_beside_mac_is_a_usage_error_on_build_and_test() {
+    let home = tmp("dest-mac-home");
+    let cwd = tmp("dest-mac-cwd");
+    for verb in [&["build"][..], &["test"], &["test", "build"]] {
+        for (flag, value) in [
+            ("--on", "mac"),
+            ("--on", "iPhone 17"),
+            ("--destination", "platform=macOS"),
+        ] {
+            let args = [verb, &[flag, value, "--mac"]].concat();
+            let out = sweetpad(&args, &cwd, &home);
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            let expected = format!("{flag} and --mac are mutually exclusive; pass one");
+            assert!(stderr.contains(&expected), "{args:?}: {stderr}");
+        }
+    }
+}
+
+/// Every `app` verb that takes the mode flags checks a typed '--on' or
+/// '--destination' against them the way 'app run' does, before any project
+/// is looked for: both typed is a usage error, whichever destination the
+/// other flag names.
+#[test]
+fn a_typed_on_or_destination_beside_a_mode_flag_is_a_usage_error_on_every_app_verb() {
+    let home = tmp("on-mac-home");
+    let cwd = tmp("on-mac-cwd");
+    let verbs = [
+        "run",
+        "install",
+        "launch",
+        "debug",
+        "diagnose",
+        "uninstall",
+        "logs",
+        "stop",
+        "container",
+    ];
+    for verb in verbs {
+        for (flag, value, mode) in [
+            ("--on", "mac", "--mac"),
+            ("--on", "iPhone 17", "--mac"),
+            ("--destination", "platform=iOS Simulator,name=Nope", "--mac"),
+            ("--destination", "platform=macOS", "--mac"),
+            ("--destination", "platform=iOS Simulator", "--device"),
+        ] {
+            let args = ["app", verb, flag, value, mode];
+            let out = sweetpad(&args, &cwd, &home);
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            let expected = format!("{flag} and {mode} are mutually exclusive; pass one");
+            assert!(stderr.contains(&expected), "{args:?}: {stderr}");
+        }
+    }
 }

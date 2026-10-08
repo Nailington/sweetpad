@@ -5,32 +5,25 @@
 
 import type { AppDeps } from "../common/commands";
 import type { ProcessGroup, ProcessHandle, ProcessSpec, TaskTerminal } from "../common/tasks/types";
-import type { DeviceCtlDevice } from "../common/xcode/devicectl";
+import type { DevicectlDevice } from "../common/xcode/devicectl";
 import type { XcdeviceDevice } from "../common/xcode/xcdevice";
 
 /**
- * Create a mock DeviceCtlDevice object with optional overrides
+ * Create a mock devicectl device, as the addon's "parseDevicectlDevices" returns it, with
+ * optional overrides. Pass `undefined` for a field to model devicectl leaving it out.
  */
-export function createMockDevice(overrides: Partial<DeviceCtlDevice> = {}): DeviceCtlDevice {
+export function createMockDevice(overrides: Partial<DevicectlDevice> = {}): DevicectlDevice {
   return {
-    capabilities: [],
-    connectionProperties: {
-      tunnelState: "connected",
-      pairingState: "paired",
-    },
-    deviceProperties: {
-      name: "iPhone 14 Pro",
-      osVersionNumber: "17.0",
-    },
-    hardwareProperties: {
-      deviceType: "iPhone",
-      marketingName: "iPhone 14 Pro",
-      productType: "iPhone15,2",
-      udid: "00008110-001234567890001E",
-      platform: "iOS",
-    },
     identifier: "urn:x-ios-devicectl:device-CS4567890-1234567890123456",
-    visibilityClass: "default",
+    udid: "00008110-001234567890001E",
+    name: "iPhone 14 Pro",
+    marketingName: "iPhone 14 Pro",
+    productType: "iPhone15,2",
+    deviceType: "iPhone",
+    platform: "iOS",
+    osVersion: "17.0",
+    connection: "connected",
+    pairing: "paired",
     ...overrides,
   };
 }
@@ -128,13 +121,8 @@ export function createMockTerminal(): MockTaskTerminal {
 /**
  * Helper to create a mock device with specific OS version
  */
-export function createMockDeviceWithOS(osVersion: string): DeviceCtlDevice {
-  return createMockDevice({
-    deviceProperties: {
-      name: "iPhone Test Device",
-      osVersionNumber: osVersion,
-    },
-  });
+export function createMockDeviceWithOS(osVersion: string): DevicectlDevice {
+  return createMockDevice({ name: "iPhone Test Device", osVersion: osVersion });
 }
 
 /**
@@ -142,8 +130,8 @@ export function createMockDeviceWithOS(osVersion: string): DeviceCtlDevice {
  */
 export function createMockDeviceOfType(
   deviceType: "iPhone" | "iPad" | "appleWatch" | "appleTV" | "appleVision",
-): DeviceCtlDevice {
-  const hardwareProps: Record<string, any> = {
+): DevicectlDevice {
+  const hardware: Record<string, Partial<DevicectlDevice>> = {
     iPhone: {
       deviceType: "iPhone",
       marketingName: "iPhone 14 Pro",
@@ -171,52 +159,26 @@ export function createMockDeviceOfType(
     },
   };
 
-  return createMockDevice({
-    hardwareProperties: {
-      ...createMockDevice().hardwareProperties,
-      ...hardwareProps[deviceType],
-    },
-  });
+  return createMockDevice(hardware[deviceType]);
 }
 
 /**
  * Create a mock device without OS version (for testing fallback behavior)
  */
-export function createMockDeviceWithoutOS(): DeviceCtlDevice {
-  return createMockDevice({
-    deviceProperties: {
-      name: "iPhone Unknown",
-    },
-    hardwareProperties: {
-      ...createMockDevice().hardwareProperties,
-      udid: undefined,
-    },
-  });
+export function createMockDeviceWithoutOS(): DevicectlDevice {
+  return createMockDevice({ name: "iPhone Unknown", osVersion: undefined, udid: undefined });
 }
 
 /**
  * Create a mock device without UDID (for testing fallback behavior)
  */
-export function createMockDeviceWithoutUDID(): DeviceCtlDevice {
-  return createMockDevice({
-    hardwareProperties: {
-      ...createMockDevice().hardwareProperties,
-      udid: undefined,
-    },
-  });
+export function createMockDeviceWithoutUDID(): DevicectlDevice {
+  return createMockDevice({ udid: undefined });
 }
 
 /**
  * Create a mock device with missing name (for testing fallback behavior)
  */
-export function createMockDeviceWithoutName(): DeviceCtlDevice {
-  return createMockDevice({
-    deviceProperties: {
-      osVersionNumber: "17.0",
-    },
-    hardwareProperties: {
-      ...createMockDevice().hardwareProperties,
-      marketingName: undefined,
-    },
-  });
+export function createMockDeviceWithoutName(): DevicectlDevice {
+  return createMockDevice({ name: undefined, marketingName: undefined });
 }

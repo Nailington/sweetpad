@@ -10,7 +10,6 @@ use crate::destination::RunDestination;
 use crate::pbxproj::{self, Dict, Value};
 use crate::resolver;
 use crate::xcconfig::{Assignment, Condition};
-use crate::xcode_hash::derived_data_hash;
 
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -29,8 +28,8 @@ pub struct Project {
     /// Scheme names for this project, sorted alphabetically — the set
     /// `xcodebuild -list` prints: shared (`xcshareddata/xcschemes`) plus
     /// per-user (`xcuserdata/<user>.xcuserdatad/xcschemes`) scheme files,
-    /// plus one autocreated scheme per eligible target not already named by
-    /// a scheme file (Xcode's scheme autocreation; see
+    /// plus one autocreated scheme per eligible target no scheme file names
+    /// or runs (Xcode's scheme autocreation; see [`listed_schemes`], and
     /// [`autocreates_scheme_for_target`] for the eligibility rules). Schemes
     /// that `xcodebuild` additionally synthesizes from Swift *package*
     /// manifests are out of scope — they aren't derivable from the pbxproj.
@@ -90,7 +89,7 @@ impl Error {
     }
 
     /// The canonical "no target named X" lookup-miss error.
-    fn no_such_target(target_name: &str) -> Self {
+    pub(crate) fn no_such_target(target_name: &str) -> Self {
         Error::NoSuchTarget(target_name.to_string())
     }
 }
@@ -123,11 +122,79 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A parsed project document, in whichever of the two formats the bundle
+/// holds: `project.pbxproj`, or the JSON `project.xcproj` that Xcode 27.2
+/// writes in its place.
+///
+/// Parsing dominates the cost of a query, so a caller with more than one
+/// question to ask parses once and asks the document — which is what makes
+/// [`open`] and [`build_settings`] the convenience wrappers rather than the
+/// primitives. Both arms hold a shared, mtime-validated cache entry, so the
+/// parse is reused across documents opened on the same bundle too.
+#[derive(Debug, Clone)]
+pub enum Document {
+    Pbxproj(Arc<Value>),
+    Xcproj(Arc<crate::xcproj::Value>),
+}
+
+impl Document {
+    /// Read and parse the document under an `.xcodeproj` directory.
+    ///
+    /// A bundle holding both is invalid — Xcode says so rather than preferring
+    /// one — so this reports it instead of guessing.
+    pub fn parse(xcodeproj_path: &Path) -> Result<Self, Error> {
+        let pbxproj = xcodeproj_path.join("project.pbxproj").exists();
+        let xcproj = xcodeproj_path.join(crate::xcproj::DOCUMENT_NAME).exists();
+        match (pbxproj, xcproj) {
+            (true, true) => Err(Error::BadProject(format!(
+                "{} has both project.pbxproj and {}; only one should exist",
+                xcodeproj_path.display(),
+                crate::xcproj::DOCUMENT_NAME
+            ))),
+            (false, true) => crate::project_xcproj::parse(xcodeproj_path).map(Document::Xcproj),
+            _ => parse_pbxproj(xcodeproj_path).map(Document::Pbxproj),
+        }
+    }
+
+    /// The project's high-level metadata: name, targets, project
+    /// configurations, and shared schemes.
+    pub fn open(&self, xcodeproj_path: &Path) -> Result<Project, Error> {
+        match self {
+            Document::Pbxproj(value) => open_from_value(value, xcodeproj_path),
+            Document::Xcproj(value) => {
+                crate::project_xcproj::open_from_value(value, xcodeproj_path)
+            }
+        }
+    }
+
+    /// The four user-authored build-settings layers for a target and
+    /// configuration, plus the target metadata xcspec lookups need. See
+    /// [`build_settings`].
+    pub fn build_settings(
+        &self,
+        xcodeproj_path: &Path,
+        target_name: &str,
+        config_name: &str,
+    ) -> Result<BuildSettingsContext, Error> {
+        match self {
+            Document::Pbxproj(value) => {
+                build_settings_from_value(value, xcodeproj_path, target_name, config_name)
+            }
+            Document::Xcproj(value) => crate::project_xcproj::build_settings_from_value(
+                value,
+                xcodeproj_path,
+                target_name,
+                config_name,
+            ),
+        }
+    }
+}
+
 /// Open an .xcodeproj directory and extract its high-level metadata: name,
-/// targets, project configurations, and shared schemes.
+/// targets, project configurations, and shared schemes, in whichever of the
+/// two formats its bundle holds.
 pub fn open(xcodeproj_path: &Path) -> Result<Project, Error> {
-    let value = parse_pbxproj(xcodeproj_path)?;
-    open_from_value(&value, xcodeproj_path)
+    Document::parse(xcodeproj_path)?.open(xcodeproj_path)
 }
 
 /// Like [`open`] but driven by an already-parsed pbxproj value. Use this when
@@ -139,32 +206,10 @@ pub fn open_from_value(value: &Value, xcodeproj_path: &Path) -> Result<Project, 
     let configurations = extract_project_configurations(objects, project_obj)?;
     let default_configuration = default_configuration_name(objects, project_obj);
     let targets = extract_targets(objects, project_obj)?;
-    let mut schemes = crate::scheme::container_schemes(xcodeproj_path);
-    if crate::scheme::autocreation_allowed(xcodeproj_path) {
-        // Mirror Xcode's per-target scheme autocreation: `xcodebuild -list`
-        // reports one scheme per eligible target that no scheme file already
-        // names, even when other targets DO have scheme files (kingfisher's
-        // Demo project ships only `Kingfisher-Demo.xcscheme` yet lists its
-        // macOS/tvOS/watchOS demo apps too; NetNewsWire lists its
-        // extension targets). When the workspace settings disable
-        // autocreation (XcodeGen / Tuist write the flag), `xcodebuild -list`
-        // shows only the scheme files and so do we.
-        let existing: std::collections::BTreeSet<&str> =
-            schemes.iter().map(String::as_str).collect();
-        let first_config = configurations.first().cloned();
-        let autocreated: Vec<String> = targets
-            .iter()
-            .filter(|t| !existing.contains(t.name.as_str()))
-            .filter(|t| {
-                autocreates_scheme_for_target(value, xcodeproj_path, t, first_config.as_deref())
-            })
-            .map(|t| t.name.clone())
-            .collect();
-        schemes.extend(autocreated);
-        schemes.dedup();
-    }
-    crate::scheme::sort_like_xcodebuild(&mut schemes);
-    schemes.dedup();
+    let first_config = configurations.first().cloned();
+    let schemes = listed_schemes(xcodeproj_path, &targets, |t| {
+        autocreates_scheme_for_target(value, xcodeproj_path, t, first_config.as_deref())
+    });
 
     let name = xcodeproj_path
         .file_stem()
@@ -279,70 +324,30 @@ fn group_tree_package_refs(
     project_obj: &Value,
     project_dir: &Path,
 ) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Some(main_group_id) = project_obj.get("mainGroup").and_then(Value::as_str) {
-        walk_for_packages(
-            objects,
-            main_group_id,
-            project_dir,
-            project_dir,
-            &mut out,
-            &mut BTreeSet::new(),
-            0,
-        );
-    }
-    out
-}
-
-fn walk_for_packages<'a>(
-    objects: &'a Dict,
-    node_id: &'a str,
-    parent_base: &Path,
-    project_dir: &Path,
-    out: &mut Vec<PathBuf>,
-    visited: &mut BTreeSet<&'a str>,
-    depth: usize,
-) {
-    let Some(node) = objects.get(node_id) else {
-        return;
+    let Some(main_group_id) = project_obj.get("mainGroup").and_then(Value::as_str) else {
+        return Vec::new();
     };
-    let base = node_base(node, parent_base, project_dir);
-    match node.get("isa").and_then(Value::as_str).unwrap_or("") {
-        "PBXGroup" | "PBXVariantGroup" | "XCVersionGroup" => {
-            if depth >= MAX_GROUP_DEPTH || !visited.insert(node_id) {
-                return;
+    let mut out = Vec::new();
+    for (_, node, base) in navigator_nodes(objects, main_group_id, project_dir) {
+        match node.get("isa").and_then(Value::as_str).unwrap_or("") {
+            "PBXGroup" | "PBXVariantGroup" | "XCVersionGroup" => {}
+            // A folder reference (Xcode 16+): the pbxproj lists none of its
+            // members, so a package under it is found by looking at the disk.
+            "PBXFileSystemSynchronizedRootGroup" => {
+                if base.join("Package.swift").is_file() {
+                    out.push(base);
+                } else {
+                    packages_under_synchronized_folder(&base, &mut out, 0);
+                }
             }
-            if let Some(children) = node.get("children").and_then(Value::as_array) {
-                for child in children {
-                    if let Some(cid) = child.as_str() {
-                        walk_for_packages(
-                            objects,
-                            cid,
-                            &base,
-                            project_dir,
-                            out,
-                            visited,
-                            depth + 1,
-                        );
-                    }
+            _ => {
+                if names_a_directory(node) {
+                    out.push(base);
                 }
             }
         }
-        // A folder reference (Xcode 16+): the pbxproj lists none of its
-        // members, so a package under it is found by looking at the disk.
-        "PBXFileSystemSynchronizedRootGroup" => {
-            if base.join("Package.swift").is_file() {
-                out.push(base);
-            } else {
-                packages_under_synchronized_folder(&base, out, 0);
-            }
-        }
-        _ => {
-            if names_a_directory(node) {
-                out.push(base);
-            }
-        }
     }
+    out
 }
 
 /// Package directories physically under `dir`, a synchronized folder.
@@ -359,7 +364,7 @@ fn walk_for_packages<'a>(
 /// `en.lproj`. A package directory never has one, and skipping them keeps the
 /// scan off the resource trees that are most of what a synchronized folder
 /// holds: NetNewsWire's eight folders cost 82 `read_dir` calls this way.
-fn packages_under_synchronized_folder(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+pub(crate) fn packages_under_synchronized_folder(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     if depth >= MAX_GROUP_DEPTH {
         return;
     }
@@ -397,6 +402,58 @@ fn names_a_directory(node: &Value) -> bool {
     match kind {
         None => true,
         Some(k) => k == "folder" || k == "wrapper" || k.starts_with("folder."),
+    }
+}
+
+/// The schemes `xcodebuild -list -project` prints for the project at
+/// `xcodeproj_path`: its scheme files, plus one autocreated scheme per target
+/// `eligible` accepts that no scheme file names or runs, sorted the way
+/// `xcodebuild` sorts. Both project formats list their schemes through here.
+///
+/// Autocreation is per target, not per project: a project with scheme files
+/// still lists a scheme for each other eligible target (kingfisher's Demo
+/// project ships only `Kingfisher-Demo.xcscheme` yet lists its
+/// macOS/tvOS/watchOS demo apps too; NetNewsWire lists its extension
+/// targets). A target a scheme file runs, or builds when the target doesn't
+/// run, has none under its own name ([`crate::scheme::SchemeReferences`]).
+/// When the workspace settings disable
+/// autocreation (XcodeGen / Tuist write the flag), `xcodebuild -list` shows
+/// only the scheme files and so do we.
+pub(crate) fn listed_schemes(
+    xcodeproj_path: &Path,
+    targets: &[Target],
+    eligible: impl Fn(&Target) -> bool,
+) -> Vec<String> {
+    let mut schemes = crate::scheme::container_schemes(xcodeproj_path);
+    if crate::scheme::autocreation_allowed(xcodeproj_path) {
+        let existing: std::collections::BTreeSet<&str> =
+            schemes.iter().map(String::as_str).collect();
+        let references = crate::scheme::SchemeReferences::of(xcodeproj_path);
+        let autocreated: Vec<String> = targets
+            .iter()
+            .filter(|t| !existing.contains(t.name.as_str()))
+            .filter(|t| !references.cover(Some(xcodeproj_path), &t.name, t.runs()))
+            .filter(|t| eligible(t))
+            .map(|t| t.name.clone())
+            .collect();
+        schemes.extend(autocreated);
+    }
+    crate::scheme::sort_like_xcodebuild(&mut schemes);
+    schemes.dedup();
+    schemes
+}
+
+impl Target {
+    /// Whether the target is something a scheme runs, an app, a command-line
+    /// tool or an app extension, rather than something it only builds.
+    #[must_use]
+    pub fn runs(&self) -> bool {
+        self.product_type.as_deref().is_some_and(|pt| {
+            pt.starts_with("com.apple.product-type.application")
+                || pt.starts_with("com.apple.product-type.app-extension")
+                || pt.starts_with("com.apple.product-type.extensionkit-extension")
+                || pt == "com.apple.product-type.tool"
+        })
     }
 }
 
@@ -476,7 +533,7 @@ fn is_safari_extension_target(
 
 /// Recursive search for a `<key>NSExtensionPointIdentifier</key>` followed by
 /// `<string>com.apple.Safari.extension</string>` anywhere in an XML plist.
-fn element_has_safari_extension_point(el: &crate::xcscheme::Element) -> bool {
+pub(crate) fn element_has_safari_extension_point(el: &crate::xcscheme::Element) -> bool {
     let mut children = el.children.iter().peekable();
     while let Some(child) = children.next() {
         if child.name == "key"
@@ -515,6 +572,13 @@ fn default_configuration_name(objects: &Dict, container: &Value) -> Option<Strin
 /// [`build_settings_from_value`].
 pub fn parse_pbxproj(xcodeproj_path: &Path) -> Result<Arc<Value>, Error> {
     let pbxproj_path = xcodeproj_path.join("project.pbxproj");
+    if !pbxproj_path.exists() && xcodeproj_path.join(crate::xcproj::DOCUMENT_NAME).exists() {
+        return Err(Error::BadProject(format!(
+            "{} is in the {} format, which this command cannot read yet",
+            xcodeproj_path.display(),
+            crate::xcproj::DOCUMENT_NAME
+        )));
+    }
     pbxproj::parse_file_cached(&pbxproj_path).map_err(|e| match e {
         pbxproj::Error::Io(e) => Error::Io(e),
         pbxproj::Error::Parse(e) => Error::Parse(e),
@@ -530,11 +594,11 @@ fn project_root(value: &Value) -> Result<(&Dict, &Value), Error> {
     let objects = root
         .get("objects")
         .and_then(Value::as_dict)
-        .ok_or_else(|| Error::BadProject("no `objects` dict".into()))?;
+        .ok_or_else(|| Error::BadProject("no 'objects' dict".into()))?;
     let root_id = root
         .get("rootObject")
         .and_then(Value::as_str)
-        .ok_or_else(|| Error::BadProject("no `rootObject` reference".into()))?;
+        .ok_or_else(|| Error::BadProject("no 'rootObject' reference".into()))?;
     let project_obj = objects
         .get(root_id)
         .ok_or_else(|| Error::BadProject(format!("rootObject {root_id} not found in objects")))?;
@@ -654,6 +718,10 @@ pub struct BuildSettingsContext {
     /// synthesize the subpath when the bundle doesn't author `TEST_TARGET_NAME`
     /// (see [`crate::build_context`]'s `target_graph_layer`).
     pub test_host_target: Option<String>,
+    /// The project's development region (`developmentRegion` in a pbxproj,
+    /// `localizations.development` in a `project.xcproj`), which xcodebuild
+    /// reports as `DEVELOPMENT_LANGUAGE`. `None` when the document names none.
+    pub development_region: Option<String>,
 }
 
 /// Extract the four user-authored build-settings layers for a target +
@@ -669,8 +737,7 @@ pub fn build_settings(
     target_name: &str,
     config_name: &str,
 ) -> Result<BuildSettingsContext, Error> {
-    let value = parse_pbxproj(xcodeproj_path)?;
-    build_settings_from_value(&value, xcodeproj_path, target_name, config_name)
+    Document::parse(xcodeproj_path)?.build_settings(xcodeproj_path, target_name, config_name)
 }
 
 /// Like [`build_settings`] but driven by an already-parsed pbxproj value.
@@ -715,10 +782,7 @@ pub fn build_settings_from_value(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let has_package_product_dependencies = target_obj
-        .get("packageProductDependencies")
-        .and_then(Value::as_array)
-        .is_some_and(|deps| !deps.is_empty());
+    let has_package_product_dependencies = links_package_product(objects, target_obj);
     let test_host_target = if is_test_bundle_product_type(product_type.as_deref()) {
         // Xcode records the authoritative host in the root PBXProject's
         // `attributes.TargetAttributes.<test-target-uuid>.TestTargetID`;
@@ -739,6 +803,11 @@ pub fn build_settings_from_value(
         target_isa,
         has_package_product_dependencies,
         test_host_target,
+        development_region: project_obj
+            .get("developmentRegion")
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
+            .map(String::from),
     })
 }
 
@@ -766,6 +835,9 @@ pub fn target_source_files(
     xcodeproj_path: &Path,
     target_name: &str,
 ) -> Result<Vec<PathBuf>, Error> {
+    if let Some(value) = crate::project_xcproj::parse_if_present(xcodeproj_path)? {
+        return crate::project_xcproj::target_source_files(&value, xcodeproj_path, target_name);
+    }
     let value = parse_pbxproj(xcodeproj_path)?;
     target_source_files_from_value(&value, xcodeproj_path, target_name)
 }
@@ -779,21 +851,26 @@ pub fn target_source_files_from_value(
     let (objects, project_obj) = project_root(value)?;
     let project_dir = abs_project_dir(xcodeproj_path);
 
-    // Resolve every file reference to an absolute path with one DFS from the
-    // project's mainGroup, accumulating each `<group>`'s `path` as we descend.
+    // Resolve every file reference to an absolute path with one walk from the
+    // project's mainGroup, accumulating each `<group>`'s `path` as it descends.
     let mut file_paths: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut sync_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
     if let Some(main_group_id) = project_obj.get("mainGroup").and_then(Value::as_str) {
-        resolve_group_paths(
-            objects,
-            main_group_id,
-            &project_dir,
-            &project_dir,
-            &mut file_paths,
-            &mut sync_dirs,
-            &mut BTreeSet::new(),
-            0,
-        );
+        for (id, node, base) in navigator_nodes(objects, main_group_id, &project_dir) {
+            match node.get("isa").and_then(Value::as_str).unwrap_or("") {
+                "PBXGroup" | "PBXVariantGroup" | "XCVersionGroup" => {}
+                // A folder reference (Xcode 16+): its members aren't listed in
+                // the pbxproj, they are every file physically under `base`. A
+                // target that lists it in `fileSystemSynchronizedGroups`
+                // resolves its sources by walking it.
+                "PBXFileSystemSynchronizedRootGroup" => {
+                    sync_dirs.insert(id.to_string(), base);
+                }
+                _ => {
+                    file_paths.insert(id.to_string(), base);
+                }
+            }
+        }
     }
 
     let target = find_target(objects, project_obj, target_name)?
@@ -831,6 +908,7 @@ pub fn target_source_files_from_value(
     // names a root folder whose compilable files are implicit target members —
     // they never appear in a `PBXSourcesBuildPhase`. Walk each for sources, minus
     // any file the group's exception sets exclude from this target.
+    let mut default_groups: BTreeSet<&str> = BTreeSet::new();
     if let Some(group_ids) = target
         .get("fileSystemSynchronizedGroups")
         .and_then(Value::as_array)
@@ -839,34 +917,79 @@ pub fn target_source_files_from_value(
             let Some(group_id) = group_ref.as_str() else {
                 continue;
             };
+            default_groups.insert(group_id);
             let Some(dir) = sync_dirs.get(group_id) else {
                 continue;
             };
-            let excluded = objects.get(group_id).map_or_else(Vec::new, |group| {
-                synchronized_membership_exclusions(objects, group, target_name, dir, &project_dir)
-            });
+            let excluded: Vec<PathBuf> = objects
+                .get(group_id)
+                .map(|group| membership_exceptions(objects, group, target_name))
+                .unwrap_or_default()
+                .iter()
+                // Xcode is inconsistent about whether a relative path is
+                // anchored at the folder or the project root, so both
+                // anchorings go in and either one hides the file.
+                .flat_map(|rel| {
+                    [
+                        join_normalized(dir, rel),
+                        join_normalized(&project_dir, rel),
+                    ]
+                })
+                .collect();
             collect_synchronized_sources(dir, &excluded, &mut out);
+        }
+    }
+
+    // The same `membershipExceptions` list cuts the other way for a target the
+    // folder does not already belong to: those files are the target's whole
+    // share of the folder. NetNewsWire builds five of its extensions this way,
+    // each with an empty `PBXSourcesBuildPhase` — Xcode 27's format spells the
+    // two senses as separate `inclusions` / `exclusions` keys, which is what
+    // made the distinction legible.
+    for (group_id, dir) in &sync_dirs {
+        if default_groups.contains(group_id.as_str()) {
+            continue;
+        }
+        let Some(group) = objects.get(group_id.as_str()) else {
+            continue;
+        };
+        for rel in membership_exceptions(objects, group, target_name) {
+            let candidates = [
+                join_normalized(dir, rel),
+                join_normalized(&project_dir, rel),
+            ];
+            let Some(path) = candidates.into_iter().find(|p| p.is_file()) else {
+                continue;
+            };
+            let compilable = path
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|ext| SYNCHRONIZED_SOURCE_EXTS.contains(&ext));
+            if compilable && !out.contains(&path) {
+                out.push(path);
+            }
         }
     }
     Ok(out)
 }
 
-/// The absolute paths a synchronized root group's exception sets exclude from
+/// The relative paths a synchronized root group's exception sets name for
 /// `target_name` — the `membershipExceptions` of each
-/// `PBXFileSystemSynchronizedBuildFileExceptionSet` that targets it (a file
-/// unchecked from the target's membership). Xcode is inconsistent about whether
-/// these relative paths are anchored at the group folder or the project root, so
-/// both anchorings are returned and either match excludes the file.
-fn synchronized_membership_exclusions(
-    objects: &Dict,
-    group: &Value,
+/// `PBXFileSystemSynchronizedBuildFileExceptionSet` that targets it.
+///
+/// One list, two meanings. For a target the folder already belongs to these
+/// are files unchecked from its membership; for any other target they are the
+/// files checked *into* it. Which applies is the caller's to decide, since
+/// only it knows whether the target names the group in
+/// `fileSystemSynchronizedGroups`.
+fn membership_exceptions<'a>(
+    objects: &'a Dict,
+    group: &'a Value,
     target_name: &str,
-    group_dir: &Path,
-    project_dir: &Path,
-) -> Vec<PathBuf> {
-    let mut excluded = Vec::new();
+) -> Vec<&'a str> {
+    let mut named = Vec::new();
     let Some(set_ids) = group.get("exceptions").and_then(Value::as_array) else {
-        return excluded;
+        return named;
     };
     for set_ref in set_ids {
         let Some(set) = set_ref.as_str().and_then(|id| objects.get(id)) else {
@@ -882,25 +1005,27 @@ fn synchronized_membership_exclusions(
             continue;
         }
         if let Some(members) = set.get("membershipExceptions").and_then(Value::as_array) {
-            for rel in members.iter().filter_map(Value::as_str) {
-                excluded.push(join_normalized(group_dir, rel));
-                excluded.push(join_normalized(project_dir, rel));
-            }
+            named.extend(members.iter().filter_map(Value::as_str));
         }
     }
-    excluded
+    named
 }
 
 /// Compilable source extensions a synchronized folder contributes to a target —
 /// the `.swift` and C-family files that would otherwise be listed in a
 /// `PBXSourcesBuildPhase`. Headers, resources, and asset catalogs are excluded
 /// (they are not compiler inputs). `.C` is the C++ convention, distinct from `.c`.
-const SYNCHRONIZED_SOURCE_EXTS: &[&str] = &["swift", "c", "m", "mm", "cc", "cpp", "cxx", "C"];
+pub(crate) const SYNCHRONIZED_SOURCE_EXTS: &[&str] =
+    &["swift", "c", "m", "mm", "cc", "cpp", "cxx", "C"];
 
 /// Append every compilable source under `dir` (recursively) to `out`, sorted for
 /// determinism, skipping files already present or excluded from the target. A
 /// missing directory yields nothing.
-fn collect_synchronized_sources(dir: &Path, excluded: &[PathBuf], out: &mut Vec<PathBuf>) {
+pub(crate) fn collect_synchronized_sources(
+    dir: &Path,
+    excluded: &[PathBuf],
+    out: &mut Vec<PathBuf>,
+) {
     let mut found = Vec::new();
     walk_source_tree(dir, &mut found);
     found.sort();
@@ -944,6 +1069,9 @@ pub fn target_linked_frameworks(
     xcodeproj_path: &Path,
     target_name: &str,
 ) -> Result<Vec<String>, Error> {
+    if let Some(value) = crate::project_xcproj::parse_if_present(xcodeproj_path)? {
+        return crate::project_xcproj::target_linked_frameworks(&value, target_name);
+    }
     let value = parse_pbxproj(xcodeproj_path)?;
     let (objects, project_obj) = project_root(&value)?;
     let target = find_target(objects, project_obj, target_name)?
@@ -994,6 +1122,9 @@ pub fn target_linked_libraries(
     xcodeproj_path: &Path,
     target_name: &str,
 ) -> Result<Vec<String>, Error> {
+    if let Some(value) = crate::project_xcproj::parse_if_present(xcodeproj_path)? {
+        return crate::project_xcproj::target_linked_libraries(&value, target_name);
+    }
     let value = parse_pbxproj(xcodeproj_path)?;
     let (objects, project_obj) = project_root(&value)?;
     let target = find_target(objects, project_obj, target_name)?
@@ -1046,6 +1177,9 @@ pub fn target_linked_libraries(
 /// modules to prepare. Same-project dependencies only; a cross-project
 /// `targetProxy` whose `target` doesn't resolve in this project is skipped.
 pub fn target_dependencies(xcodeproj_path: &Path, target_name: &str) -> Result<Vec<String>, Error> {
+    if let Some(value) = crate::project_xcproj::parse_if_present(xcodeproj_path)? {
+        return crate::project_xcproj::target_dependencies(&value, target_name);
+    }
     let value = parse_pbxproj(xcodeproj_path)?;
     let (objects, project_obj) = project_root(&value)?;
     let target = find_target(objects, project_obj, target_name)?
@@ -1072,22 +1206,50 @@ fn target_dependency_names(objects: &Dict, target_obj: &Value) -> Vec<String> {
     out
 }
 
-/// Whether a target links one or more Swift Package products (a non-empty
-/// `packageProductDependencies`). Such a target needs the package-products
-/// framework search path (`-F …/PackageFrameworks`) for its `import`s to
-/// resolve; targets without packages must not emit it.
+/// Whether a target links one or more Swift Package products. Such a target
+/// needs the package-products framework search path (`-F …/PackageFrameworks`)
+/// for its `import`s to resolve; targets without packages must not emit it.
 pub fn target_has_package_products(
     xcodeproj_path: &Path,
     target_name: &str,
 ) -> Result<bool, Error> {
+    if let Some(value) = crate::project_xcproj::parse_if_present(xcodeproj_path)? {
+        return crate::project_xcproj::target_has_package_products(&value, target_name);
+    }
     let value = parse_pbxproj(xcodeproj_path)?;
     let (objects, project_obj) = project_root(&value)?;
     let target = find_target(objects, project_obj, target_name)?
         .ok_or_else(|| Error::no_such_target(target_name))?;
-    Ok(target
+    Ok(links_package_product(objects, target))
+}
+
+/// Two spellings link a package product, and a project can carry either alone.
+/// The target's `packageProductDependencies` names the
+/// `XCSwiftPackageProductDependency` directly; a `PBXBuildFile` in the
+/// frameworks phase reaches the same object through `productRef` instead of
+/// the `fileRef` an ordinary file has. Tuist's
+/// `xcode_project_with_registry_and_alamofire` links Alamofire with only the
+/// second, and Xcode 27 converting that project records the product on the
+/// target, so the relation is one thing wearing two hats.
+fn links_package_product(objects: &Dict, target_obj: &Value) -> bool {
+    if target_obj
         .get("packageProductDependencies")
         .and_then(Value::as_array)
-        .is_some_and(|deps| !deps.is_empty()))
+        .is_some_and(|deps| !deps.is_empty())
+    {
+        return true;
+    }
+    let Some(phase_ids) = target_obj.get("buildPhases").and_then(Value::as_array) else {
+        return false;
+    };
+    phase_ids
+        .iter()
+        .filter_map(|id| id.as_str().and_then(|id| objects.get(id)))
+        .filter(|phase| phase.get("isa").and_then(Value::as_str) == Some("PBXFrameworksBuildPhase"))
+        .filter_map(|phase| phase.get("files").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|id| id.as_str().and_then(|id| objects.get(id)))
+        .any(|build_file| build_file.get("productRef").is_some())
 }
 
 /// `target`'s transitive dependencies in build order — a dependency precedes
@@ -1098,6 +1260,12 @@ pub fn transitive_dependencies(
     xcodeproj_path: &Path,
     target_name: &str,
 ) -> Result<Vec<String>, Error> {
+    if let Some(value) = crate::project_xcproj::parse_if_present(xcodeproj_path)? {
+        return Ok(crate::project_xcproj::transitive_dependencies(
+            &value,
+            target_name,
+        ));
+    }
     let value = parse_pbxproj(xcodeproj_path)?;
     let (objects, project_obj) = project_root(&value)?;
     let mut order = Vec::new();
@@ -1136,6 +1304,14 @@ pub fn is_self_buildable(xcodeproj_path: &Path, target_name: &str) -> Result<boo
     if target_has_package_products(xcodeproj_path, target_name)? {
         return Ok(false);
     }
+    if let Some(value) = crate::project_xcproj::parse_if_present(xcodeproj_path)? {
+        if crate::project_xcproj::has_script_or_rule_phase(&value, target_name) {
+            return Ok(false);
+        }
+        let sources =
+            crate::project_xcproj::target_source_files(&value, xcodeproj_path, target_name)?;
+        return Ok(all_swift(&sources));
+    }
     let value = parse_pbxproj(xcodeproj_path)?;
     let (objects, project_obj) = project_root(&value)?;
     let target = find_target(objects, project_obj, target_name)?
@@ -1144,8 +1320,13 @@ pub fn is_self_buildable(xcodeproj_path: &Path, target_name: &str) -> Result<boo
         return Ok(false);
     }
     let sources = target_source_files_from_value(&value, xcodeproj_path, target_name)?;
-    let is_swift = |p: &Path| p.extension().and_then(OsStr::to_str) == Some("swift");
-    Ok(sources.iter().any(|p| is_swift(p)) && sources.iter().all(|p| is_swift(p)))
+    Ok(all_swift(&sources))
+}
+
+/// A non-empty source list with nothing but `.swift` in it.
+fn all_swift(sources: &[PathBuf]) -> bool {
+    let is_swift = |p: &PathBuf| p.extension().and_then(OsStr::to_str) == Some("swift");
+    !sources.is_empty() && sources.iter().all(is_swift)
 }
 
 /// Whether a target has a `PBXShellScriptBuildPhase` or any build rule — either
@@ -1172,7 +1353,7 @@ fn target_has_script_or_rule_phase(objects: &Dict, target_obj: &Value) -> bool {
 /// The absolute directory containing the `.xcodeproj` — the anchor for
 /// `<group>` / `SOURCE_ROOT` source trees. Canonicalized when it exists (so the
 /// paths match xcodebuild's absolute output), falling back to the input.
-fn abs_project_dir(xcodeproj_path: &Path) -> PathBuf {
+pub(crate) fn abs_project_dir(xcodeproj_path: &Path) -> PathBuf {
     let abs = fs::canonicalize(xcodeproj_path).unwrap_or_else(|_| xcodeproj_path.to_path_buf());
     abs.parent().map_or_else(PathBuf::new, Path::to_path_buf)
 }
@@ -1181,87 +1362,111 @@ fn abs_project_dir(xcodeproj_path: &Path) -> PathBuf {
 /// are tens of levels at most — and since groups are objects referenced by
 /// id, their depth is NOT bounded by the pbxproj parser's nesting cap, so a
 /// corrupt chain of groups could otherwise overflow the stack.
-const MAX_GROUP_DEPTH: usize = 256;
+pub(crate) const MAX_GROUP_DEPTH: usize = 256;
 
-/// DFS the group tree, recording `file_id → absolute path` for every leaf. A
-/// group node contributes its own directory to its children; a leaf records its
-/// full path. `PBXVariantGroup` / `XCVersionGroup` (localized resources, Core
-/// Data model versions) are walked like groups so their members resolve.
+/// Every node the navigator reaches from the mainGroup, parents before
+/// children in navigator order, each with the absolute path its `sourceTree`
+/// and `path` resolve to. A group contributes its own directory to its
+/// children. `PBXVariantGroup` / `XCVersionGroup` (localized resources, Core
+/// Data model versions) are walked like groups so their members resolve. A
+/// node listed in two groups appears once, under the listing Xcode keeps
+/// ([`Parents`]), so the files a build reads and the directories a listing
+/// shows agree.
 ///
 /// `visited` breaks reference cycles (`G1 → G2 → G1`) and bounds the walk to
-/// one visit per group even when a corrupt file shares subtrees (a crafted
+/// one visit per node even when a corrupt file shares subtrees (a crafted
 /// `children = (G, G)` at every level would otherwise re-walk shared nodes
 /// 2^depth times); `depth` bounds the stack on a non-cyclic chain.
-// The two walk-state params push this over clippy's arity limit; a state
-// struct for an internal DFS helper would be heavier than the flag list.
-#[allow(clippy::too_many_arguments)]
-fn resolve_group_paths<'a>(
+fn navigator_nodes<'a>(
     objects: &'a Dict,
-    node_id: &'a str,
-    parent_base: &Path,
+    main_group: &'a str,
     project_dir: &Path,
-    out: &mut BTreeMap<String, PathBuf>,
-    sync_out: &mut BTreeMap<String, PathBuf>,
-    visited: &mut BTreeSet<&'a str>,
-    depth: usize,
-) {
-    let Some(node) = objects.get(node_id) else {
-        return;
-    };
-    let base = node_base(node, parent_base, project_dir);
-    let isa = node.get("isa").and_then(Value::as_str).unwrap_or("");
-    match isa {
-        "PBXGroup" | "PBXVariantGroup" | "XCVersionGroup" => {
-            if depth >= MAX_GROUP_DEPTH || !visited.insert(node_id) {
-                return;
-            }
-            if let Some(children) = node.get("children").and_then(Value::as_array) {
-                for child in children {
-                    if let Some(cid) = child.as_str() {
-                        resolve_group_paths(
-                            objects,
-                            cid,
-                            &base,
-                            project_dir,
-                            out,
-                            sync_out,
-                            visited,
-                            depth + 1,
-                        );
-                    }
-                }
-            }
+) -> Vec<(&'a str, &'a Value, PathBuf)> {
+    // The walk-state params push this over clippy's arity limit; a state
+    // struct for an internal DFS helper would be heavier than the flag list.
+    #[allow(clippy::too_many_arguments)]
+    fn walk<'a>(
+        objects: &'a Dict,
+        parents: &Parents<'a>,
+        group: &'a str,
+        base: &Path,
+        project_dir: &Path,
+        out: &mut Vec<(&'a str, &'a Value, PathBuf)>,
+        visited: &mut BTreeSet<&'a str>,
+        depth: usize,
+    ) {
+        if depth >= MAX_GROUP_DEPTH {
+            return;
         }
-        // A folder reference (Xcode 16+): its members aren't listed in the
-        // pbxproj — they are every file physically under `base`. Record the
-        // directory keyed by id; a target that lists it in
-        // `fileSystemSynchronizedGroups` resolves its sources by walking it.
-        "PBXFileSystemSynchronizedRootGroup" => {
-            sync_out.insert(node_id.to_string(), base);
-        }
-        _ => {
-            out.insert(node_id.to_string(), base);
+        let children = objects
+            .get(group)
+            .and_then(|g| g.get("children"))
+            .and_then(Value::as_array)
+            .unwrap_or_default();
+        for child in children.iter().filter_map(Value::as_str) {
+            if parents.get(child) != Some(group) || !visited.insert(child) {
+                continue;
+            }
+            let Some(node) = objects.get(child) else {
+                continue;
+            };
+            let child_base = node_dir(node, || base.to_path_buf(), project_dir);
+            if is_group(node) {
+                out.push((child, node, child_base.clone()));
+                walk(
+                    objects,
+                    parents,
+                    child,
+                    &child_base,
+                    project_dir,
+                    out,
+                    visited,
+                    depth + 1,
+                );
+            } else {
+                out.push((child, node, child_base));
+            }
         }
     }
+
+    let Some(root) = objects.get(main_group) else {
+        return Vec::new();
+    };
+    let base = node_dir(root, || project_dir.to_path_buf(), project_dir);
+    let mut out = vec![(main_group, root, base.clone())];
+    walk(
+        objects,
+        &Parents::of(objects),
+        main_group,
+        &base,
+        project_dir,
+        &mut out,
+        &mut BTreeSet::from([main_group]),
+        0,
+    );
+    out
 }
 
-/// The absolute path of one group/file node, from its `sourceTree` + `path` and
-/// the accumulated parent-group directory. `<group>` is parent-relative,
-/// `SOURCE_ROOT` is project-relative, `<absolute>` is literal; build-variable
-/// source trees (`BUILT_PRODUCTS_DIR`, …) anchor at the parent as a best effort
-/// (they rarely hold compiled sources).
-fn node_base(node: &Value, parent_base: &Path, project_dir: &Path) -> PathBuf {
+/// Where a pbxproj node's stored `path` points, from its `sourceTree`, for a
+/// build and a listing alike. `<group>` resolves below the directory of the
+/// group holding it, `<absolute>` stands on its own, and every other tree
+/// ignores the group chain and resolves below the project directory:
+/// `SOURCE_ROOT` is that directory, and a build-time tree
+/// (`BUILT_PRODUCTS_DIR`, `SDKROOT`, …) has no place in the source tree to
+/// stand for. Each takes the join a `project.xcproj` node takes too
+/// ([`join_normalized`]). `group_dir` is asked for only by a `<group>` path.
+fn node_dir(node: &Value, group_dir: impl FnOnce() -> PathBuf, project_dir: &Path) -> PathBuf {
     let path = node.get("path").and_then(Value::as_str).unwrap_or("");
-    let source_tree = node
+    let base = match node
         .get("sourceTree")
         .and_then(Value::as_str)
-        .unwrap_or("<group>");
-    match source_tree {
-        "<absolute>" => PathBuf::from(path),
-        "SOURCE_ROOT" => join_normalized(project_dir, path),
-        _ if path.is_empty() => parent_base.to_path_buf(),
-        _ => join_normalized(parent_base, path),
-    }
+        .unwrap_or("<group>")
+    {
+        "<absolute>" => PathBuf::new(),
+        "<group>" => group_dir(),
+        _ => project_dir.to_path_buf(),
+    };
+    join_normalized(&base, path)
 }
 
 /// Make `path` absolute WITHOUT resolving symlinks: a relative path anchors
@@ -1325,15 +1530,62 @@ pub fn standardize(path: &Path) -> PathBuf {
     }
 }
 
+/// Xcode's spelling of a `-derivedDataPath`, which depends on whether the
+/// directory exists. One that does takes [`standardize`]'s spelling, symlinks
+/// resolved. One that doesn't keeps its symlinks, has `.` and `..` collapsed,
+/// and loses only a leading `/private` ([`without_private_root`]). On Xcode 27,
+/// `xcodebuild -showBuildSettings -derivedDataPath /private/tmp/x/link/dd`
+/// reported `BUILD_DIR = /tmp/x/link/dd/Build/Products` the first time, and
+/// `/tmp/x/real/dd/Build/Products` once that run had created the directory.
+#[must_use]
+pub fn derived_data_spelling(path: &Path) -> PathBuf {
+    if fs::canonicalize(path).is_ok() {
+        standardize(path)
+    } else {
+        without_private_root(&absolutize(path))
+    }
+}
+
+/// A leading `/private` dropped from `path` when the directory after it is one
+/// of the root symlinks into `/private` (`/tmp`, `/var`, `/etc`), and nothing
+/// else touched. Unlike [`standardize`], a symlink further down stays, and the
+/// path need not exist.
+#[must_use]
+pub fn without_private_root(path: &Path) -> PathBuf {
+    let Ok(rest) = path.strip_prefix("/private") else {
+        return path.to_path_buf();
+    };
+    let Some(Component::Normal(root)) = rest.components().next() else {
+        return path.to_path_buf();
+    };
+    let private_root = Path::new("/private").join(root);
+    if fs::canonicalize(Path::new("/").join(root)).is_ok_and(|c| c == private_root) {
+        Path::new("/").join(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Join `rel` onto `base`, collapsing `.` / `..` lexically (without touching the
 /// filesystem) so a group path like `../Shared` resolves cleanly.
-fn join_normalized(base: &Path, rel: &str) -> PathBuf {
+///
+/// This is how both project formats place a node's stored path below its
+/// group's directory, for a build and for a listing alike. An empty `rel`
+/// leaves `base` as it is, with no trailing `/`. A relative `base` keeps a
+/// `..` that climbs past its start (`""` and `../Shared` give `../Shared`), so
+/// a listing relative to the project directory still names a directory above
+/// it.
+pub(crate) fn join_normalized(base: &Path, rel: &str) -> PathBuf {
     let mut p = base.to_path_buf();
     for comp in Path::new(rel).components() {
         match comp {
-            Component::ParentDir => {
-                p.pop();
-            }
+            Component::ParentDir => match p.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    p.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => p.push(".."),
+            },
             Component::CurDir => {}
             Component::Normal(s) => p.push(s),
             Component::RootDir | Component::Prefix(_) => p = PathBuf::from(comp.as_os_str()),
@@ -1523,8 +1775,8 @@ pub fn built_in_settings(
     derived_data_path: Option<&Path>,
     // The container the build was opened with (a `-workspace` invocation's
     // `.xcworkspace`), when it isn't this project itself. DerivedData hashes
-    // this path for every member project; `None` infers the container from
-    // the project's own location (see [`find_derived_data_container`]).
+    // this path for every member project; `None` hashes the project itself,
+    // as `xcodebuild -project` does even when a workspace beside it lists it.
     derived_data_container: Option<&Path>,
     // Consult the host's Xcode configuration — the app-wide Derived Data
     // preference and the container's per-user workspace settings — when
@@ -1544,11 +1796,15 @@ pub fn built_in_settings(
     // `ResolveQuery::scheme_sanitizers`).
     scheme_sanitizers: crate::scheme::SanitizerEnables,
 ) -> Vec<Assignment> {
-    // Resolve to an absolute path so PROJECT_DIR / SRCROOT / BUILD_DIR match
-    // xcodebuild's behaviour (it always emits absolute paths). Fall back to
-    // the input if canonicalization fails — e.g. when the path doesn't exist.
-    let abs_path =
-        fs::canonicalize(xcodeproj_path).unwrap_or_else(|_| xcodeproj_path.to_path_buf());
+    // PROJECT_DIR / SRCROOT and every setting built on them take the project
+    // path in xcodebuild's standardized spelling: absolute, symlinks resolved,
+    // and `/private/tmp/…` spelled `/tmp/…`. `xcodebuild -showBuildSettings`
+    // prints that one spelling whether the project is named through `/tmp`,
+    // `/private/tmp` or a symlinked checkout, as a relative `-project` from a
+    // directory reached any of those ways or as an absolute one (sweetpad-core's
+    // `project_paths_take_the_spelling_xcodebuild_prints`). It is the spelling
+    // DerivedData is hashed over too.
+    let abs_path = standardize(xcodeproj_path);
     let project_dir = abs_path
         .parent()
         .map_or_else(PathBuf::new, Path::to_path_buf);
@@ -1561,46 +1817,32 @@ pub fn built_in_settings(
     let project_file_path = abs_path.display().to_string();
     let user = host_user();
     let home = host_home();
-    // Xcode keys DerivedData by whichever container was opened (an
-    // `.xcworkspace` if one sits next to or above the project, else the
-    // `.xcodeproj` itself). The 28-char base-26 hash is MD5(container_path).
+    // Xcode keys DerivedData by whichever container was opened: the
+    // declared `.xcworkspace`, else the `.xcodeproj` itself. `xcodebuild
+    // -project` hashes the project even when a workspace beside it lists it
+    // (Xcode 27, `info.plist` `WorkspacePath`). The 28-char base-26 hash is
+    // MD5(container_path).
     // We mirror that here so `BUILD_DIR` and friends match the layout the
     // oracle captures use.
     //
     // The hash input is the container path *standardized* the way Foundation
     // does it — symlinks resolved, a leading `/private` dropped for the
     // symlinked roots — because that is the spelling xcodebuild hashes. See
-    // [`standardize`] for the `-showBuildSettings` evidence. The container
-    // *search* still runs on the spelling it was given, so a workspace found
-    // beside the project is found the same way either way.
+    // [`standardize`] for the `-showBuildSettings` evidence.
     //
     // `xcodebuild -derivedDataPath PATH` flattens this — it replaces the
     // whole `<home>/.../DerivedData/<container-hash>` segment with `PATH`,
     // so `BUILD_DIR = PATH/Build/Products` directly.
-    let derived_container = derived_data_container.map_or_else(
-        || find_derived_data_container(&absolutize(xcodeproj_path)),
-        |c| normalize_stub_workspace(&absolutize(c)),
-    );
-    let derived_name = derived_container
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .unwrap_or("")
-        .to_string();
-    let derived_hash = derived_data_hash(&standardize(&derived_container).display().to_string());
+    let derived_key =
+        crate::derived_data::ContainerKey::of(derived_data_container.unwrap_or(xcodeproj_path));
     // The stock "Unique" build location (`<Name>-<hash>`) is only one of the
     // layouts a user can end up with: Xcode's Locations pref and a container's
     // per-user workspace settings both move build output, and `xcodebuild`
     // honours them. [`crate::derived_data`] models the lot — it reads host
     // state only when `read_xcode_locations` is set, so with the flag off this
     // stays the pure function the oracle suites resolve against.
-    let locations = crate::derived_data::resolve(
-        &derived_container,
-        &derived_name,
-        &derived_hash,
-        &home,
-        derived_data_path,
-        read_xcode_locations,
-    );
+    let locations =
+        crate::derived_data::resolve(&derived_key, &home, derived_data_path, read_xcode_locations);
     let build_dir = locations.products.display().to_string();
     let obj_root = locations.intermediates.display().to_string();
     // Prefer the catalog's recorded DEVELOPER_DIR (the Xcode the capture was
@@ -1625,6 +1867,10 @@ pub fn built_in_settings(
     // ordering, the no-destination full-ARCHS view). An unknown version
     // (no catalog, no Xcode) is treated as modern.
     let legacy_xcode15 = matches!(xcode_major(&xcode_short), Some(major) if major < 16);
+    // Xcode 27 adds settings and arch-list entries no earlier major reports.
+    // An unknown version (no catalog, no Xcode) is treated as pre-27, so a
+    // catalog-less resolve keeps the shape every captured major agrees on.
+    let xcode27plus = matches!(xcode_major(&xcode_short), Some(major) if major >= 27);
     // Whether this (target, config) resolves an unoptimized build —
     // `GCC_OPTIMIZATION_LEVEL = 0`. xcodebuild keys its "debug build" output
     // flips (STRIP_INSTALLED_PRODUCT, GCC_SYMBOLS_PRIVATE_EXTERN,
@@ -1664,6 +1910,42 @@ pub fn built_in_settings(
     //     captured oracles keep it only when WATCHOS_DEPLOYMENT_TARGET < 9
     //     (3.0/6.0 include it, 10.0/26.0 drop it). The fixtures bracket the
     //     cutoff at (6, 10]; we pin it to Apple's documented watchOS 9 drop.
+    // Each platform carries one legacy secondary slice that Xcode 27 drops
+    // once the deployment target reaches a release with no hardware needing
+    // it: x86_64 on macOS (the end of the Intel transition) and arm64_32 on
+    // watchOS (32-bit-pointer watches). 26.5 reported both at every captured
+    // deployment target, including 26.5 and 26.0 themselves, so the drop is
+    // Xcode-27-gated rather than SDK-gated. The fixtures bracket the cutoff at
+    // (15, 27] for macOS and (10, 27] for watchOS; both pin to 26. It applies
+    // to ARCHS / ARCHS_STANDARD / ARCHS_BASE but NOT to ARCHS_STANDARD_64_BIT,
+    // which keeps reporting the full pair — hence `archs_64` below reads the
+    // unfiltered list.
+    let legacy_secondary_arch = match sdk_base.as_str() {
+        "macosx" => Some(("x86_64", "MACOSX_DEPLOYMENT_TARGET")),
+        "watchos" => Some(("arm64_32", "WATCHOS_DEPLOYMENT_TARGET")),
+        _ => None,
+    };
+    let archs_before_27_drop = archs;
+    let archs: Vec<&'static str> = match legacy_secondary_arch {
+        Some((slice, target_key)) if xcode27plus => {
+            // The slice stays for a deployment target below 27: measured on
+            // Xcode 27.0 and 27.2, macOS 26.4 keeps `x86_64` and watchOS 26.4
+            // keeps `arm64_32`, and both go at 27.0. An unauthored deployment
+            // target takes the SDK's own default, which on 27 is past the
+            // cutoff: tuist's fixtures author none and drop the slice.
+            let keeps = authored
+                .get(target_key)
+                .and_then(|v| v.split('.').next())
+                .and_then(|major| major.trim().parse::<u32>().ok())
+                .is_some_and(|major| major < 27);
+            if keeps {
+                archs.to_vec()
+            } else {
+                archs.iter().copied().filter(|a| *a != slice).collect()
+            }
+        }
+        _ => archs.to_vec(),
+    };
     let archs: Vec<&'static str> = if destination.is_none()
         && sdk_base == "watchos"
         && watchos_keeps_armv7k(
@@ -1673,9 +1955,13 @@ pub fn built_in_settings(
         ) {
         vec!["arm64", "armv7k", "arm64_32"]
     } else {
-        archs.to_vec()
+        archs.clone()
     };
-    let archs_64: Vec<&str> = archs.iter().copied().filter(|a| is_64bit(a)).collect();
+    let archs_64: Vec<&str> = archs_before_27_drop
+        .iter()
+        .copied()
+        .filter(|a| is_64bit(a))
+        .collect();
     let arch_list = archs.join(" ");
     let native_32: String = match host.as_str() {
         "arm64" | "arm64e" => "arm".into(),
@@ -1730,19 +2016,20 @@ pub fn built_in_settings(
     // `SYMROOT = $(SRCROOT)/../build/products` in an xcconfig) carries
     // `BUILD_DIR` — and the whole `CONFIGURATION_BUILD_DIR` / `BUILT_PRODUCTS_DIR`
     // / `TARGET_BUILD_DIR` chain below it — to the same place, matching
-    // xcodebuild. `OBJROOT` / `TEMP_ROOT` are independent: xcodebuild keeps the
-    // intermediates under DerivedData even when the products move.
+    // xcodebuild. `OBJROOT` is independent: xcodebuild keeps the intermediates
+    // under DerivedData even when the products move, and `TEMP_ROOT` follows
+    // `OBJROOT` (CoreBuildSystem.xcspec's default) when it moves.
     push("SYMROOT", build_dir);
     push("BUILD_DIR", "$(SYMROOT)".into());
     push("BUILD_ROOT", "$(SYMROOT)".into());
-    push("OBJROOT", obj_root.clone());
-    push("TEMP_ROOT", obj_root);
+    push("OBJROOT", obj_root);
+    push("TEMP_ROOT", "$(OBJROOT)".into());
     // `DSTROOT` is keyed on the *project*, not the target —
     // CoreBuildSystem.xcspec defines it as `/tmp/$(PROJECT_NAME).dst` and the
     // captures confirm it (target `Alamofire iOS` reports `/tmp/Alamofire.dst`).
-    // `INSTALL_ROOT` defaults to `$(DSTROOT)`.
+    // `INSTALL_ROOT` defaults to `$(DSTROOT)`, and follows one set elsewhere.
     push("DSTROOT", format!("/tmp/{project_name}.dst"));
-    push("INSTALL_ROOT", format!("/tmp/{project_name}.dst"));
+    push("INSTALL_ROOT", "$(DSTROOT)".into());
     // DerivedData root (parent of every container/hash dir). Referenced by
     // xcspec defaults like `MODULE_CACHE_DIR = $(DERIVED_DATA_DIR)/ModuleCache.noindex`.
     // When `-derivedDataPath` is overridden, the override IS the
@@ -1788,13 +2075,16 @@ pub fn built_in_settings(
     push("BUILT_PRODUCTS_DIR", "$(CONFIGURATION_BUILD_DIR)".into());
     // Including `$(TARGET_BUILD_SUBPATH)` here is what wires up parent-app
     // embedding. `TARGET_BUILD_SUBPATH` defaults to empty (so this expands
-    // to `$(BUILT_PRODUCTS_DIR)` for normal targets), but xcodebuild — and
+    // to `$(CONFIGURATION_BUILD_DIR)` for normal targets), but xcodebuild — and
     // [`crate::build_context::BuildContext`] — set it to e.g.
     // `/App.app/PlugIns` for a unit-test bundle whose host is `App`, which
-    // nests the test bundle inside the host app's `PlugIns` directory.
+    // nests the test bundle inside the host app's `PlugIns` directory. It
+    // hangs off `CONFIGURATION_BUILD_DIR`, as CoreBuildSystem.xcspec has it,
+    // not `BUILT_PRODUCTS_DIR`: Xcode 27 leaves the product where it was when
+    // only `BUILT_PRODUCTS_DIR` is set.
     push(
         "TARGET_BUILD_DIR",
-        "$(BUILT_PRODUCTS_DIR)$(TARGET_BUILD_SUBPATH)".into(),
+        "$(CONFIGURATION_BUILD_DIR)$(TARGET_BUILD_SUBPATH)".into(),
     );
     push(
         "PROJECT_TEMP_DIR",
@@ -2129,6 +2419,17 @@ pub fn built_in_settings(
         .unwrap_or(host.as_str());
     let archs_value = if pinned_to_device && only_active_arch_yes {
         active_arch.to_string()
+    } else if xcode27plus && sdk_base == "watchos" {
+        // Xcode 27 retires armv7k from the resolved ARCHS at every watchOS
+        // deployment target, including the 3.0/6.0 targets that still carried
+        // it on 26.5 — but ARCHS_STANDARD keeps reporting it, the same split
+        // Xcode 15.4 has below.
+        archs
+            .iter()
+            .copied()
+            .filter(|a| *a != "armv7k")
+            .collect::<Vec<_>>()
+            .join(" ")
     } else if legacy_xcode15 {
         // Xcode 15.4's build view drops the retired 32-bit `armv7k` from
         // ARCHS even when ARCHS_STANDARD still reports it (Kingfisher's
@@ -2169,7 +2470,12 @@ pub fn built_in_settings(
         "ARCHS_STANDARD_32_BIT",
         archs_standard_32_bit_for(&sdk_base).into(),
     );
-    push("ARCHS_STANDARD_INCLUDING_64_BIT", arch_list);
+    // Like ARCHS_STANDARD_64_BIT, this one keeps the full pair through the
+    // 27 drop — only the plain ARCHS/ARCHS_STANDARD/ARCHS_BASE trio narrows.
+    push(
+        "ARCHS_STANDARD_INCLUDING_64_BIT",
+        archs_before_27_drop.join(" "),
+    );
     push(
         "ARCHS_STANDARD_32_64_BIT",
         archs_standard_32_64_bit_for(&sdk_base).into(),
@@ -2183,6 +2489,13 @@ pub fn built_in_settings(
         (true, "macosx") => "x86_64 x86_64h arm64 arm64e",
         (true, "iphoneos" | "appletvos") => "arm64e arm64",
         (true, "watchos") => "arm64 arm64e arm64_32",
+        // Xcode 27's SDKSettings adds the `arm64e.x1` slice to macOS, iOS and
+        // watchOS (`SupportedTargets.<platform>.Archs`), and VALID_ARCHS
+        // carries it in sorted position. tvOS and visionOS do not advertise it
+        // and their lists are unchanged.
+        (false, "macosx") if xcode27plus => "arm64 arm64e arm64e.x1 i386 x86_64",
+        (false, "iphoneos") if xcode27plus => "arm64 arm64e arm64e.x1 armv7 armv7s",
+        (false, "watchos") if xcode27plus => "arm64 arm64_32 arm64e arm64e.x1 armv7k",
         _ => valid_archs_for(&sdk_base),
     };
     push("VALID_ARCHS", valid_archs.into());
@@ -2191,6 +2504,21 @@ pub fn built_in_settings(
         if is_catalyst { "YES" } else { "NO" }.into(),
     );
     push("INLINE_PRIVATE_FRAMEWORKS", "NO".into());
+    if xcode27plus {
+        // New in 27's CoreBuildSystem.xcspec with a bare `DefaultValue = YES`
+        // and no Condition, yet every one of the 154 per-target captures
+        // reports NO, and nothing in the spec tree or any SDKSettings.plist
+        // says otherwise — the build system overrides its own declared
+        // default, so the xcspec value cannot be taken at face value here.
+        push("SWIFTC_PASS_SYSROOT", "NO".into());
+        // Also new in 27, and it tracks ENABLE_TESTABILITY exactly: across the
+        // corpus, YES against YES on all 78 captures, and where
+        // ENABLE_TESTABILITY is NO the key is absent rather than NO — hence
+        // emitting nothing instead of pushing NO.
+        if authored.get("ENABLE_TESTABILITY").map(String::as_str) == Some("YES") {
+            push("SWIFT_ENABLE_TESTABILITY", "YES".into());
+        }
+    }
     // STRIP_INSTALLED_PRODUCT: the xcspec default is YES; on Xcode 16+
     // xcodebuild flips it to NO for *unoptimized* builds (keyed on the
     // resolved `GCC_OPTIMIZATION_LEVEL = 0`, not the configuration name —
@@ -2237,9 +2565,12 @@ pub fn built_in_settings(
     // (see `macos_destination_unbound`). Xcode 15.x reported NO in every
     // capture (Catalyst and native alike), so the flip is version-gated
     // to 16+.
+    // A macOS target built for another platform's destination (a macOS app
+    // in a scheme run on an iPhone simulator) flips it too, on Xcode 27.
     let active_resources = if !legacy_xcode15
         && (sdk_base.ends_with("simulator")
-            || (sdk_base != "macosx" && destination.is_some() && !macos_destination_unbound))
+            || (sdk_base != "macosx" && destination.is_some() && !macos_destination_unbound)
+            || (sdk_base == "macosx" && destination.is_some_and(|d| !d.is_macos())))
     {
         "YES"
     } else {
@@ -2488,6 +2819,20 @@ pub fn built_in_settings(
         );
     }
 
+    // Xcode 27 reports the platform's bundled library dir to the Swift
+    // importer as well, on test bundles only and by the same recipe — the
+    // resolved value carries the identical double leading space. 26.5 and
+    // older never emitted the key. Every 27 capture that has it is a
+    // unit-test or ui-testing bundle (44 of them across macOS, iOS, tvOS,
+    // watchOS and visionOS); no Catalyst test bundle is captured, so this
+    // mirrors the sibling's guard rather than claiming evidence for it.
+    if xcode27plus && !is_catalyst && is_test_bundle_product_type(product_type) {
+        push(
+            "SWIFT_SYSTEM_INCLUDE_PATHS",
+            "$(inherited) $(TEST_LIBRARY_SEARCH_PATHS)".into(),
+        );
+    }
+
     // (`KASAN_DEFAULT_CFLAGS` needs no special-casing here: `SDKSettings.plist`
     // defines it with `[arch=arm64]`/`[arch=arm64e]` overrides picking the
     // HW-tagged TBI variant, and the showBuildSettings resolve binds
@@ -2506,8 +2851,7 @@ pub fn built_in_settings(
     // version segment from the catalog's recorded Xcode when one is attached
     // (so a capture resolves against ITS Xcode, not the host's) and fall
     // back to the active install otherwise. The cache dir is host state —
-    // read from `$DARWIN_USER_CACHE_DIR`, `$TMPDIR/../C/`, or the pinned
-    // [`HostOverride::darwin_user_cache`].
+    // `confstr`'s answer, or the pinned [`HostOverride::darwin_user_cache`].
     let darwin_cache = darwin_user_cache_dir();
     let xcode_build = match (xcode_version, xcode_build_version) {
         (Some(version), Some(build)) => {
@@ -2542,24 +2886,10 @@ pub fn built_in_settings(
         );
     }
 
-    // --- Synthesized search paths ------------------------------------------
-    // Xcode 16+ appends BUILT_PRODUCTS_DIR-relative entries with a trailing
-    // space, which is what gets surfaced in `-showBuildSettings`. Xcode 15.x
-    // never synthesized these — its captures report the keys only when the
-    // user authored a value (or, for LIBRARY_SEARCH_PATHS on a test bundle,
-    // via the test recipe below).
-    if !legacy_xcode15 {
-        push(
-            "HEADER_SEARCH_PATHS",
-            "$(BUILT_PRODUCTS_DIR)/include ".into(),
-        );
-        push("LIBRARY_SEARCH_PATHS", "$(BUILT_PRODUCTS_DIR) ".into());
-        push("REZ_SEARCH_PATHS", "$(BUILT_PRODUCTS_DIR) ".into());
-        push("FRAMEWORK_SEARCH_PATHS", "$(BUILT_PRODUCTS_DIR) ".into());
-    }
-    // (XCTest bundles additionally gain `$(inherited)
-    // $(TEST_LIBRARY_SEARCH_PATHS)` — but ABOVE the user layers, so it lives
-    // in [`built_in_overrides`].)
+    // (The products-dir search paths Xcode 16+ puts in front of
+    // HEADER/LIBRARY/REZ/FRAMEWORK_SEARCH_PATHS, and the XCTest bundles'
+    // `$(inherited) $(TEST_LIBRARY_SEARCH_PATHS)`, sit ABOVE the user layers,
+    // so they live in [`built_in_overrides`].)
     // `TEST_FRAMEWORK_SEARCH_PATHS` points at the platform-bundled XCTest
     // frameworks. macOS gets only the platform-level path; every other
     // platform (device OR simulator) also gets the SDK-internal
@@ -2753,6 +3083,27 @@ pub fn built_in_overrides(
             condition: None,
         });
     };
+    // Xcode 16+ puts the products dir in front of these search paths above
+    // every user layer, so a value authored without `$(inherited)` keeps it:
+    // on Xcode 27, an `-xcconfig` setting `FRAMEWORK_SEARCH_PATHS =
+    // $(SRCROOT)/Vendor` resolves to `<BUILT_PRODUCTS_DIR> <SRCROOT>/Vendor`.
+    // With nothing authored the value is the products dir and a trailing
+    // space, which is what `-showBuildSettings` surfaces. Xcode 15.x never
+    // added these: its captures report the keys only when the user authored
+    // a value (or, for LIBRARY_SEARCH_PATHS on a test bundle, via the test
+    // recipe below).
+    if !legacy_xcode15 {
+        push(
+            "HEADER_SEARCH_PATHS",
+            "$(BUILT_PRODUCTS_DIR)/include $(inherited)",
+        );
+        push("LIBRARY_SEARCH_PATHS", "$(BUILT_PRODUCTS_DIR) $(inherited)");
+        push("REZ_SEARCH_PATHS", "$(BUILT_PRODUCTS_DIR) $(inherited)");
+        push(
+            "FRAMEWORK_SEARCH_PATHS",
+            "$(BUILT_PRODUCTS_DIR) $(inherited)",
+        );
+    }
     // Xcode 15.x reported `ENABLE_PREVIEWS = YES` for previews-capable
     // products in optimized (Release) builds too; the unoptimized-only flip
     // arrived with Xcode 16.
@@ -2852,7 +3203,15 @@ pub fn built_in_overrides(
         // device view there too — full standard ARCHS, no active-arch
         // collapse — overriding even an authored `ONLY_ACTIVE_ARCH = YES`
         // (NetNewsWire's iOS xcconfigs captured against the macOS scheme).
-        if target_is_watch != dest_is_watch || foreign_sim_extension || macos_destination_unbound {
+        // A macOS target built for another platform's destination can't run
+        // there either: a macOS app in a scheme run on an iPhone simulator
+        // reports ARCHS `arm64 x86_64` and OAA NO in Debug on Xcode 27.
+        let foreign_mac = target_sdk == "macosx" && dest_sdk != "macosx";
+        if target_is_watch != dest_is_watch
+            || foreign_sim_extension
+            || macos_destination_unbound
+            || foreign_mac
+        {
             push("ONLY_ACTIVE_ARCH", "NO");
             push("ARCHS", "$(ARCHS_STANDARD)");
         }
@@ -3092,23 +3451,26 @@ pub fn built_in_overrides(
     if !code_signing_required {
         push("CODE_SIGN_IDENTITY", "-");
     } else if (is_test_bundle_product_type(product_type)
-        || product_type == Some("com.apple.product-type.tool"))
+        || product_type == Some("com.apple.product-type.tool")
+        || (product_type == Some("com.apple.product-type.application") && !is_catalyst))
         && canonicalize_sdk_base(sdk_base) == "macosx"
         && user_code_sign_identity.is_none_or(str::is_empty)
         && user_development_team.is_none_or(str::is_empty)
     {
-        // A macOS unit/UI-test bundle or command-line tool with no signing
-        // team and no authored identity signs ad-hoc ("Sign to Run Locally"),
-        // which xcodebuild reports as CODE_SIGN_IDENTITY="-" even though
-        // CODE_SIGNING_REQUIRED stays YES for these product types (so the
-        // branch above doesn't fire). Our per-SDK default would otherwise
-        // surface the macOS SDKSettings literal "Apple Development". Scoped
-        // to macOS test bundles and tools — the product types the corpus
-        // proves this for (the synthetic xcconfig/custom-config Scratch tools
-        // report "-" in every capture) — and gated on no-team/no-identity so
-        // a team-set target keeps its resolved value. (macOS *apps* are
-        // deliberately left to the SDK default; see
-        // `code_sign_identity_forced_dash_when_signing_not_required`.)
+        // A macOS unit/UI-test bundle, command-line tool or app with no
+        // signing team and no authored identity signs ad-hoc ("Sign to Run
+        // Locally"), which xcodebuild reports as CODE_SIGN_IDENTITY="-" even
+        // though CODE_SIGNING_REQUIRED stays YES for these product types (so
+        // the branch above doesn't fire). Our per-SDK default would otherwise
+        // surface the macOS SDKSettings literal "Apple Development". The
+        // corpus proves this for tools (the synthetic xcconfig/custom-config
+        // Scratch tools report "-" in every capture) and has no macOS app
+        // without a team or an authored identity; Xcode 27 on the CI fixture's
+        // macOS app reports "-" with no team whatever CODE_SIGNING_ALLOWED
+        // and CODE_SIGN_STYLE say, and "Apple Development" once a team is
+        // set, so the gate is the team, not whether signing is allowed. A Mac
+        // Catalyst app keeps the SDK default: nothing captured says how one
+        // without a team reads.
         push("CODE_SIGN_IDENTITY", "-");
     }
     // Mac Catalyst targets that opt into
@@ -3139,8 +3501,10 @@ fn detect_developer_dir() -> String {
         .into_owned()
 }
 
-/// Filesystem name of the platform under `<Xcode>/Contents/Developer/Platforms/`.
-fn platform_dir_name_for(sdk_base: &str) -> &'static str {
+/// Filesystem name of the platform under `<Xcode>/Contents/Developer/Platforms/`
+/// for an SDK name without its version (`iphonesimulator` is `iPhoneSimulator`).
+#[must_use]
+pub fn platform_dir_name_for(sdk_base: &str) -> &'static str {
     match sdk_base {
         "iphoneos" => "iPhoneOS",
         "iphonesimulator" => "iPhoneSimulator",
@@ -3231,96 +3595,21 @@ pub(crate) fn host_arch() -> String {
     }
 }
 
+/// The account's login name, as `xcodebuild` reports it in `USER`: from the
+/// user database, not `$USER` ([`crate::host::user`]).
 fn host_user() -> String {
-    host_override(|o| o.user.as_ref()).unwrap_or_else(|| std::env::var("USER").unwrap_or_default())
+    host_override(|o| o.user.as_ref())
+        .or_else(crate::host::user)
+        .unwrap_or_default()
 }
 
+/// The account's home, which `HOME` reports and DerivedData hangs off: from
+/// the user database or `$CFFIXED_USER_HOME`, not `$HOME`
+/// ([`crate::host::home`]).
 fn host_home() -> String {
-    host_override(|o| o.home.as_ref()).unwrap_or_else(|| std::env::var("HOME").unwrap_or_default())
-}
-
-/// Collapse the `.xcodeproj/project.xcworkspace` stub Xcode auto-generates
-/// inside every project bundle down to its containing `.xcodeproj`.
-///
-/// A caller can declare that stub as the DerivedData container — e.g. a
-/// `xcodeWorkspacePath` pointed straight at `Foo.xcodeproj/project.xcworkspace`.
-/// Xcode never keys DerivedData by the stub: opening such a project hashes the
-/// `.xcodeproj` itself, producing `Foo-<hash>`. Hashing the stub instead yields
-/// the wrong folder name (`project-<hash>`) AND the wrong hash, so the built
-/// app can't be found (issue #285). `find_derived_data_container` already skips
-/// the stub during inference; this normalizes the explicit case to match.
-#[must_use]
-fn normalize_stub_workspace(container: &Path) -> PathBuf {
-    let is_stub = container.file_name().and_then(OsStr::to_str) == Some("project.xcworkspace")
-        && container
-            .parent()
-            .and_then(Path::extension)
-            .and_then(OsStr::to_str)
-            == Some("xcodeproj");
-    if is_stub && let Some(parent) = container.parent() {
-        return parent.to_path_buf();
-    }
-    container.to_path_buf()
-}
-
-/// Return the path Xcode would hash for the DerivedData folder name: a
-/// standalone `.xcworkspace` this `.xcodeproj` is a *member* of (one sitting
-/// next to it or one directory above), else the `.xcodeproj` itself.
-///
-/// The `.xcodeproj`'s own embedded `project.xcworkspace` (Xcode's auto-
-/// generated stub) is skipped — only USER-authored workspaces count. A
-/// workspace that merely sits in a parent directory without referencing this
-/// project is **not** adopted: Xcode keys DerivedData by such a workspace only
-/// when the project actually belongs to it. (A bare `.xcodeproj` nested under
-/// an unrelated project's `.xcworkspace` must hash by itself, or the resolved
-/// build path points into the wrong DerivedData folder.)
-fn find_derived_data_container(xcodeproj: &Path) -> PathBuf {
-    let parent = xcodeproj.parent();
-    for dir in [parent, parent.and_then(Path::parent)].iter().flatten() {
-        let Ok(entries) = fs::read_dir(dir) else {
-            continue;
-        };
-        let mut workspaces: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension().and_then(OsStr::to_str) == Some("xcworkspace")
-                    // Skip the `.xcodeproj/project.xcworkspace` stub Xcode
-                    // generates inside every project bundle.
-                    && p.parent().and_then(Path::extension).and_then(OsStr::to_str)
-                        != Some("xcodeproj")
-            })
-            .collect();
-        workspaces.sort();
-        if let Some(ws) = workspaces
-            .into_iter()
-            .find(|ws| workspace_contains_project(ws, xcodeproj))
-        {
-            return ws;
-        }
-    }
-    xcodeproj.to_path_buf()
-}
-
-/// Whether `workspace` lists `xcodeproj` among its `FileRef`s. Gates
-/// DerivedData-container adoption on real membership rather than mere directory
-/// proximity; a workspace that fails to parse counts as "does not contain".
-fn workspace_contains_project(workspace: &Path, xcodeproj: &Path) -> bool {
-    crate::workspace::open(workspace).is_ok_and(|ws| {
-        ws.project_refs
-            .iter()
-            .any(|member| paths_equivalent(member, xcodeproj))
-    })
-}
-
-/// Whether two paths point at the same location: by `fs::canonicalize` when
-/// both exist (handles symlinks and `/tmp` aliasing), else by lexical
-/// [`absolutize`].
-fn paths_equivalent(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => absolutize(a) == absolutize(b),
-    }
+    host_override(|o| o.home.as_ref())
+        .or_else(|| crate::host::home().map(|home| home.to_string_lossy().into_owned()))
+        .unwrap_or_default()
 }
 
 #[must_use]
@@ -3668,7 +3957,10 @@ fn supported_platforms_for(sdk_base: &str, legacy_xcode15: bool) -> String {
 /// macOS. The destination wins when available; otherwise we infer from
 /// the SDK name's `simulator` suffix.
 fn is_not_simulator_for(sdk_base: &str, destination: Option<&RunDestination>) -> &'static str {
-    if let Some(d) = destination {
+    // A macOS target a build for another platform's destination builds for
+    // `macosx` anyway (a macOS app in a scheme run on an iPhone simulator)
+    // reads its own SDK: xcodebuild reports YES there on Xcode 27.
+    if let Some(d) = destination.filter(|d| sdk_base != "macosx" || d.is_macos()) {
         if d.is_simulator() { "NO" } else { "YES" }
     } else if sdk_base.ends_with("simulator") {
         "NO"
@@ -3677,32 +3969,19 @@ fn is_not_simulator_for(sdk_base: &str, destination: Option<&RunDestination>) ->
     }
 }
 
-/// Read `$DARWIN_USER_CACHE_DIR` (which Xcode sets from
-/// `confstr(_CS_DARWIN_USER_CACHE_DIR)`). Fall back to `$TMPDIR` with the
-/// final `T/` segment swapped for `C/`, which is how macOS lays out per-
-/// user caches. Returns a trailing-slash-terminated string so callers
-/// can concatenate sub-paths directly.
+/// The per-user cache dir `CCHROOT` / `CACHE_ROOT` hang off, as
+/// `xcodebuild` finds it: `confstr(_CS_DARWIN_USER_CACHE_DIR)`, which a
+/// custom `$TMPDIR` doesn't move ([`crate::host::darwin_user_cache_dir`]).
+/// Returns a trailing-slash-terminated string so callers can concatenate
+/// sub-paths directly.
 fn darwin_user_cache_dir() -> String {
     if let Some(pinned) = host_override(|o| o.darwin_user_cache.as_ref()) {
         return ensure_trailing_slash(&pinned);
     }
-    if let Ok(v) = std::env::var("DARWIN_USER_CACHE_DIR")
-        && !v.is_empty()
-    {
-        return ensure_trailing_slash(&v);
-    }
-    if let Ok(tmp) = std::env::var("TMPDIR")
-        && !tmp.is_empty()
-    {
-        // `$TMPDIR` is usually `/var/folders/<x>/<y>/T/`; swap the last
-        // segment to `C/` to get the cache root.
-        let trimmed = tmp.trim_end_matches('/');
-        if let Some(stripped) = trimmed.strip_suffix("/T") {
-            return format!("{stripped}/C/");
-        }
-        return ensure_trailing_slash(&tmp);
-    }
-    "/tmp/".into()
+    crate::host::darwin_user_cache_dir().map_or_else(
+        || "/tmp/".into(),
+        |dir| ensure_trailing_slash(&dir.to_string_lossy()),
+    )
 }
 
 fn ensure_trailing_slash(s: &str) -> String {
@@ -3986,7 +4265,7 @@ fn resolve_anchor_relative_path(
     xcodeproj_path: &Path,
 ) -> PathBuf {
     let project_dir = xcodeproj_path.parent().unwrap_or_else(|| Path::new("."));
-    group_dir(objects, anchor_id, project_dir, 0).join(relative_path)
+    join_normalized(&group_dir(objects, anchor_id, project_dir), relative_path)
 }
 
 fn resolve_file_ref_path(
@@ -3994,82 +4273,156 @@ fn resolve_file_ref_path(
     file_ref_id: &str,
     xcodeproj_path: &Path,
 ) -> Result<PathBuf, Error> {
-    let file_ref = objects.get(file_ref_id).ok_or_else(|| {
-        Error::BadProject(format!("PBXFileReference {file_ref_id} not in objects"))
-    })?;
-    let path = file_ref.get("path").and_then(Value::as_str).unwrap_or("");
-    let source_tree = file_ref
-        .get("sourceTree")
-        .and_then(Value::as_str)
-        .unwrap_or("<group>");
+    if !objects.contains_key(file_ref_id) {
+        return Err(Error::BadProject(format!(
+            "PBXFileReference {file_ref_id} not in objects"
+        )));
+    }
+    // `<group>` (the default) is relative to the parent group's path, which is
+    // NOT always the root group: CocoaPods nests the Pod xcconfigs under a
+    // group whose `path` is "Pods".
     let project_dir = xcodeproj_path.parent().unwrap_or_else(|| Path::new("."));
-    let resolved = match source_tree {
-        "<absolute>" => PathBuf::from(path),
-        // `<group>` (the default) is relative to the parent group's path, which
-        // is NOT always the root group — CocoaPods nests the Pod xcconfigs under
-        // a group whose `path` is "Pods". Walk the parent-group chain to anchor
-        // it; a root-group ref still resolves to the project dir.
-        "<group>" => parent_group_dir(objects, file_ref_id, project_dir, 0).join(path),
-        // `SOURCE_ROOT` is the project dir; build-time trees (BUILT_PRODUCTS_DIR,
-        // etc.) don't occur for xcconfig references — anchor at the project dir.
-        _ => project_dir.join(path),
-    };
-    Ok(resolved)
-}
-
-/// The on-disk directory a `<group>`-relative child resolves against: its parent
-/// `PBXGroup`'s directory, resolved up the group chain. The mainGroup (no parent)
-/// anchors at the project dir. Depth-guarded against a malformed cyclic graph.
-fn parent_group_dir(objects: &Dict, child_id: &str, project_dir: &Path, depth: usize) -> PathBuf {
-    if depth > 64 {
-        return project_dir.to_path_buf();
-    }
-    match parent_group_of(objects, child_id) {
-        Some(parent_id) => group_dir(objects, &parent_id, project_dir, depth + 1),
-        None => project_dir.to_path_buf(),
-    }
+    Ok(group_dir(objects, file_ref_id, project_dir))
 }
 
 /// The on-disk directory of a `PBXGroup`, resolving its `path` up the parent
 /// chain (each `<group>` ancestor contributes its `path`).
-pub(crate) fn group_dir(
-    objects: &Dict,
-    group_id: &str,
-    project_dir: &Path,
-    depth: usize,
-) -> PathBuf {
-    if depth > 64 {
-        return project_dir.to_path_buf();
-    }
-    let Some(group) = objects.get(group_id) else {
-        return project_dir.to_path_buf();
-    };
-    let path = group.get("path").and_then(Value::as_str).unwrap_or("");
-    let source_tree = group
-        .get("sourceTree")
-        .and_then(Value::as_str)
-        .unwrap_or("<group>");
-    match source_tree {
-        "<absolute>" => PathBuf::from(path),
-        "<group>" => parent_group_dir(objects, group_id, project_dir, depth + 1).join(path),
-        _ => project_dir.join(path),
-    }
+pub(crate) fn group_dir(objects: &Dict, group_id: &str, project_dir: &Path) -> PathBuf {
+    Parents::of(objects).group_dir(group_id, project_dir)
 }
 
 /// The id of the group (`PBXGroup` / variant / version) listing `child_id` in its
-/// `children`.
+/// `children`, the one Xcode keeps when two do ([`Parents`]).
 pub(crate) fn parent_group_of(objects: &Dict, child_id: &str) -> Option<String> {
-    objects.iter().find_map(|(id, v)| {
-        let isa = v.get("isa").and_then(Value::as_str)?;
-        if !matches!(isa, "PBXGroup" | "PBXVariantGroup" | "XCVersionGroup") {
+    Parents::of(objects).get(child_id).map(str::to_string)
+}
+
+/// The group each node in the navigator sits in.
+///
+/// A node listed in two groups is a malformed project. Xcode 27.2 refuses to
+/// open one. Xcode 27.0 opens it with a warning and keeps one listing: the one
+/// in the group it finishes reading last, where it reads a group's children
+/// before the group itself. So a listing in an ancestor wins over one below
+/// it, and of two places side by side the later one in the navigator wins.
+/// That listing names the node's navigator path, and it is the one Xcode
+/// resolves a `<group>` path against: a build compiles the file under it. The
+/// rule is the same for a file and for a group.
+///
+/// A node the navigator does not reach keeps the first group listing it, in
+/// object order. The mainGroup has no parent, whatever lists it.
+pub(crate) struct Parents<'a> {
+    objects: &'a Dict,
+    root: Option<&'a str>,
+    kept: std::collections::HashMap<&'a str, &'a str>,
+}
+
+impl<'a> Parents<'a> {
+    pub(crate) fn of(objects: &'a Dict) -> Self {
+        fn read<'a>(
+            objects: &'a Dict,
+            group: &'a str,
+            depth: usize,
+            seen: &mut std::collections::HashSet<&'a str>,
+            kept: &mut std::collections::HashMap<&'a str, &'a str>,
+        ) {
+            if depth >= MAX_GROUP_DEPTH || !seen.insert(group) {
+                return;
+            }
+            let children: Vec<&'a str> = objects
+                .get(group)
+                .and_then(|g| g.get("children"))
+                .and_then(Value::as_array)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            for child in &children {
+                if objects.get(child).is_some_and(is_group) {
+                    read(objects, child, depth + 1, seen, kept);
+                }
+            }
+            for child in children {
+                kept.insert(child, group);
+            }
+        }
+
+        let root = main_group_id(objects);
+        let mut kept = std::collections::HashMap::new();
+        if let Some(root) = root {
+            read(
+                objects,
+                root,
+                0,
+                &mut std::collections::HashSet::new(),
+                &mut kept,
+            );
+        }
+        Self {
+            objects,
+            root,
+            kept,
+        }
+    }
+
+    /// The group Xcode keeps listing `child`, if any group lists it.
+    pub(crate) fn get(&self, child: &str) -> Option<&'a str> {
+        if self.root == Some(child) {
             return None;
         }
-        let children = v.get("children").and_then(Value::as_array)?;
-        children
-            .iter()
-            .any(|c| c.as_str() == Some(child_id))
-            .then(|| id.clone())
-    })
+        if let Some(parent) = self.in_navigator(child) {
+            return Some(parent);
+        }
+        self.objects.iter().find_map(|(id, v)| {
+            let children = v.get("children").and_then(Value::as_array)?;
+            (is_group(v) && children.iter().any(|c| c.as_str() == Some(child)))
+                .then_some(id.as_str())
+        })
+    }
+
+    /// The kept group listing `child` when the navigator reaches it from the
+    /// mainGroup, and `None` for a node it does not reach.
+    pub(crate) fn in_navigator(&self, child: &str) -> Option<&'a str> {
+        if self.root == Some(child) {
+            return None;
+        }
+        self.kept.get(child).copied()
+    }
+
+    /// The on-disk directory of a group, or of any node, resolving its `path`
+    /// up the kept chain.
+    pub(crate) fn group_dir(&self, id: &str, project_dir: &Path) -> PathBuf {
+        self.dir_of(id, project_dir, 0)
+    }
+
+    fn dir_below(&self, child: &str, project_dir: &Path, depth: usize) -> PathBuf {
+        match self.get(child) {
+            Some(parent) if depth < MAX_GROUP_DEPTH => self.dir_of(parent, project_dir, depth + 1),
+            _ => project_dir.to_path_buf(),
+        }
+    }
+
+    fn dir_of(&self, id: &str, project_dir: &Path, depth: usize) -> PathBuf {
+        let Some(node) = self.objects.get(id) else {
+            return project_dir.to_path_buf();
+        };
+        node_dir(node, || self.dir_below(id, project_dir, depth), project_dir)
+    }
+}
+
+fn is_group(node: &Value) -> bool {
+    matches!(
+        node.get("isa").and_then(Value::as_str),
+        Some("PBXGroup" | "PBXVariantGroup" | "XCVersionGroup")
+    )
+}
+
+/// The navigator root: the group the `PBXProject` names as its `mainGroup`.
+fn main_group_id(objects: &Dict) -> Option<&str> {
+    objects
+        .iter()
+        .find(|(_, o)| o.get("isa").and_then(Value::as_str) == Some("PBXProject"))
+        .and_then(|(_, o)| o.get("mainGroup"))
+        .and_then(Value::as_str)
 }
 
 fn extract_inline_settings(config: &Value) -> Vec<Assignment> {
@@ -4089,7 +4442,7 @@ fn extract_inline_settings(config: &Value) -> Vec<Assignment> {
     out
 }
 
-fn split_conditional_key(s: &str) -> (String, Vec<Condition>) {
+pub(crate) fn split_conditional_key(s: &str) -> (String, Vec<Condition>) {
     let Some(idx) = s.find('[') else {
         return (s.to_string(), Vec::new());
     };
@@ -4131,20 +4484,14 @@ fn value_to_string(v: &Value) -> String {
 /// (BSP `prepare`). Prefers a scheme file named exactly `target` (Xcode and
 /// Tuist create a per-target scheme), shared or per-user; otherwise the first
 /// scheme file (shared directory first, then the current user's) whose build
-/// action references it. When the container holds no scheme file at all and
-/// scheme autocreation is enabled, the target's own name qualifies —
+/// action references it. Failing both, the target's own name qualifies when
+/// the project lists it as an autocreated scheme ([`listed_schemes`]) —
 /// `xcodebuild` accepts autocreated scheme names. `None` otherwise —
 /// `xcodebuild` needs a scheme (a bare `-target` build doesn't populate the
 /// products dir our search paths use).
 #[must_use]
 pub fn scheme_for_target(xcodeproj_path: &Path, target: &str) -> Option<String> {
     let names = crate::scheme::container_schemes(xcodeproj_path);
-    if names.is_empty() {
-        // No scheme file anywhere (shared or per-user): xcodebuild resolves
-        // the target's autocreated scheme, unless the workspace settings
-        // disable autocreation (XcodeGen / Tuist write the flag).
-        return crate::scheme::autocreation_allowed(xcodeproj_path).then(|| target.to_string());
-    }
     if names.iter().any(|n| n == target) {
         return Some(target.to_string());
     }
@@ -4159,14 +4506,22 @@ pub fn scheme_for_target(xcodeproj_path: &Path, target: &str) -> Option<String> 
         })
         .collect();
     schemes.sort();
-    schemes
+    let building = schemes
         .into_iter()
         .find(|(_, _, path)| {
             scheme_build_action_targets(path)
                 .iter()
                 .any(|t| t == target)
         })
-        .map(|(_, name, _)| name)
+        .map(|(_, name, _)| name);
+    // Otherwise the target's autocreated scheme, when the project lists one
+    // (see [`listed_schemes`]): autocreation is per target, so other targets'
+    // scheme files don't stand in its way.
+    building.or_else(|| {
+        open(xcodeproj_path)
+            .is_ok_and(|project| project.schemes.iter().any(|s| s == target))
+            .then(|| target.to_string())
+    })
 }
 
 /// The blueprint (target) names a scheme's `BuildAction` builds.
@@ -4187,6 +4542,7 @@ fn scheme_build_action_targets(scheme_path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdir::TempDir;
 
     /// Shorthand for the [`effective_authored_settings`]-shaped map the
     /// built-in/override gates read.
@@ -4593,32 +4949,46 @@ mod tests {
             crate::scheme::SanitizerEnables::default(),
         );
         assert_eq!(find(&unsigned, "CODE_SIGN_IDENTITY").as_deref(), Some("-"));
-        let signed = built_in_overrides(
-            26,
-            true,
-            false,
-            false,
-            None,
-            None,
-            app,
-            "macosx",
-            None,
-            false,
-            false,
-            true,
-            false,
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
-            None,
-            false,
-            false,
-            crate::scheme::SanitizerEnables::default(),
+        // A signable macOS app signs ad-hoc with no team (Xcode 27 on the CI
+        // fixture's app: `-` whatever CODE_SIGNING_ALLOWED says, `Apple
+        // Development` with `DEVELOPMENT_TEAM=ABCDE12345`), and a Mac Catalyst
+        // one keeps the SDK default.
+        let signed_app = |team: Option<&str>, is_catalyst: bool| {
+            built_in_overrides(
+                26,
+                true,
+                is_catalyst,
+                is_catalyst,
+                None,
+                None,
+                app,
+                "macosx",
+                None,
+                false,
+                false,
+                true,
+                false,
+                None,
+                team,
+                None,
+                false,
+                false,
+                None,
+                None,
+                false,
+                false,
+                crate::scheme::SanitizerEnables::default(),
+            )
+        };
+        assert_eq!(
+            find(&signed_app(None, false), "CODE_SIGN_IDENTITY").as_deref(),
+            Some("-")
         );
-        assert_eq!(find(&signed, "CODE_SIGN_IDENTITY"), None);
+        assert_eq!(
+            find(&signed_app(Some("ABCDE12345"), false), "CODE_SIGN_IDENTITY"),
+            None
+        );
+        assert_eq!(find(&signed_app(None, true), "CODE_SIGN_IDENTITY"), None);
     }
 
     #[test]
@@ -4817,6 +5187,47 @@ mod tests {
         assert_eq!(get("ENABLE_HARDENED_RUNTIME"), Some("YES"));
     }
 
+    /// Xcode 27 drops macOS's `x86_64` and watchOS's `arm64_32` from
+    /// `ARCHS_STANDARD` only for a deployment target of 27 or later: measured
+    /// on 27.0 and 27.2, 26.4 keeps both.
+    #[test]
+    fn xcode_27_keeps_the_legacy_slice_below_a_27_deployment_target() {
+        let archs_standard = |sdk: &str, key: &str, target: &str| {
+            let out = built_in_settings(
+                Path::new("/tmp/App.xcodeproj"),
+                "App",
+                "Release",
+                Some("com.apple.product-type.application"),
+                sdk,
+                None,
+                false,
+                false,
+                None,
+                None,
+                &authored_map(&[("SDKROOT", sdk), (key, target)]),
+                None,
+                None,
+                false,
+                Some("27.0"),
+                None,
+                None,
+                None,
+                false,
+                crate::scheme::SanitizerEnables::default(),
+            );
+            out.iter()
+                .rev()
+                .find(|a| a.key == "ARCHS_STANDARD")
+                .map(|a| a.value.clone())
+        };
+        let mac = |t| archs_standard("macosx", "MACOSX_DEPLOYMENT_TARGET", t);
+        let watch = |t| archs_standard("watchos", "WATCHOS_DEPLOYMENT_TARGET", t);
+        assert_eq!(mac("26.4").as_deref(), Some("arm64 x86_64"));
+        assert_eq!(mac("27.0").as_deref(), Some("arm64"));
+        assert_eq!(watch("26.0").as_deref(), Some("arm64 arm64_32"));
+        assert_eq!(watch("27.0").as_deref(), Some("arm64"));
+    }
+
     #[test]
     fn concrete_sdkroot_application_installs_and_keeps_pedantic_tapi() {
         // A normal macOS application (no `auto`) is a top-level installable
@@ -4879,7 +5290,7 @@ mod tests {
         );
         let get = |k: &str| out.iter().find(|a| a.key == k).map(|a| a.value.as_str());
         assert_eq!(get("DSTROOT"), Some("/tmp/Alamofire.dst"));
-        assert_eq!(get("INSTALL_ROOT"), Some("/tmp/Alamofire.dst"));
+        assert_eq!(get("INSTALL_ROOT"), Some("$(DSTROOT)"));
     }
 
     #[test]
@@ -5018,8 +5429,7 @@ mod tests {
     /// another package gets none, and dotted names are never packages.
     #[test]
     fn finds_packages_under_a_synchronized_folder() {
-        let root = std::env::temp_dir().join(format!("sweetpad-sync-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = TempDir::new("sweetpad-sync");
         for rel in [
             "Modules/Shallow",
             "Modules/Nest/Deep",
@@ -5038,7 +5448,6 @@ mod tests {
             found,
             vec![root.join("Modules/Nest/Deep"), root.join("Modules/Shallow")]
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5174,6 +5583,60 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             assert_eq!(keys(f), keys(r), "fallback must mirror the default config");
+        }
+    }
+
+    /// A node listed in two groups resolves under the listing Xcode 27.0
+    /// keeps, which is the file each layout here compiled: the later of two
+    /// sibling groups, and a listing at the root over the one below it, in
+    /// navigator order rather than object order. The xcconfig a configuration
+    /// names follows the same listing.
+    #[test]
+    fn a_node_listed_twice_resolves_under_the_listing_xcode_keeps() {
+        fn resolve(main: &str, sources: &str, tests: &str) -> (PathBuf, PathBuf) {
+            let text = format!(
+                "// !$*UTF8*$!
+{{
+\tobjects = {{
+\t\tBF = {{ isa = PBXBuildFile; fileRef = UTIL; }};
+\t\tUTIL = {{ isa = PBXFileReference; path = Util.swift; sourceTree = \"<group>\"; }};
+\t\tXC = {{ isa = PBXFileReference; path = Base.xcconfig; sourceTree = \"<group>\"; }};
+\t\tSRC = {{ isa = PBXGroup; path = Sources; sourceTree = \"<group>\"; children = ({sources}); }};
+\t\tTST = {{ isa = PBXGroup; path = Tests; sourceTree = \"<group>\"; children = ({tests}); }};
+\t\tSH = {{ isa = PBXGroup; path = Shared; sourceTree = \"<group>\"; children = (UTIL, XC); }};
+\t\tMAIN = {{ isa = PBXGroup; sourceTree = \"<group>\"; children = ({main}); }};
+\t\tPHASE = {{ isa = PBXSourcesBuildPhase; files = (BF); }};
+\t\tAPP = {{ isa = PBXNativeTarget; name = App; buildPhases = (PHASE); }};
+\t\tPROJ = {{ isa = PBXProject; mainGroup = MAIN; targets = (APP); }};
+\t}};
+\trootObject = PROJ;
+}}
+"
+            );
+            let value = pbxproj::parse(&text).unwrap();
+            let xcodeproj = Path::new("/nonexistent-sweetpad/App.xcodeproj");
+            let sources = target_source_files_from_value(&value, xcodeproj, "App").unwrap();
+            let (objects, _) = project_root(&value).unwrap();
+            let xcconfig = resolve_file_ref_path(objects, "XC", xcodeproj).unwrap();
+            let relative = |p: &Path| {
+                p.strip_prefix("/nonexistent-sweetpad")
+                    .unwrap()
+                    .to_path_buf()
+            };
+            (relative(&sources[0]), relative(&xcconfig))
+        }
+
+        for (main, sources, tests, expected) in [
+            ("SRC, TST", "SH", "SH", "Tests/Shared"),
+            ("TST, SRC", "SH", "SH", "Sources/Shared"),
+            ("SH, SRC", "SH", "", "Shared"),
+            ("SRC, SH", "SH", "", "Shared"),
+            ("SRC, TST, SH", "SH", "SH", "Shared"),
+        ] {
+            let (source, xcconfig) = resolve(main, sources, tests);
+            let expected = Path::new(expected);
+            assert_eq!(source, expected.join("Util.swift"), "main = ({main})");
+            assert_eq!(xcconfig, expected.join("Base.xcconfig"), "main = ({main})");
         }
     }
 
@@ -5414,6 +5877,23 @@ mod tests {
         assert!(!has_key(&resolve_with_version("15.4")));
     }
 
+    /// The join both formats place a stored path with: an empty path leaves
+    /// the directory as it is, and a relative directory keeps the `..` that
+    /// climbs past it, so a listing relative to the project still names a
+    /// place above it.
+    #[test]
+    fn join_normalized_adds_nothing_for_an_empty_path_and_keeps_a_leading_climb() {
+        let join = |base: &str, rel: &str| join_normalized(Path::new(base), rel);
+        assert_eq!(join("Sources", ""), PathBuf::from("Sources"));
+        assert_eq!(join("", ""), PathBuf::new());
+        assert_eq!(join("Sources", "App/"), PathBuf::from("Sources/App"));
+        assert_eq!(join("Sources", "../Shared"), PathBuf::from("Shared"));
+        assert_eq!(join("", "../Shared"), PathBuf::from("../Shared"));
+        assert_eq!(join("..", "../x"), PathBuf::from("../../x"));
+        assert_eq!(join("/a", "../../b"), PathBuf::from("/b"));
+        assert_eq!(join("Sources", "/abs/./x"), PathBuf::from("/abs/x"));
+    }
+
     /// [`absolutize`] anchors relative paths and collapses dot segments while
     /// preserving the spelling it was given — symlinks included. Resolving
     /// them is [`standardize`]'s job, and only the hash input wants that.
@@ -5429,10 +5909,9 @@ mod tests {
         );
 
         // A symlinked directory keeps its symlink spelling.
-        let root = std::env::temp_dir().join(format!("sweetpad-abs-{}", std::process::id()));
+        let root = TempDir::new("sweetpad-abs");
         let target_dir = root.join("target");
         let link = root.join("link");
-        let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&target_dir).unwrap();
         std::os::unix::fs::symlink(&target_dir, &link).unwrap();
         let through_link = link.join("Proj.xcodeproj");
@@ -5442,7 +5921,6 @@ mod tests {
             target_dir.join("Proj.xcodeproj"),
             "must not resolve the symlink"
         );
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// [`standardize`] is the DerivedData hash input, so its whole job is to
@@ -5450,10 +5928,9 @@ mod tests {
     /// xcodebuild hashes.
     #[test]
     fn standardize_resolves_symlinks_and_drops_private() {
-        let root = std::env::temp_dir().join(format!("sweetpad-std-{}", std::process::id()));
+        let root = TempDir::new("sweetpad-std");
         let target_dir = root.join("target");
         let link = root.join("link");
-        let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&target_dir).unwrap();
         std::os::unix::fs::symlink(&target_dir, &link).unwrap();
 
@@ -5479,145 +5956,60 @@ mod tests {
         // back to the lexical form rather than failing.
         let missing = root.join("nope").join("Proj.xcodeproj");
         assert_eq!(standardize(&missing), absolutize(&missing));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
-    /// `normalize_stub_workspace` is pure-lexical (no filesystem), so pin it
-    /// with a table. It must collapse ONLY the `.xcodeproj/project.xcworkspace`
-    /// stub down to its bundle; everything else passes through untouched.
+    /// A `-derivedDataPath` loses only the `/private` in front of a root
+    /// symlink, whether or not the directory exists yet, and keeps every
+    /// other part of its spelling.
     #[test]
-    fn normalize_stub_workspace_collapses_only_the_bundle_stub() {
-        let cases: &[(&str, &str)] = &[
-            // The auto-generated stub collapses to its containing bundle…
-            (
-                "/root/Foo.xcodeproj/project.xcworkspace",
-                "/root/Foo.xcodeproj",
-            ),
-            // …even spelled with a trailing slash (Path ignores it).
-            (
-                "/root/Foo.xcodeproj/project.xcworkspace/",
-                "/root/Foo.xcodeproj",
-            ),
-            // A real, user-authored workspace is left untouched.
-            ("/root/Foo.xcworkspace", "/root/Foo.xcworkspace"),
-            // A `project.xcworkspace` NOT inside an `.xcodeproj` is not the
-            // stub — don't eat a real directory that merely shares the name.
-            (
-                "/root/weird/project.xcworkspace",
-                "/root/weird/project.xcworkspace",
-            ),
-            // A bare `.xcodeproj` is already the container.
-            ("/root/Foo.xcodeproj", "/root/Foo.xcodeproj"),
-        ];
-        for (input, expected) in cases {
+    fn without_private_root_drops_only_the_private_prefix() {
+        if !Path::new("/private/tmp").exists() {
+            return;
+        }
+        for (given, spelled) in [
+            ("/private/tmp/x/link/dd", "/tmp/x/link/dd"),
+            ("/private/var/folders/x/dd", "/var/folders/x/dd"),
+            ("/private/tmp", "/tmp"),
+            ("/tmp/x/dd", "/tmp/x/dd"),
+            ("/Users/x/dd", "/Users/x/dd"),
+            // No `/sweetpad-none` symlink leads into it.
+            ("/private/sweetpad-none/dd", "/private/sweetpad-none/dd"),
+            ("/private", "/private"),
+            ("dd", "dd"),
+        ] {
             assert_eq!(
-                normalize_stub_workspace(Path::new(input)),
-                PathBuf::from(expected),
-                "normalize_stub_workspace({input})"
+                without_private_root(Path::new(given)),
+                PathBuf::from(spelled),
+                "{given}"
             );
         }
     }
 
-    /// The container-*inference* matrix (`find_derived_data_container`), which
-    /// chooses which path Xcode would hash for the DerivedData folder. Each
-    /// shape is built on disk because the function reads the tree — including
-    /// each candidate workspace's `contents.xcworkspacedata`, since only a
-    /// workspace this project actually belongs to keys its DerivedData.
+    /// A `-derivedDataPath` keeps a symlink in it until the directory exists,
+    /// and is spelled through the real directory once it does, as
+    /// `xcodebuild -showBuildSettings` spells it before and after the run that
+    /// creates it.
     #[test]
-    #[allow(clippy::many_single_char_names)] // a/b/c… mirror the (a)/(b)/(c) case labels
-    fn find_derived_data_container_selects_the_keyed_container() {
-        use std::fmt::Write as _;
-        let root = std::env::temp_dir().join(format!("sweetpad-ddc-{}", std::process::id()));
+    fn a_derived_data_path_resolves_its_symlinks_once_it_exists() {
+        let root =
+            std::env::temp_dir().join(format!("sweetpad-dd-spelling-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let spelled = |path: &Path| without_private_root(path);
 
-        // Write a `.xcworkspace` whose `contents.xcworkspacedata` lists `refs`
-        // (each a `group:`-relative `.xcodeproj`).
-        let mk_ws = |path: &Path, refs: &[&str]| {
-            fs::create_dir_all(path).unwrap();
-            let mut body = String::new();
-            for r in refs {
-                let _ = writeln!(body, "  <FileRef location = \"group:{r}\"></FileRef>");
-            }
-            fs::write(
-                path.join("contents.xcworkspacedata"),
-                format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version=\"1.0\">\n{body}</Workspace>\n"
-                ),
-            )
-            .unwrap();
-        };
-
-        // (a) Bare project, no workspace anywhere -> the `.xcodeproj` itself.
-        let a = root.join("a");
-        fs::create_dir_all(a.join("Foo.xcodeproj")).unwrap();
+        let through_link = root.join("link/dd");
+        assert_eq!(derived_data_spelling(&through_link), spelled(&through_link));
         assert_eq!(
-            find_derived_data_container(&a.join("Foo.xcodeproj")),
-            a.join("Foo.xcodeproj"),
-            "no workspace: container is the project"
+            derived_data_spelling(&root.join("link/../dd")),
+            spelled(&root.join("dd"))
         );
 
-        // (b) A sibling workspace that lists the project as a member -> the
-        //     workspace keys DerivedData (Xcode opens the project through it).
-        let b = root.join("b");
-        fs::create_dir_all(b.join("Foo.xcodeproj")).unwrap();
-        mk_ws(&b.join("App.xcworkspace"), &["Foo.xcodeproj"]);
+        fs::create_dir(root.join("real/dd")).unwrap();
         assert_eq!(
-            find_derived_data_container(&b.join("Foo.xcodeproj")),
-            b.join("App.xcworkspace"),
-            "member sibling workspace wins over the project"
+            derived_data_spelling(&through_link),
+            standardize(&root.join("real/dd"))
         );
-
-        // (c) A member workspace one directory ABOVE the project -> the
-        //     workspace (the grandparent leg). The folder prefix is the
-        //     WORKSPACE stem (`App`), not the project stem (`Foo`).
-        let c = root.join("c");
-        fs::create_dir_all(c.join("Sub/Foo.xcodeproj")).unwrap();
-        mk_ws(&c.join("App.xcworkspace"), &["Sub/Foo.xcodeproj"]);
-        assert_eq!(
-            find_derived_data_container(&c.join("Sub/Foo.xcodeproj")),
-            c.join("App.xcworkspace"),
-            "member grandparent workspace wins; name != project name"
-        );
-
-        // (d) A sub-project nested inside another `.xcodeproj` bundle: the only
-        //     workspace in view is that bundle's auto-generated stub, which the
-        //     search skips -> fall back to the sub-project itself.
-        let d = root.join("d");
-        fs::create_dir_all(d.join("Outer.xcodeproj/Sub.xcodeproj")).unwrap();
-        fs::create_dir_all(d.join("Outer.xcodeproj/project.xcworkspace")).unwrap();
-        assert_eq!(
-            find_derived_data_container(&d.join("Outer.xcodeproj/Sub.xcodeproj")),
-            d.join("Outer.xcodeproj/Sub.xcodeproj"),
-            "the bundle stub is skipped during inference too"
-        );
-
-        // (e) Two member workspaces beside the project: pick the
-        //     alphabetically-first. A documented heuristic, not captured Xcode
-        //     behaviour — pinned so any change is deliberate (DOCS open item).
-        let e = root.join("e");
-        fs::create_dir_all(e.join("Foo.xcodeproj")).unwrap();
-        mk_ws(&e.join("Beta.xcworkspace"), &["Foo.xcodeproj"]);
-        mk_ws(&e.join("Alpha.xcworkspace"), &["Foo.xcodeproj"]);
-        assert_eq!(
-            find_derived_data_container(&e.join("Foo.xcodeproj")),
-            e.join("Alpha.xcworkspace"),
-            "two member workspaces: alphabetically-first heuristic"
-        );
-
-        // (f) A nearby workspace that does NOT list the project -> the project
-        //     keys its own DerivedData. A bare `.xcodeproj` scaffolded beneath
-        //     an unrelated project's workspace must not borrow its folder (the
-        //     `app run` install-path regression).
-        let f = root.join("f");
-        fs::create_dir_all(f.join("Sub/Foo.xcodeproj")).unwrap();
-        mk_ws(&f.join("Other.xcworkspace"), &["Sub/Bar.xcodeproj"]);
-        assert_eq!(
-            find_derived_data_container(&f.join("Sub/Foo.xcodeproj")),
-            f.join("Sub/Foo.xcodeproj"),
-            "non-member workspace is ignored; the project keys itself"
-        );
-
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -5631,8 +6023,8 @@ mod tests {
         let without = absolutize(Path::new("/root/Foo.xcodeproj"));
         assert_eq!(with, without, "trailing slash must normalize away");
         assert_eq!(
-            derived_data_hash(&with.display().to_string()),
-            derived_data_hash(&without.display().to_string()),
+            crate::derived_data::container_hash(Path::new("/root/Foo.xcodeproj/")),
+            crate::derived_data::container_hash(Path::new("/root/Foo.xcodeproj")),
         );
     }
 }

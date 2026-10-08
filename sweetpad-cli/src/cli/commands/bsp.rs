@@ -55,9 +55,44 @@ pub fn run(ctx: &mut Context, action: &Action) -> CommandResult {
                 server_args.push(p.display().to_string());
             }
             server_args.extend(args.iter().cloned());
+            let command_line = serve_command_line(ctx);
             // The server owns stdio (JSON-RPC frames on stdout); no envelope.
-            sweetpad_core::bsp::run(&server_args).map_err(CliError::new)?;
+            sweetpad_core::bsp::run_with(&server_args, command_line).map_err(CliError::new)?;
             Ok(Rendered::Streamed)
+        }
+    }
+}
+
+/// The settings the server layers on every target: the `KEY=VALUE` settings
+/// and `-xcconfig` in the project's `sweetpad.toml` `[xcodebuild] args`, so
+/// the editor's arguments and prepare builds follow the project's builds.
+/// Only a config `bsp init` wrote names the container, and the file is read
+/// for that one. A server the extension's `bsp.json` configures reads that
+/// file's `xcconfig` and `buildSettings` instead: the extension's builds take
+/// its own `sweetpad.build.args` rather than `sweetpad.toml`, and discovery
+/// from the working directory could name a container other than the one
+/// `bsp.json` does. A file `build` would refuse is warned about and left out,
+/// so the index keeps working.
+fn serve_command_line(ctx: &Context) -> sweetpad_core::bsp::CommandLine {
+    if ctx.targeting.workspace.is_none() && ctx.targeting.project.is_none() {
+        return sweetpad_core::bsp::CommandLine::default();
+    }
+    let Some(container) = resolve::container_silently(ctx) else {
+        return sweetpad_core::bsp::CommandLine::default();
+    };
+    match ctx.xcodebuild_args(crate::cli::xcodebuild::Action::Build, &[]) {
+        Ok(args) => {
+            let settings = crate::cli::xcodebuild::command_line_settings(&args, &container);
+            sweetpad_core::bsp::CommandLine {
+                xcconfig: settings.xcconfig,
+                overrides: settings.overrides,
+            }
+        }
+        Err(e) => {
+            ctx.out.warn(&format!(
+                "{e}; the index resolves without sweetpad.toml's '[xcodebuild] args'"
+            ));
+            sweetpad_core::bsp::CommandLine::default()
         }
     }
 }
@@ -106,7 +141,7 @@ fn doctor(ctx: &mut Context) -> CommandResult {
     let Ok(text) = std::fs::read_to_string(&path) else {
         checks.push(BspCheck {
             ok: false,
-            what: "file exists (run `sweetpad bsp init` to create it)".to_string(),
+            what: "file exists (run 'sweetpad bsp init' to create it)".to_string(),
         });
         return Ok(Rendered::data_with_exit(
             BspDoctor {
@@ -132,11 +167,11 @@ fn doctor(ctx: &mut Context) -> CommandResult {
                 checks.push(BspCheck {
                     ok: present,
                     what: format!(
-                        "`{field}` present{}",
+                        "'{field}' present{}",
                         if present {
                             ""
                         } else {
-                            " (sourcekit-lsp silently skips the file without it — rerun `sweetpad bsp init`)"
+                            " (sourcekit-lsp silently skips the file without it — rerun 'sweetpad bsp init')"
                         }
                     ),
                 });
@@ -160,7 +195,7 @@ fn doctor(ctx: &mut Context) -> CommandResult {
                         if exists {
                             " exists"
                         } else {
-                            " is missing — rerun `sweetpad bsp init`"
+                            " is missing — rerun 'sweetpad bsp init'"
                         }
                     ),
                 });
@@ -202,7 +237,7 @@ fn probe_launch(argv: &[String]) -> BspCheck {
         Ok(status) => BspCheck {
             ok: false,
             what: format!(
-                "argv starts a BSP server (exec exited with {status} — rerun `sweetpad bsp init`)"
+                "argv starts a BSP server (exec exited with {status} — rerun 'sweetpad bsp init')"
             ),
         },
         Err(e) => BspCheck {
@@ -337,15 +372,7 @@ fn init_swift_package(manifest_path: &Path, output: Option<&Path>) -> BspSwiftPa
 /// Where sourcekit-lsp looks for a `buildServer.json`: the explicit `--output`,
 /// else next to the container (its parent directory).
 fn buildserver_path(container: &Path, output: Option<&Path>) -> PathBuf {
-    output.map_or_else(
-        || {
-            container
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("buildServer.json")
-        },
-        Path::to_path_buf,
-    )
+    sweetpad_core::bsp::build_server_json_path(container, output)
 }
 
 #[cfg(test)]
@@ -357,6 +384,17 @@ mod tests {
         assert_eq!(
             buildserver_path(Path::new("/pkg/Package.swift"), None),
             PathBuf::from("/pkg/buildServer.json")
+        );
+    }
+
+    /// A project named through its embedded workspace gets its
+    /// `buildServer.json` beside the `.xcodeproj`, where sourcekit-lsp looks,
+    /// and never inside the bundle.
+    #[test]
+    fn buildserver_path_puts_an_embedded_workspaces_file_beside_the_project() {
+        assert_eq!(
+            buildserver_path(Path::new("/src/App.xcodeproj/project.xcworkspace"), None),
+            PathBuf::from("/src/buildServer.json")
         );
     }
 

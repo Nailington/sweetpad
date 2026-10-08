@@ -3,7 +3,9 @@
 //! specialty.
 //!
 //! This is the porcelain view: what the build will actually use, after
-//! xcconfig files, SDK defaults, and `$(inherited)` chains. The *stored*
+//! xcconfig files, SDK defaults, `$(inherited)` chains, the settings the
+//! project's `sweetpad.toml` `[xcodebuild] args` add to every build, and a
+//! `--` tail previewed the way a build takes one. The *stored*
 //! pbxproj layer — and everything that edits it — is plumbing:
 //! `sweetpad pbxproj settings show/set/unset` (CLI_DESIGN §9g).
 
@@ -13,12 +15,14 @@ use clap::Subcommand;
 
 use crate::cli::output::Output;
 use crate::cli::resolve::{self, Container};
-use crate::cli::{BuildTargetArgs, CliError, CommandResult, Context, Render, Rendered};
+use crate::cli::{BuildTargetArgs, CliError, CommandResult, Context, Render, Rendered, xcodebuild};
 use sweetpad_core::build_settings::{BuildSettingsOptions, TargetSettings, resolve_build_settings};
 
 #[derive(Debug, Subcommand)]
 pub enum Action {
-    /// Show resolved build settings for the resolved scheme/target.
+    /// Show resolved build settings for the resolved scheme/target, including
+    /// the 'KEY=VALUE' settings and '-xcconfig' in sweetpad.toml's
+    /// '[xcodebuild] args'.
     Show {
         #[command(flatten)]
         build: BuildTargetArgs,
@@ -31,14 +35,26 @@ pub enum Action {
         /// for '$(…)' capture.
         #[arg(long)]
         key: Option<String>,
+
+        /// xcodebuild arguments to preview (after '--'), read the way a build
+        /// reads its tail: 'KEY=VALUE' settings, '-xcconfig' and
+        /// '-derivedDataPath', on top of sweetpad.toml's '[xcodebuild] args'.
+        /// E.g. 'sweetpad settings show --key PRODUCT_NAME -- PRODUCT_NAME=Beta'.
+        #[arg(last = true, value_name = "XCODEBUILD_ARGS")]
+        passthrough: Vec<String>,
     },
 }
 
 pub fn run(ctx: &mut Context, action: &Action) -> CommandResult {
     match action {
-        Action::Show { build, target, key } => {
+        Action::Show {
+            build,
+            target,
+            key,
+            passthrough,
+        } => {
             ctx.targeting = build.clone().into();
-            show(ctx, target.as_deref(), key.as_deref())
+            show(ctx, target.as_deref(), key.as_deref(), passthrough)
         }
     }
 }
@@ -91,7 +107,18 @@ impl Render for SettingsResult {
     }
 }
 
-fn show(ctx: &mut Context, target: Option<&str>, key: Option<&str>) -> CommandResult {
+fn show(
+    ctx: &mut Context,
+    target: Option<&str>,
+    key: Option<&str>,
+    passthrough: &[String],
+) -> CommandResult {
+    // The settings a build with this tail resolves: the project's
+    // `[xcodebuild] args` carry command-line settings and an `-xcconfig`
+    // every build takes, and the typed tail layers on them as a build's does.
+    // Read before resolving, so a tail a build would refuse is refused from
+    // the command line alone.
+    let passthrough = ctx.xcodebuild_args(xcodebuild::Action::Build, passthrough)?;
     let mut resolved = resolve::resolve(ctx)?;
 
     let (project, workspace): (Option<PathBuf>, Option<PathBuf>) = match &resolved.container {
@@ -146,6 +173,7 @@ fn show(ctx: &mut Context, target: Option<&str>, key: Option<&str>) -> CommandRe
         .as_deref()
         .or(resolved.destination.as_deref())
         .and_then(sweetpad_lib::destination::parse_destination_arg);
+    let command_line = xcodebuild::command_line_settings(&passthrough, &resolved.container);
 
     let opts = BuildSettingsOptions {
         project,
@@ -156,12 +184,13 @@ fn show(ctx: &mut Context, target: Option<&str>, key: Option<&str>) -> CommandRe
         sdk: resolved.sdk.clone().unwrap_or_default(),
         arch: String::new(),
         destination,
-        xcconfig: None,
+        xcconfig: command_line.xcconfig,
         xcode: None,
         xcspec_root: None,
         sdksettings_root: None,
         catalog_cache: None,
-        derived_data_path: None,
+        derived_data_path: command_line.derived_data_path,
+        overrides: command_line.overrides,
         // Report the paths this machine would really build into, so the output
         // can be compared against `xcodebuild -showBuildSettings`.
         read_xcode_locations: true,

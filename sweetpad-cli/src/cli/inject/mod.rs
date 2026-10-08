@@ -62,25 +62,7 @@ impl Drop for HotSession {
     }
 }
 
-/// Map an `xcodebuild` `-destination` specifier to the SDK short name (the
-/// value SDK conditionals and the client dylib lookup key on) for the
-/// injectable destinations: simulators and native macOS. Returns `None` for
-/// the rest (devices, generic).
-#[must_use]
-pub fn sdk_for_destination(destination: &str) -> Option<&'static str> {
-    let platform = destination
-        .split(',')
-        .find_map(|kv| kv.trim().strip_prefix("platform="))
-        .unwrap_or("")
-        .trim();
-    match platform {
-        "iOS Simulator" => Some("iphonesimulator"),
-        "tvOS Simulator" => Some("appletvsimulator"),
-        "visionOS Simulator" => Some("xrsimulator"),
-        "macOS" => Some("macosx"),
-        _ => None,
-    }
-}
+pub use sweetpad_core::hot::sdk_for_destination;
 
 /// Whether the project depends on the `Inject` package (krzysztofzablocki/Inject),
 /// which SwiftUI views need (`@ObserveInjection` + `.enableInjection()`) to
@@ -245,22 +227,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sdk_for_destination_maps_injectable_destinations() {
-        assert_eq!(
-            sdk_for_destination("platform=iOS Simulator,id=ABC"),
-            Some("iphonesimulator")
-        );
-        assert_eq!(
-            sdk_for_destination("platform=visionOS Simulator,name=X"),
-            Some("xrsimulator")
-        );
-        assert_eq!(sdk_for_destination("platform=macOS"), Some("macosx"));
-        // Physical device / unknown → unsupported.
-        assert_eq!(sdk_for_destination("platform=iOS,id=ABC"), None);
-        assert_eq!(sdk_for_destination("generic/platform=iOS"), None);
-    }
-
-    #[test]
     fn hardened_runtime_flag_detection() {
         let hardened = "Executable=/x/App\nIdentifier=dev.x.app\n\
                         CodeDirectory v=20400 size=768 flags=0x10000(runtime) hashes=13+7 location=embedded\n";
@@ -326,13 +292,7 @@ mod tests {
 
     #[test]
     fn inject_dependency_detection() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("sweetpad-inject-dep-{n}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::cli::testdir::TempDir::new("sweetpad-inject-dep");
 
         // No Package.resolved → unknown (stay quiet).
         assert_eq!(inject_dependency_present(&dir), None);
@@ -352,7 +312,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inject_dependency_present(&dir), Some(true));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

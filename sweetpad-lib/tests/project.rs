@@ -1,8 +1,11 @@
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use common::TempDir;
 use sweetpad_lib::project::{
     Target, is_self_buildable, open, target_dependencies, target_has_package_products,
     target_source_files, transitive_dependencies,
@@ -153,8 +156,7 @@ fn icecubes_shared_schemes_discovered() {
 /// skip headers and other non-compiled files.
 #[test]
 fn synchronized_folder_sources_are_walked() {
-    let root = std::env::temp_dir().join(format!("sweetpad-sync-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = TempDir::new("sweetpad-sync");
     let xcodeproj = root.join("App.xcodeproj");
     let sources = root.join("App/Sources");
     fs::create_dir_all(xcodeproj.join("..")).unwrap();
@@ -191,7 +193,6 @@ fn synchronized_folder_sources_are_walked() {
         .filter_map(|p| p.file_name().and_then(OsStr::to_str))
         .collect();
     names.sort_unstable();
-    let _ = fs::remove_dir_all(&root);
 
     assert_eq!(
         names,
@@ -203,10 +204,92 @@ fn synchronized_folder_sources_are_walked() {
 /// A file unchecked from a target's membership appears in the synchronized
 /// folder's `PBXFileSystemSynchronizedBuildFileExceptionSet.membershipExceptions`
 /// and must be dropped from that target's sources.
+/// The same `membershipExceptions` list cuts the other way for a target that
+/// does not name the folder in `fileSystemSynchronizedGroups`: those files are
+/// the target's whole share of it. NetNewsWire builds five extensions this
+/// way, each with an empty `PBXSourcesBuildPhase`.
+/// A package product can be linked without the target naming it: the frameworks
+/// phase's build file reaches the `XCSwiftPackageProductDependency` through
+/// `productRef` where an ordinary file would have a `fileRef`. Tuist writes
+/// projects this way.
+#[test]
+fn a_package_product_linked_only_through_a_product_ref_counts() {
+    let root = TempDir::new("sweetpad-productref");
+    let xcodeproj = root.join("App.xcodeproj");
+    fs::create_dir_all(&xcodeproj).unwrap();
+
+    let pbxproj = "\
+// !$*UTF8*$!
+{
+\tarchiveVersion = 1;
+\tobjects = {
+\t\tPROJ = { isa = PBXProject; mainGroup = MAIN; targets = (APP, BARE); };
+\t\tMAIN = { isa = PBXGroup; sourceTree = \"<group>\"; children = (); };
+\t\tPRODDEP = { isa = XCSwiftPackageProductDependency; productName = Alamofire; };
+\t\tBF = { isa = PBXBuildFile; productRef = PRODDEP; };
+\t\tFRAMEWORKS = { isa = PBXFrameworksBuildPhase; files = (BF); };
+\t\tEMPTY = { isa = PBXFrameworksBuildPhase; files = (); };
+\t\tAPP = { isa = PBXNativeTarget; name = App; buildPhases = (FRAMEWORKS); };
+\t\tBARE = { isa = PBXNativeTarget; name = Bare; buildPhases = (EMPTY); };
+\t};
+\trootObject = PROJ;
+}
+";
+    fs::write(xcodeproj.join("project.pbxproj"), pbxproj).unwrap();
+
+    assert!(target_has_package_products(&xcodeproj, "App").unwrap());
+    assert!(!target_has_package_products(&xcodeproj, "Bare").unwrap());
+}
+
+#[test]
+fn synchronized_folder_membership_exception_is_included_for_a_non_member() {
+    let root = TempDir::new("sweetpad-sync-inc");
+    let xcodeproj = root.join("App.xcodeproj");
+    let sources = root.join("App/Sources");
+    fs::create_dir_all(&xcodeproj).unwrap();
+    fs::create_dir_all(&sources).unwrap();
+    fs::write(sources.join("Shared.swift"), "let a = 1\n").unwrap();
+    fs::write(sources.join("AppOnly.swift"), "let b = 2\n").unwrap();
+    fs::write(sources.join("Icon.png"), "not a png\n").unwrap();
+
+    // `App` owns the folder; `Ext` does not, and its exception set names the
+    // two files it takes from it. The resource among them is not a source.
+    let pbxproj = "\
+// !$*UTF8*$!
+{
+\tarchiveVersion = 1;
+\tobjects = {
+\t\tPROJ = { isa = PBXProject; mainGroup = MAIN; targets = (APP, EXT); };
+\t\tMAIN = { isa = PBXGroup; sourceTree = \"<group>\"; children = (APPGRP); };
+\t\tAPPGRP = { isa = PBXGroup; path = App; sourceTree = \"<group>\"; children = (SYNC); };
+\t\tSYNC = { isa = PBXFileSystemSynchronizedRootGroup; path = Sources; sourceTree = \"<group>\"; exceptions = (EXC); };
+\t\tEXC = { isa = PBXFileSystemSynchronizedBuildFileExceptionSet; target = EXT; membershipExceptions = (\"Shared.swift\", \"Icon.png\"); };
+\t\tAPP = { isa = PBXNativeTarget; name = App; buildPhases = (); fileSystemSynchronizedGroups = (SYNC); };
+\t\tEXT = { isa = PBXNativeTarget; name = Ext; buildPhases = (); };
+\t};
+\trootObject = PROJ;
+}
+";
+    fs::write(xcodeproj.join("project.pbxproj"), pbxproj).unwrap();
+
+    let names = |target: &str| {
+        let mut n: Vec<String> = target_source_files(&xcodeproj, target)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    };
+    // The folder's owner keeps everything: an exception set for another target
+    // takes nothing away from it.
+    assert_eq!(names("App"), ["AppOnly.swift", "Shared.swift"]);
+    assert_eq!(names("Ext"), ["Shared.swift"]);
+}
+
 #[test]
 fn synchronized_folder_membership_exception_is_excluded() {
-    let root = std::env::temp_dir().join(format!("sweetpad-sync-exc-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = TempDir::new("sweetpad-sync-exc");
     let xcodeproj = root.join("App.xcodeproj");
     let sources = root.join("App/Sources");
     fs::create_dir_all(&xcodeproj).unwrap();
@@ -238,7 +321,6 @@ fn synchronized_folder_membership_exception_is_excluded() {
         .filter_map(|p| p.file_name().and_then(OsStr::to_str))
         .collect();
     names.sort_unstable();
-    let _ = fs::remove_dir_all(&root);
 
     assert_eq!(
         names,

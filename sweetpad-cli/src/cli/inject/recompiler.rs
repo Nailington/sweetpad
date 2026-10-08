@@ -17,6 +17,12 @@
 //!
 //! Recovered commands are **cached per source** (they're stable until the file
 //! set / settings change), so the only per-save cost is the compile + link.
+//!
+//! Every toolchain child runs with a `TMPDIR` of the session's own, `tmp/` in
+//! the session's work directory: the Swift driver leaves a
+//! `TemporaryDirectory.*` in `$TMPDIR` on each `-###` dry run, and the work
+//! directory goes when the session ends. It lasts as long as the cached jobs
+//! do, so a path a job names inside it stays valid for every save.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +31,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cli::resolve::Container;
+use crate::cli::xcodebuild::CommandLineSettings;
 use sweetpad_core::build_settings::{BuildSettingsOptions, resolve_compiler_arguments};
 use sweetpad_lib::compiler_args::TargetCompilerArguments;
 
@@ -67,6 +74,10 @@ pub struct Recompiler {
     workspace: Option<PathBuf>,
     scheme: String,
     configuration: String,
+    /// What the `--hot` build's arguments add to its settings, so the
+    /// recompiled file sees the same settings and search paths it was built
+    /// with.
+    command_line: CommandLineSettings,
     /// Cached per-target compiler args; rebuilt on a miss (e.g. a new file).
     resolved: Mutex<Option<Vec<TargetCompilerArguments>>>,
     /// Recovered single-file frontend commands, keyed by canonical source path.
@@ -75,6 +86,10 @@ pub struct Recompiler {
 
     // BuildLog (A) input: the `--hot` build's captured transcript.
     build_log: Option<PathBuf>,
+
+    /// `<out_dir>/tmp`, the `TMPDIR` the toolchain children run with. The
+    /// caller removes `out_dir` when the session ends, which takes this too.
+    tmpdir: PathBuf,
 
     counter: AtomicUsize,
 }
@@ -87,6 +102,7 @@ impl Recompiler {
         container: &Container,
         scheme: String,
         configuration: String,
+        command_line: CommandLineSettings,
         sdk: String,
         arch: String,
         developer_dir: String,
@@ -101,6 +117,7 @@ impl Recompiler {
         };
         Recompiler {
             mode,
+            tmpdir: out_dir.join("tmp"),
             out_dir,
             developer_dir,
             sdk,
@@ -109,6 +126,7 @@ impl Recompiler {
             workspace,
             scheme,
             configuration,
+            command_line,
             resolved: Mutex::new(None),
             frontend_cache: Mutex::new(HashMap::new()),
             build_log,
@@ -116,9 +134,17 @@ impl Recompiler {
         }
     }
 
+    /// The `TMPDIR` the toolchain children run with, once it exists. Without
+    /// it they keep the one this process has.
+    fn tmpdir(&self) -> Option<&Path> {
+        self.tmpdir.is_dir().then_some(self.tmpdir.as_path())
+    }
+
     /// Recompile `source` into a fresh loadable dylib, returning its path.
     pub fn recompile(&self, source: &Path) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&self.out_dir).map_err(|e| format!("create inject dir: {e}"))?;
+        // Best effort: a missing one leaves the children the inherited TMPDIR.
+        let _ = std::fs::create_dir_all(&self.tmpdir);
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         // The `eval_injection_` prefix is what the client's image scan expects.
         let dylib = self.out_dir.join(format!("eval_injection_{n}.dylib"));
@@ -133,9 +159,16 @@ impl Recompiler {
 
         // Primary: the recovered single-file frontend command (resolver `-###`, or
         // the build log in `BuildLog` mode), compiled and linked into the dylib.
-        let primary = self
-            .frontend_tokens(source)
-            .and_then(|tokens| compile_and_link(&tokens, &source_str, &object, &dylib, &self.sdk));
+        let primary = self.frontend_tokens(source).and_then(|tokens| {
+            compile_and_link(
+                &tokens,
+                &source_str,
+                &object,
+                &dylib,
+                &self.sdk,
+                self.tmpdir(),
+            )
+        });
         match primary {
             Ok(()) => Ok(dylib),
             // Only resolver mode degrades; build-log mode surfaces its own failure.
@@ -148,7 +181,15 @@ impl Recompiler {
                 // single-file — and cache it so later saves of this file skip the
                 // broken `-###` path. Whole-module `-emit-library` is the last resort.
                 if let Ok(tokens) = self.buildlog_tokens(source)
-                    && compile_and_link(&tokens, &source_str, &object, &dylib, &self.sdk).is_ok()
+                    && compile_and_link(
+                        &tokens,
+                        &source_str,
+                        &object,
+                        &dylib,
+                        &self.sdk,
+                        self.tmpdir(),
+                    )
+                    .is_ok()
                 {
                     let canon =
                         std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
@@ -212,7 +253,7 @@ impl Recompiler {
             vec!["swiftc".into(), "-###".into(), "-disable-batch-mode".into()];
         argv.extend(sanitize_driver_args(&swift.arguments));
         argv.extend(swift.input_files.clone());
-        let output = capture_combined("xcrun", &argv)?;
+        let output = capture_combined("xcrun", &argv, self.tmpdir())?;
 
         let mut cache = self.frontend_cache.lock().unwrap();
         let mut found = 0;
@@ -249,7 +290,12 @@ impl Recompiler {
             .map(String::from),
         );
         argv.push(dylib.to_string_lossy().into_owned());
-        run("xcrun", &prepend("swiftc", &argv), "emit-library")
+        run(
+            "xcrun",
+            &prepend("swiftc", &argv),
+            "emit-library",
+            self.tmpdir(),
+        )
     }
 
     /// Resolve (and cache) the target whose module owns `source`, returning its
@@ -317,6 +363,12 @@ impl Recompiler {
             configuration: self.configuration.clone(),
             sdk: self.sdk.clone(),
             arch: self.arch.clone(),
+            xcconfig: self.command_line.xcconfig.clone(),
+            derived_data_path: self.command_line.derived_data_path.clone(),
+            overrides: self.command_line.overrides.clone(),
+            // The search paths name the products the `--hot` build wrote,
+            // wherever this machine's Xcode puts them.
+            read_xcode_locations: true,
             ..Default::default()
         };
         resolve_compiler_arguments(&opts)
@@ -386,10 +438,19 @@ impl Recompiler {
 
 // ---- shared command helpers (ported from the validated spike) ----
 
+/// `Command::new(program)`, with `TMPDIR` set to `tmpdir` when there is one.
+fn command(program: &str, tmpdir: Option<&Path>) -> Command {
+    let mut cmd = Command::new(program);
+    if let Some(dir) = tmpdir {
+        cmd.env("TMPDIR", dir);
+    }
+    cmd
+}
+
 /// Run `prog argv`, returning stdout+stderr combined (the `-###` dry run prints
 /// its jobs to stderr; we don't care which stream).
-fn capture_combined(prog: &str, argv: &[String]) -> Result<String, String> {
-    let out = Command::new(prog)
+fn capture_combined(prog: &str, argv: &[String], tmpdir: Option<&Path>) -> Result<String, String> {
+    let out = command(prog, tmpdir)
         .args(argv)
         .output()
         .map_err(|e| format!("spawn {prog}: {e}"))?;
@@ -399,16 +460,19 @@ fn capture_combined(prog: &str, argv: &[String]) -> Result<String, String> {
 }
 
 /// Parse `swiftc -###` output into the per-file frontend *compile* jobs (each a
-/// token vector). `-###` prints each job on a line with every argument
-/// double-quoted; we keep the lines that are frontend invocations carrying a
-/// `-primary-file` and a compile flag (skipping the module-merge / link jobs).
+/// token vector). `-###` prints each job on a line, quoted the way a shell
+/// reads it: Xcode 27 leaves most arguments bare and single-quotes the ones
+/// with a space or a `#`, while older toolchains double-quote every argument.
+/// [`shell_tokens`] reads both. We keep the lines that are frontend invocations
+/// carrying a `-primary-file` and a compile flag (skipping the module-merge /
+/// link jobs).
 fn parse_frontend_jobs(text: &str) -> Vec<Vec<String>> {
     let mut jobs = Vec::new();
     for line in text.lines() {
         if !line.contains("-frontend") {
             continue;
         }
-        let tokens = parse_quoted_tokens(line);
+        let tokens = shell_tokens(line);
         let has_primary = tokens.iter().any(|t| t == "-primary-file");
         let is_compile = tokens.iter().any(|t| t == "-c" || t == "-emit-object");
         if has_primary && is_compile {
@@ -416,22 +480,6 @@ fn parse_frontend_jobs(text: &str) -> Vec<Vec<String>> {
         }
     }
     jobs
-}
-
-/// Tokenize a `-###` job line. `-###` wraps every argument in double quotes, so
-/// the tokens are the odd-indexed `"`-split segments; fall back to whitespace
-/// splitting for any unquoted line.
-fn parse_quoted_tokens(line: &str) -> Vec<String> {
-    let line = line.trim();
-    if line.contains('"') {
-        line.split('"')
-            .enumerate()
-            .filter(|(i, _)| i % 2 == 1)
-            .map(|(_, s)| s.to_string())
-            .collect()
-    } else {
-        line.split_whitespace().map(str::to_string).collect()
-    }
 }
 
 /// Strip the driver flags that orchestrate xcodebuild's *incremental, batched,
@@ -501,7 +549,7 @@ fn prepend(first: &str, rest: &[String]) -> Vec<String> {
 }
 
 #[allow(clippy::similar_names)] // prog/program/argv/args are the natural names here
-fn run(prog: &str, argv: &[String], what: &str) -> Result<(), String> {
+fn run(prog: &str, argv: &[String], what: &str, tmpdir: Option<&Path>) -> Result<(), String> {
     if argv.is_empty() {
         return Err(format!("{what}: empty command"));
     }
@@ -511,7 +559,7 @@ fn run(prog: &str, argv: &[String], what: &str) -> Result<(), String> {
     } else {
         (prog, argv)
     };
-    let out = Command::new(program)
+    let out = command(program, tmpdir)
         .args(args)
         .output()
         .map_err(|e| format!("spawn {what}: {e}"))?;
@@ -528,19 +576,26 @@ fn run(prog: &str, argv: &[String], what: &str) -> Result<(), String> {
 /// Compile `source` into one object via the recovered single-file frontend
 /// command, then link it into a loadable `dylib`. Shared by the primary attempt
 /// and the build-log fallback. `fallback_sdk` resolves the sysroot when the
-/// frontend command carries no `-sdk`.
+/// frontend command carries no `-sdk`; both children get `tmpdir` as `TMPDIR`.
 fn compile_and_link(
     tokens: &[String],
     source: &str,
     object: &Path,
     dylib: &Path,
     fallback_sdk: &str,
+    tmpdir: Option<&Path>,
 ) -> Result<(), String> {
-    run("", &single_file_command(tokens, source, object)?, "compile")?;
+    run(
+        "",
+        &single_file_command(tokens, source, object)?,
+        "compile",
+        tmpdir,
+    )?;
     run(
         "",
         &link_command(tokens, object, dylib, fallback_sdk)?,
         "link",
+        tmpdir,
     )?;
     Ok(())
 }
@@ -743,6 +798,45 @@ fn link_command(
 mod tests {
     use super::*;
 
+    /// Every toolchain child gets the session's own `TMPDIR`, inside the work
+    /// directory the session removes.
+    #[test]
+    fn children_run_with_the_sessions_tmpdir() {
+        let work = crate::cli::testdir::TempDir::new("sweetpad-hot-tmpdir");
+        // Build-log mode with no log fails before resolving anything, so the
+        // recompile below spawns nothing and reads no Xcode.
+        let recompiler = Recompiler::new(
+            Mode::BuildLog,
+            &Container::Project(PathBuf::from("/nonexistent/App.xcodeproj")),
+            "App".into(),
+            "Debug".into(),
+            CommandLineSettings::default(),
+            "macosx".into(),
+            "arm64".into(),
+            String::new(),
+            None,
+            work.to_path_buf(),
+        );
+        assert_eq!(recompiler.tmpdir(), None);
+        // A recompile makes it first thing, before anything it spawns.
+        assert!(recompiler.recompile(&work.join("Missing.swift")).is_err());
+        let dir = recompiler.tmpdir().expect("a session TMPDIR").to_path_buf();
+        assert_eq!(dir, work.join("tmp"));
+        let shell = |script: &str| vec!["-c".to_string(), script.to_string()];
+        assert_eq!(
+            capture_combined("sh", &shell("printf %s \"$TMPDIR\""), recompiler.tmpdir()).unwrap(),
+            dir.display().to_string()
+        );
+        let probe = dir.join("seen");
+        let script = format!(
+            "[ \"$TMPDIR\" = '{}' ] && touch '{}'",
+            dir.display(),
+            probe.display()
+        );
+        run("sh", &shell(&script), "probe", recompiler.tmpdir()).unwrap();
+        assert!(probe.exists());
+    }
+
     #[test]
     fn mode_parses_aliases() {
         assert_eq!(Mode::parse("resolver"), Some(Mode::Resolver));
@@ -879,12 +973,56 @@ mod tests {
     #[test]
     fn parses_quoted_dash_dash_dash_tokens() {
         let line = r#"  "/x/swift-frontend" "-frontend" "-c" "-primary-file" "/p/A.swift" "-target" "arm64-apple-ios16.0-simulator""#;
-        let t = parse_quoted_tokens(line);
+        let t = shell_tokens(line);
         assert_eq!(t[0], "/x/swift-frontend");
         assert!(t.contains(&"-primary-file".to_string()));
         assert!(t.contains(&"/p/A.swift".to_string()));
-        // Unquoted fallback still splits on whitespace.
-        assert_eq!(parse_quoted_tokens("a b c"), vec!["a", "b", "c"]);
+        assert_eq!(shell_tokens("a b c"), vec!["a", "b", "c"]);
+    }
+
+    /// Xcode 27's `-###` prints arguments bare and single-quotes the ones a
+    /// shell would split: a path with a space, and the `#`-joined plugin
+    /// paths. Captured from `swiftc -### -disable-batch-mode -c` on Xcode 27.0,
+    /// with the sources under `/Users/me/sp ace`.
+    #[test]
+    fn a_spaced_path_in_an_xcode_27_job_stays_one_token() {
+        let dev = "/Applications/Xcode.app/Contents/Developer";
+        let toolchain = format!("{dev}/Toolchains/XcodeDefault.xctoolchain/usr");
+        let platform = format!("{dev}/Platforms/MacOSX.platform/Developer");
+        let line = format!(
+            "{toolchain}/bin/swift-frontend -frontend -c -primary-file '/Users/me/sp ace/A.swift' \
+             '/Users/me/sp ace/B.swift' -target arm64-apple-macos14.0 -Xllvm -aarch64-use-tbi \
+             -enable-objc-interop -stack-check -sdk {platform}/SDKs/MacOSX27.0.sdk \
+             -no-color-diagnostics -Xcc -fno-color-diagnostics \
+             -new-driver-path {toolchain}/bin/swift-driver -empty-abi-descriptor \
+             -no-auto-bridging-header-chaining -module-name M -disable-clang-spi \
+             -target-sdk-version 27.0 -target-sdk-name macosx27.0 \
+             -external-plugin-path '{platform}/usr/lib/swift/host/plugins#{platform}/usr/bin/swift-plugin-server' \
+             -in-process-plugin-server-path {toolchain}/lib/swift/host/libSwiftInProcPluginServer.dylib \
+             -plugin-path {toolchain}/lib/swift/host/plugins -o A.o"
+        );
+        let jobs = parse_frontend_jobs(&line);
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(
+            primary_file(job).as_deref(),
+            Some("/Users/me/sp ace/A.swift")
+        );
+        assert!(
+            job.iter().any(|t| t == "/Users/me/sp ace/B.swift"),
+            "{job:?}"
+        );
+        let plugin = job
+            .iter()
+            .skip_while(|t| *t != "-external-plugin-path")
+            .nth(1)
+            .unwrap();
+        assert_eq!(
+            plugin,
+            &format!(
+                "{platform}/usr/lib/swift/host/plugins#{platform}/usr/bin/swift-plugin-server"
+            )
+        );
     }
 
     #[test]

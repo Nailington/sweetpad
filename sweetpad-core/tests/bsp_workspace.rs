@@ -26,6 +26,23 @@ fn file_uri(rel: &str) -> String {
     format!("file://{}", fixture(rel))
 }
 
+/// A `bsp-server` command that keeps what a session writes in Cargo's scratch
+/// space for integration tests. The server resolves against the active Xcode,
+/// and the parsed catalog it caches would otherwise land in the user's
+/// `~/.cache/sweetpad`. Its home is there too, as `CFFIXED_USER_HOME`: the
+/// DerivedData locator and the `xcodebuild` a prepare runs both follow that,
+/// not `HOME`, so what the warm-up after `build/initialized` builds stays out
+/// of the user's DerivedData.
+fn bsp_server() -> Command {
+    let home = concat!(env!("CARGO_TARGET_TMPDIR"), "/home");
+    std::fs::create_dir_all(home).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bsp-server"));
+    cmd.env("SWEETPAD_CACHE_DIR", env!("CARGO_TARGET_TMPDIR"))
+        .env("HOME", home)
+        .env("CFFIXED_USER_HOME", home);
+    cmd
+}
+
 fn frame(msg: &Value) -> Vec<u8> {
     let body = msg.to_string();
     format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
@@ -58,7 +75,7 @@ fn run_workspace_session(messages: &[Value], workspace: &str) -> Vec<Value> {
     for m in messages {
         input.extend(frame(m));
     }
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bsp-server"))
+    let mut child = bsp_server()
         .args(["bsp", "--workspace", workspace])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

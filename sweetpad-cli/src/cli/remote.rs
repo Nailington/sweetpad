@@ -278,7 +278,7 @@ fn sync_inputs(
             .any(|part| part == std::path::Component::ParentDir)
         {
             return Err(format!(
-                "input path {} cannot contain `..`",
+                "input path {} cannot contain '..'",
                 input.display()
             ));
         }

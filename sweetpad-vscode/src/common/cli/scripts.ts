@@ -6,7 +6,13 @@ import * as sweetpadLib from "@sweetpad/native";
 import { getBuildServerProvider } from "../../bsp/commands";
 import { getBspConfigFile } from "../../bsp/paths";
 import { assembleBspConfig, hasBspConfig, writeBspConfig } from "../../bsp/write";
-import { detectWorkspaceType, getSwiftPMDirectory, prepareDerivedDataPath } from "../../build/utils";
+import {
+  XcodeCommandBuilder,
+  detectWorkspaceType,
+  getSwiftPMDirectory,
+  prepareDerivedDataPath,
+  xcodeContainerArgs,
+} from "../../build/utils";
 import type { DestinationPlatform } from "../../destination/constants";
 import { getWorkspaceConfig } from "../config";
 import { ExtensionError } from "../errors";
@@ -20,21 +26,6 @@ import { assertUnreachable } from "../types";
 // Injected by rolldown at build time (see rolldown.config.mjs).
 declare const GLOBAL_RELEASE_VERSION: string | undefined;
 
-export type SimulatorOutput = {
-  dataPath: string;
-  dataPathSize: number;
-  logPath: string;
-  udid: string;
-  isAvailable: boolean;
-  deviceTypeIdentifier: string;
-  state: string;
-  name: string;
-};
-
-type SimulatorsOutput = {
-  devices: { [key: string]: SimulatorOutput[] };
-};
-
 export type XcodeScheme = {
   name: string;
 };
@@ -44,14 +35,14 @@ export type XcodeConfiguration = {
 };
 
 /**
- * The build-setting keys `XcodeBuildSettings` actually reads. Passed as a
- * projection to the in-process resolver (`sweetpadLib.buildSettings`) so the
- * launch/destination queries marshal ~10 keys instead of the full ~1.4k-entry
- * map. Raw-map callers (the RPC handlers) intentionally omit this and get every
- * key. The xcodebuild fallback ignores it (xcodebuild has no projection) and
- * returns a superset, which the getters handle.
+ * The build-setting keys `XcodeBuildSettings` reads for a launch. Passed as a
+ * projection to the in-process resolver so the launch queries marshal a few
+ * keys instead of the full ~1.4k-entry map; the locator reads its own on top.
+ * Raw-map callers (the RPC handlers) omit it and get every key. The xcodebuild
+ * route ignores it (xcodebuild has no projection) and returns a superset,
+ * which the getters handle.
  */
-const XCODE_BUILD_SETTINGS_KEYS = [
+const LAUNCH_SETTINGS_KEYS = [
   "WRAPPER_NAME",
   "FULL_PRODUCT_NAME",
   "PRODUCT_NAME",
@@ -61,7 +52,6 @@ const XCODE_BUILD_SETTINGS_KEYS = [
   "PRODUCT_BUNDLE_IDENTIFIER",
   "ENABLE_DEBUG_DYLIB",
   "TARGET_BUILD_DIR",
-  "SUPPORTED_PLATFORMS",
 ];
 
 export function parseCliJsonOutput<T>(output: string): T {
@@ -106,13 +96,13 @@ export function parseCliJsonOutput<T>(output: string): T {
   }
 }
 
-export async function getSimulators(): Promise<SimulatorsOutput> {
-  const simulatorsRaw = await exec({
+/** Run "simctl list --json devices" and return its output, for the addon's "parseSimulators" to read. */
+export async function getSimulatorsJson(): Promise<string> {
+  return await exec({
     command: "xcrun",
     args: ["simctl", "list", "--json", "devices"],
     cwd: null,
   });
-  return parseCliJsonOutput<SimulatorsOutput>(simulatorsRaw);
 }
 
 export type BuildSettingsOutput = BuildSettingOutput[];
@@ -202,72 +192,61 @@ export class XcodeBuildSettings {
     // <EXECUTABLE>.debug.dylib instead of the main binary.
     return this.settings.ENABLE_DEBUG_DYLIB === "YES";
   }
+}
 
-  get supportedPlatforms(): DestinationPlatform[] | undefined {
-    // ex: ["iphonesimulator", "iphoneos"]
-    const platformsRaw = this.settings.SUPPORTED_PLATFORMS; // ex: "iphonesimulator iphoneos"
-    if (!platformsRaw) {
-      return undefined;
-    }
-    return platformsRaw.split(" ").map((platform) => {
-      return platform as DestinationPlatform;
-    });
+/**
+ * The app a build produced, as the shared locator (sweetpad-core's `app_locator`, through the native addon)
+ * found it: the target the scheme's Run action launches, or the one that runs on the destination.
+ */
+export class LaunchableApp {
+  constructor(private readonly located: sweetpadLib.LocatedApp) {}
+
+  get target(): string {
+    return this.located.target;
+  }
+
+  /** The `.app` bundle, to install on a simulator or device. */
+  get appPath(): string {
+    return this.located.path;
+  }
+
+  /** The executable inside the bundle, to run a macOS app. */
+  get executablePath(): string {
+    return this.located.executable;
+  }
+
+  get bundleIdentifier(): string {
+    return this.located.bundleId;
+  }
+
+  /** The bundle's file name, `Control Room.app`. */
+  get appName(): string {
+    return path.basename(this.located.path);
+  }
+
+  /**
+   * CFBundleExecutable: the process name in os_log and syslog output. Usually PRODUCT_NAME, but it can diverge
+   * (spaces stripped, for one).
+   */
+  get executableName(): string {
+    return this.located.settings.EXECUTABLE_NAME ?? path.basename(this.located.executable);
+  }
+
+  get enableDebugDylib(): boolean {
+    // Xcode 15+ Debug Dylib Support: when YES, app code is loaded from
+    // <EXECUTABLE>.debug.dylib instead of the main binary.
+    return this.located.settings.ENABLE_DEBUG_DYLIB === "YES";
   }
 }
 
 /**
- * Locate a scheme's `.xcscheme` file on disk. Searches the container's own
- * `xcshareddata/xcschemes` and each `xcuserdata/<user>.xcuserdatad/xcschemes`,
- * then — for a workspace — every member project's (via the in-process
- * `listWorkspace`). Returns undefined when the scheme has no file (Xcode's
+ * Locate a scheme's `.xcscheme` file on disk: the one `xcodebuild` reads for the container, from
+ * the container itself, its member projects and its local packages, and only the current user's
+ * `xcuserdata` (the addon's `locateScheme`). Returns undefined when the scheme has no file (Xcode's
  * autogenerated default scheme).
  */
 export async function findSchemeFile(container: string, scheme: string): Promise<string | undefined> {
-  const roots = [container];
-  if (container.endsWith(".xcworkspace")) {
-    try {
-      const ws = sweetpadLib.listWorkspace(container);
-      roots.push(...ws.projects);
-    } catch {
-      // Ignore — fall back to whichever candidate exists (or undefined).
-    }
-  }
-
-  for (const root of roots) {
-    const shared = path.join(root, "xcshareddata", "xcschemes", `${scheme}.xcscheme`);
-    if (await isFileExists(shared)) {
-      return shared;
-    }
-    const userScheme = await findUserSchemeFile(root, scheme);
-    if (userScheme) {
-      return userScheme;
-    }
-  }
-  return undefined;
-}
-
-/**
- * Look for `<container>/xcuserdata/<user>.xcuserdatad/xcschemes/<scheme>.xcscheme`
- * across every per-user data directory.
- */
-async function findUserSchemeFile(container: string, scheme: string): Promise<string | undefined> {
-  const userdataDir = path.join(container, "xcuserdata");
-  let entries: string[];
-  try {
-    entries = await fs.readdir(userdataDir);
-  } catch {
-    return undefined;
-  }
-  for (const entry of entries) {
-    if (!entry.endsWith(".xcuserdatad")) {
-      continue;
-    }
-    const candidate = path.join(userdataDir, entry, "xcschemes", `${scheme}.xcscheme`);
-    if (await isFileExists(candidate)) {
-      return candidate;
-    }
-  }
-  return undefined;
+  return sweetpadLib.locateScheme(container, scheme) ?? undefined;
 }
 
 /**
@@ -276,8 +255,11 @@ async function findUserSchemeFile(container: string, scheme: string): Promise<st
  * Pay attention that this function can return an empty array, if the build settings are not available.
  * Also it can return several build settings, if there are several targets assigned to the scheme.
  *
+ * The settings are the ones the extension's builds resolve: `sweetpad.build.args` reaches both routes, so a
+ * `PRODUCT_NAME=`, `-xcconfig` or `-configuration` there changes them as it changes the build.
+ *
  * `keys` (in-process resolver only) restricts the returned settings to those
- * keys; pass it when you read only a handful (see `XCODE_BUILD_SETTINGS_KEYS`).
+ * keys; pass it when you read only a handful (see `LAUNCH_SETTINGS_KEYS`).
  */
 export async function getBuildSettingsList(options: {
   workspaceRoot: string;
@@ -288,58 +270,85 @@ export async function getBuildSettingsList(options: {
   destination?: string;
   keys?: string[];
 }): Promise<XcodeBuildSettings[]> {
-  const derivedDataPath = prepareDerivedDataPath({ workspaceRoot: options.workspaceRoot });
   const workspaceType = detectWorkspaceType(options.xcworkspace);
-
   if (workspaceType === "xcode") {
-    // A customized `build.xcodebuildCommand` (a wrapper that injects env vars,
-    // selects a toolchain, …) must serve the read-only queries too, or the
-    // settings we resolve could disagree with what the wrapper builds.
-    if (isXcodeBuildCommandCustomized()) {
-      return await getBuildSettingsViaXcodebuild({ ...options, derivedDataPath, workspaceType });
-    }
-    try {
-      const result = sweetpadLib.buildSettings({
-        scheme: options.scheme,
-        configuration: options.configuration,
-        sdk: options.sdk ?? undefined,
-        destination: options.destination,
-        derivedDataPath: derivedDataPath ?? undefined,
-        keys: options.keys,
-        // Resolve against the login shell's Xcode (a DEVELOPER_DIR exported in
-        // dotfiles is invisible to the extension host's own env, which is all
-        // the in-process resolver sees). Undefined lets the resolver detect
-        // the active Xcode itself.
-        xcode: await getShellDeveloperDir(options.workspaceRoot),
-        ...(options.xcworkspace.endsWith(".xcworkspace")
-          ? { workspace: options.xcworkspace }
-          : { project: options.xcworkspace }),
-      });
-      return result.map((entry) => new XcodeBuildSettings({ settings: entry.settings, target: entry.target }));
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (getWorkspaceConfig("system.xcodebuildFallback")) {
-        commonLogger.warn("In-process build-settings resolver failed; falling back to xcodebuild", {
-          error: message,
-          scheme: options.scheme,
-          xcworkspace: options.xcworkspace,
-        });
-        return await getBuildSettingsViaXcodebuild({ ...options, derivedDataPath, workspaceType });
-      }
-      throw new ExtensionError(`Failed to resolve build settings: ${message}`, {
-        context: {
-          scheme: options.scheme,
-          configuration: options.configuration,
-          xcworkspace: options.xcworkspace,
-          hint: 'Enable "sweetpad.system.xcodebuildFallback" to retry such failures via xcodebuild.',
-        },
-      });
-    }
+    return await resolveXcodeProject({
+      ...options,
+      inProcess: (native) =>
+        sweetpadLib
+          .buildSettings(native)
+          .map((entry) => new XcodeBuildSettings({ settings: entry.settings, target: entry.target })),
+      viaXcodebuild: (settings) => settings,
+    });
   }
 
   // For SPM we still use xcodebuild
   // TODO: consider implementing this in sweetpad-lib as well
-  return await getBuildSettingsViaXcodebuild({ ...options, derivedDataPath, workspaceType });
+  return await getBuildSettingsViaXcodebuild({ ...options, workspaceType });
+}
+
+/**
+ * Answer a build-settings question about an Xcode project the way `getBuildSettingsList` resolves it: through
+ * the in-process resolver, or through xcodebuild when the user customized `build.xcodebuildCommand` (a wrapper
+ * that injects env vars, selects a toolchain, …, must serve the read-only queries too, or the settings could
+ * disagree with what the wrapper builds) or opted into `sweetpad.system.xcodebuildFallback` and the resolver
+ * failed.
+ */
+async function resolveXcodeProject<T>(options: {
+  workspaceRoot: string;
+  scheme: string;
+  configuration: string;
+  sdk: string | undefined;
+  xcworkspace: string;
+  destination?: string;
+  keys?: string[];
+  inProcess: (native: sweetpadLib.BuildSettingsOptions) => T;
+  viaXcodebuild: (settings: XcodeBuildSettings[]) => T;
+}): Promise<T> {
+  const viaXcodebuild = async () =>
+    options.viaXcodebuild(await getBuildSettingsViaXcodebuild({ ...options, workspaceType: "xcode" }));
+  if (isXcodeBuildCommandCustomized()) {
+    return await viaXcodebuild();
+  }
+  try {
+    return options.inProcess({
+      scheme: options.scheme,
+      configuration: options.configuration,
+      sdk: options.sdk ?? undefined,
+      destination: options.destination,
+      derivedDataPath: prepareDerivedDataPath({ workspaceRoot: options.workspaceRoot }) ?? undefined,
+      // The build runs xcodebuild in the workspace root with these on its command line.
+      buildArgs: getWorkspaceConfig("build.args") ?? [],
+      workingDirectory: options.workspaceRoot,
+      keys: options.keys,
+      // Resolve against the login shell's Xcode (a DEVELOPER_DIR exported in
+      // dotfiles is invisible to the extension host's own env, which is all
+      // the in-process resolver sees). Undefined lets the resolver detect
+      // the active Xcode itself.
+      xcode: await getShellDeveloperDir(options.workspaceRoot),
+      ...(options.xcworkspace.endsWith(".xcworkspace")
+        ? { workspace: options.xcworkspace }
+        : { project: options.xcworkspace }),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (getWorkspaceConfig("system.xcodebuildFallback")) {
+      commonLogger.warn("In-process build-settings resolver failed; falling back to xcodebuild", {
+        error: message,
+        scheme: options.scheme,
+        xcworkspace: options.xcworkspace,
+      });
+      return await viaXcodebuild();
+    }
+    throw new ExtensionError(`Failed to resolve build settings: ${message}`, {
+      context: {
+        scheme: options.scheme,
+        configuration: options.configuration,
+        xcworkspace: options.xcworkspace,
+        hint: 'Enable "sweetpad.system.xcodebuildFallback" to retry such failures via xcodebuild.',
+      },
+    });
+  }
 }
 
 /**
@@ -352,40 +361,41 @@ async function getBuildSettingsViaXcodebuild(options: {
   scheme: string;
   configuration: string;
   sdk: string | undefined;
+  destination?: string;
   xcworkspace: string;
-  derivedDataPath: string | null;
   workspaceType: "xcode" | "spm";
   /** Where to run xcodebuild. Only consulted for Xcode projects — an SPM package names its own. */
   workspaceRoot: string;
 }): Promise<XcodeBuildSettings[]> {
-  const command = getXcodeBuildCommand();
-  const args = [
-    "-showBuildSettings",
-    "-scheme",
-    options.scheme,
-    "-configuration",
-    options.configuration,
-    ...(options.derivedDataPath ? ["-derivedDataPath", options.derivedDataPath] : []),
-    "-json",
-  ];
+  // The builder the builds use, so `sweetpad.build.args` joins the command the way it joins theirs.
+  const command = new XcodeCommandBuilder();
+  command.addOption("-showBuildSettings");
+  command.addParameters("-scheme", options.scheme);
+  command.addParameters("-configuration", options.configuration);
+  const derivedDataPath = prepareDerivedDataPath({ workspaceRoot: options.workspaceRoot });
+  if (derivedDataPath) {
+    command.addParameters("-derivedDataPath", derivedDataPath);
+  }
+  command.addOption("-json");
   if (options.sdk !== undefined) {
-    args.push("-sdk", options.sdk);
+    command.addParameters("-sdk", options.sdk);
+  }
+  if (options.destination !== undefined) {
+    command.addParameters("-destination", options.destination);
   }
   let cwd: string | undefined;
   if (options.workspaceType === "spm") {
     cwd = getSwiftPMDirectory(options.xcworkspace);
   } else if (options.workspaceType === "xcode") {
-    if (options.xcworkspace.endsWith(".xcworkspace")) {
-      args.push("-workspace", options.xcworkspace);
-    } else {
-      args.push("-project", options.xcworkspace);
-    }
+    command.addParameters(...xcodeContainerArgs(options.xcworkspace));
   } else {
     assertUnreachable(options.workspaceType);
   }
+  command.addAdditionalArgs(getWorkspaceConfig("build.args") ?? []);
+  const [executable, ...args] = command.build();
 
   const stdout = await exec({
-    command,
+    command: executable,
     args,
     cwd: cwd ?? options.workspaceRoot,
   });
@@ -431,92 +441,71 @@ export function isXcodeBuildCommandCustomized(): boolean {
 }
 
 /**
- * Extract build settings for the given scheme and configuration to suggest the destination
- * for the user to select
+ * The platforms the scheme's targets build for, to split the destination picker into supported and other
+ * destinations. Read from the targets' authored `SUPPORTED_PLATFORMS` / `SDKROOT` by the CLI's own filter
+ * (sweetpad-core's `SupportedPlatforms`), since resolving settings with no destination would bind a default
+ * platform instead. Undefined, which filters nothing, when that can't be told: a Swift package, an unreadable
+ * project, targets that author neither setting.
  */
-export async function getBuildSettingsToAskDestination(options: {
-  workspaceRoot: string;
+export function getSupportedPlatforms(options: {
   scheme: string;
   configuration: string;
-  sdk: string | undefined;
   xcworkspace: string;
-}): Promise<XcodeBuildSettings | null> {
+}): DestinationPlatform[] | undefined {
   try {
-    // Only `supportedPlatforms` is read here, so project to the launch keys.
-    const settings = await getBuildSettingsList({ ...options, keys: XCODE_BUILD_SETTINGS_KEYS });
-
-    if (settings.length === 0) {
-      return null;
-    }
-    if (settings.length === 1) {
-      return settings[0];
-    }
-    // To ask destination, we might omit the build settings, since they are needed only to
-    // to suggest the destination and nothing bad will happen if we don't have them here
-    return null;
+    const platforms = sweetpadLib.supportedPlatforms(options.xcworkspace, options.scheme, options.configuration);
+    return platforms === null ? undefined : (platforms as DestinationPlatform[]);
   } catch (e) {
-    commonLogger.error("Error getting build settings", {
+    commonLogger.error("Error reading the scheme's supported platforms", {
       error: e,
     });
-    return null;
+    return undefined;
   }
 }
 
 /**
- * Get build settings to launch the app
+ * Find the app the last build of the scheme produced, to install and launch it. The build's own arguments
+ * (`sweetpad.build.args`) are read the way the build reads them, and the pick among the scheme's targets is the
+ * CLI's: the target the scheme's Run action launches, else the app that runs on the destination.
  *
- * Each scheme might have several targets. That's why -showBuildSettings might return different
- * build settings for each target. In the ideal scenario where there is a single target and settings
- * and I just can use first settings object. But there is a cases when there are several targets
- * for the scheme and I need to find which target is set to launch in .xcscheme XML file.
+ * A Swift package builds no `.app`: its first target's executable is what runs.
  */
-export async function getBuildSettingsToLaunch(options: {
+export async function locateBuiltApp(options: {
   workspaceRoot: string;
   scheme: string;
   configuration: string;
   sdk: string | undefined;
   xcworkspace: string;
-  destination?: string;
-}): Promise<XcodeBuildSettings> {
-  // Hot launch path: the result feeds only XcodeBuildSettings' getters, so
-  // project to those keys.
-  const settings = await getBuildSettingsList({ ...options, keys: XCODE_BUILD_SETTINGS_KEYS });
-
-  // Build settings are required to run the app because we use them to locate the executable file or
-  // the .app bundle. So let's just give up here if -showBuildSettings didn't return anything.
-  if (settings.length === 0) {
-    throw new ExtensionError("Empty build settings");
-  }
-
-  // I think this is the most common case, when there is only one target in the scheme. Higly likely that
-  // this is the target to launch. Technically, scheme mightn't have any target to launch, but I believe
-  // this is a rare case.
-  if (settings.length === 1) {
-    return settings[0];
-  }
-
-  // > 1 target in the scheme: pick the one the scheme launches by reading the
-  // LaunchAction's runnable via the in-process scheme parser (no workspace-XML
-  // parse). findSchemeFile covers both shared and user schemes.
-  const schemeFile = await findSchemeFile(options.xcworkspace, options.scheme);
-  if (schemeFile) {
-    try {
-      const launchTarget = sweetpadLib.parseScheme(schemeFile).launchTarget?.blueprintName;
-      const targetSettings = settings.find((s) => s.target === launchTarget);
-      if (targetSettings) {
-        return targetSettings;
-      }
-    } catch (e) {
-      commonLogger.warn("parseScheme failed; using the first resolved target", {
-        error: e,
-        schemeFile,
-      });
+  destination: string | undefined;
+}): Promise<LaunchableApp> {
+  if (detectWorkspaceType(options.xcworkspace) === "spm") {
+    const [first] = await getBuildSettingsList({ ...options, keys: LAUNCH_SETTINGS_KEYS });
+    if (!first) {
+      throw new ExtensionError("Empty build settings");
     }
+    return new LaunchableApp({
+      target: first.target,
+      path: first.appPath,
+      bundleId: first.bundleIdentifier,
+      executable: first.executablePath,
+      settings: first.settings,
+    });
   }
-
-  // No on-disk scheme, or its launch target didn't match a resolved target:
-  // fall back to the first resolved target.
-  return settings[0];
+  const located = await resolveXcodeProject({
+    ...options,
+    keys: LAUNCH_SETTINGS_KEYS,
+    inProcess: (native) => sweetpadLib.locateApp(native),
+    viaXcodebuild: (settings) =>
+      sweetpadLib.pickApp({
+        targets: settings.map((entry) => ({ target: entry.target, settings: entry.settings })),
+        container: options.xcworkspace,
+        scheme: options.scheme,
+        destination: options.destination,
+        sdk: options.sdk,
+        keys: LAUNCH_SETTINGS_KEYS,
+      }),
+  });
+  return new LaunchableApp(located);
 }
 
 /**
@@ -575,75 +564,16 @@ export async function getIsXBSInstalled() {
 }
 
 /**
- * Run `swift package dump-package` in a package directory and parse the model.
- * A manifest is Swift source, so the toolchain is the only thing that can say
- * what a package declares — there is no file to read instead.
+ * The toolchain the addon evaluates manifests with. A manifest is Swift source,
+ * so naming what a package declares means running `swift package dump-package`,
+ * and the extension host sees neither the login shell's `DEVELOPER_DIR` nor a
+ * custom `sweetpad.build.swiftCommand` on its own.
  */
-async function dumpPackage(packageDir: string): Promise<any> {
-  const stdout = await exec({
-    command: getSwiftCommand(),
-    args: ["package", "dump-package"],
-    cwd: packageDir,
-  });
-  return JSON.parse(stdout);
-}
-
-/**
- * The package's products as SwiftPM sees them: the ones the manifest declares,
- * whatever their kind (a `.plugin` product is one too), plus the implicit
- * executable product SwiftPM synthesizes for each `executableTarget` no
- * declared product already covers.
- *
- * `dump-package` reports only what the manifest wrote — `swift package
- * describe` is what shows the implicit ones, and it resolves the whole
- * dependency graph to do it.
- */
-function packageProducts(packageInfo: any): string[] {
-  const declared: string[] = (packageInfo?.products ?? [])
-    .map((product: any) => product?.name)
-    .filter((name: unknown): name is string => typeof name === "string");
-  const covered = new Set<string>(
-    (packageInfo?.products ?? []).flatMap((product: any) =>
-      (product?.targets ?? []).filter((name: unknown): name is string => typeof name === "string"),
-    ),
-  );
-  const implicit: string[] = (packageInfo?.targets ?? [])
-    .filter((target: any) => target?.type === "executable")
-    .map((target: any) => target?.name)
-    .filter((name: unknown): name is string => typeof name === "string" && !covered.has(name));
-  return [...declared, ...implicit];
-}
-
-/**
- * Scheme names for a package opened on its own, matching what `xcodebuild
- * -list` prints in a package directory. How many products the package has
- * decides the shape (measured on Xcode 26.5):
- *
- * - none: the `<name>-Package` aggregate alone;
- * - one: `<name>` alone — the package's own name, whatever the product is
- *   called, and no aggregate;
- * - two or more: the aggregate plus one scheme per product.
- *
- * Exported for its spec: the rule is subtle enough that this copy would drift
- * from `Manifest::scheme_names` in the CLI without one.
- */
-export function packageSchemes(packageInfo: any): string[] {
-  const name = typeof packageInfo?.name === "string" ? packageInfo.name : "";
-  const products = packageProducts(packageInfo);
-  if (products.length === 1 && name) {
-    return [name];
-  }
-  return name ? [`${name}-Package`, ...products] : products;
-}
-
-/**
- * Every target a package declares, tests included — a target list drives
- * `-only-testing:`, where a test target is the whole point.
- */
-function packageTargets(packageInfo: any): string[] {
-  return (packageInfo?.targets ?? [])
-    .map((target: any) => target?.name)
-    .filter((name: unknown): name is string => typeof name === "string");
+async function manifestToolchain(container: string): Promise<sweetpadLib.ManifestToolchain> {
+  return {
+    swift: getWorkspaceConfig("build.swiftCommand") || undefined,
+    developerDir: await getShellDeveloperDir(path.dirname(container)),
+  };
 }
 
 export async function getSchemes(options: { xcworkspace: string | undefined }): Promise<XcodeScheme[]> {
@@ -652,11 +582,13 @@ export async function getSchemes(options: { xcworkspace: string | undefined }): 
   const workspaceType = detectWorkspaceType(options.xcworkspace ?? "");
   if (workspaceType === "spm") {
     try {
-      const packageDir = getSwiftPMDirectory(options.xcworkspace ?? "");
-      const packageInfo = await dumpPackage(packageDir);
-
-      const schemeNames = new Set<string>(packageSchemes(packageInfo));
-      return Array.from(schemeNames).map((name) => ({ name }));
+      // What `xcodebuild -list` prints in the package directory, the package's
+      // `.swiftpm/xcode` scheme files included. The addon evaluates the
+      // manifest without writing into the package.
+      const xcworkspace = options.xcworkspace ?? "";
+      return (await sweetpadLib.schemes(xcworkspace, await manifestToolchain(xcworkspace))).map((name) => ({
+        name,
+      }));
     } catch (error) {
       commonLogger.error("Failed to get SPM package info", {
         error,
@@ -672,7 +604,8 @@ export async function getSchemes(options: { xcworkspace: string | undefined }): 
     }
     // Already merged and sorted in Rust, member packages included. A promise
     // because a workspace with local packages has to evaluate their manifests.
-    return (await sweetpadLib.schemes(options.xcworkspace)).map((name) => ({ name }));
+    const toolchain = await manifestToolchain(options.xcworkspace);
+    return (await sweetpadLib.schemes(options.xcworkspace, toolchain)).map((name) => ({ name }));
   }
   assertUnreachable(workspaceType);
 }
@@ -681,8 +614,9 @@ export async function getTargets(options: { xcworkspace: string }): Promise<stri
   const workspaceType = detectWorkspaceType(options.xcworkspace);
   if (workspaceType === "spm") {
     try {
-      const packageDir = getSwiftPMDirectory(options.xcworkspace ?? "");
-      return packageTargets(await dumpPackage(packageDir));
+      // Every target the manifest declares, tests included: a target list
+      // drives `-only-testing:`, where a test target is the whole point.
+      return await sweetpadLib.targets(options.xcworkspace, await manifestToolchain(options.xcworkspace));
     } catch (error) {
       commonLogger.error("Failed to get SPM targets", {
         error: error,
@@ -695,7 +629,7 @@ export async function getTargets(options: { xcworkspace: string }): Promise<stri
   if (workspaceType === "xcode") {
     // Member projects first, then each local package's targets — merged in
     // Rust, which is why this is a promise.
-    return await sweetpadLib.targets(options.xcworkspace);
+    return await sweetpadLib.targets(options.xcworkspace, await manifestToolchain(options.xcworkspace));
   }
   assertUnreachable(workspaceType);
 }
@@ -875,8 +809,9 @@ async function seedBspConfig(options: {
     if (await hasBspConfig(workspaceRoot)) {
       return;
     }
-    // A null scheme resolves to the project's default until BspService, which
-    // sees a buildServer.json of ours only after this call, rewrites it.
+    // A null scheme resolves to the project's default, and a null destination
+    // platform leaves shared files to the scheme, until BspService, which sees
+    // a buildServer.json of ours only after this call, rewrites it.
     await writeBspConfig(
       assembleBspConfig({
         workspacePath: workspaceRoot,
@@ -884,7 +819,9 @@ async function seedBspConfig(options: {
         developerDir: (await getDeveloperDir({ workspaceRoot: workspaceRoot })) ?? null,
         scheme: options.scheme ?? null,
         configuration: options.configuration ?? "Debug",
+        destinationPlatform: null,
         derivedDataPath: prepareDerivedDataPath({ workspaceRoot: workspaceRoot }) ?? null,
+        buildArgs: getWorkspaceConfig("build.args") ?? [],
       }),
     );
   } catch (error) {
@@ -930,7 +867,7 @@ async function generateXBSBuildServerConfig(options: {
     args = ["config", "-scheme", options.scheme];
   } else if (workspaceType === "xcode") {
     cwd = options.workspaceRoot;
-    args = ["config", "-workspace", options.xcworkspace, "-scheme", options.scheme];
+    args = ["config", ...xcodeContainerArgs(options.xcworkspace), "-scheme", options.scheme];
   } else {
     assertUnreachable(workspaceType);
   }

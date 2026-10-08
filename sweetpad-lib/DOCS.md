@@ -65,7 +65,7 @@ suites); `cargo fmt --check` clean. Settings-resolution scores
 mismatch corpus-wide is `CLANG_COVERAGE_MAPPING` ×2 — a capture gap, not a
 resolver bug (see [§11](#11-roadmap--open-work)). The June 2026 audit's P0/P1
 findings were fixed in `51bb938`, except the extension-side packaging item
-P0.3 (see [§11.2](#112-audit-follow-ups-june-2026)).
+P0.3 (see [§11.2b](#112b-audit-follow-ups-june-2026)).
 
 ## 2. Repository layout
 
@@ -151,6 +151,31 @@ another.
 
 - `cargo test` runs the unit tests plus every oracle, which scores the full
   pipeline against every committed capture.
+- `cargo test` writes nothing into the user's `~/.cache/sweetpad`. A test that
+  resolves against the active Xcode caches the parsed catalog in Cargo's
+  `CARGO_TARGET_TMPDIR` (`SWEETPAD_CACHE_DIR` for a spawned `bsp-server`,
+  `catalog_cache` for an in-process resolve) or, as a unit test, in a temp
+  directory of its own.
+- `cargo test` writes nothing into the user's `~/.local/state/sweetpad`
+  either. A spawned `sweetpad` gets an `XDG_STATE_HOME` of its own. An
+  in-process test that reaches state, like the package-members cache in
+  `spm_graph_oracle`, calls `common::keep_state_in_target_tmpdir`, which pins
+  `paths::state_dir` to `CARGO_TARGET_TMPDIR`. A unit test hands the code a
+  path in a temp directory of its own.
+- `cargo test` builds nothing into the user's
+  `~/Library/Developer/Xcode/DerivedData`. A spawned `bsp-server` that
+  warms up after `build/initialized` gets a `CFFIXED_USER_HOME` in
+  `CARGO_TARGET_TMPDIR`, which the DerivedData locator and `xcodebuild` both
+  follow, or a `--derived-data-path`. `HOME` doesn't move DerivedData:
+  `xcodebuild` reads the account's home from the user database, and so does
+  `host::home`. A spawned `sweetpad` whose `HOME` a test redirects gets the
+  same `CFFIXED_USER_HOME`.
+- A test makes its fixtures in a directory that goes when the test ends, a
+  failed one included. There is one such guard, `scratch::ScratchDir` in this
+  crate, which sweetpad-core re-exports. This crate's tests and the CLI's take
+  it as `TempDir` (`src/testdir.rs`), which panics instead of returning an
+  error. The CLI's tests and this crate's integration tests include that file
+  by path, since they can't see this crate's test code.
 - After **every** capture or resolver change, re-run the full oracle suite on
   **all** captured versions — a fix for one version must not silently regress
   another.
@@ -196,7 +221,12 @@ pinned ref recorded in `corpus/manifest.json`; the captures are committed under
   index-store snapshots, PATH-shim `tool-invocations.jsonl`,
   stdout/stderr/exit code under `build/<scheme>__<config>__<dest>/`.
 - **Per-version Apple spec data** in `xcspec-cache/xcode-<ver>/`: all
-  `*.xcspec` under the Xcode app, all `SDKSettings.plist`, SDK paths.
+  `*.xcspec` under the Xcode app, all `SDKSettings.plist` plus the
+  version-named symlinks beside each SDK (`MacOSX27.0.sdk -> MacOSX.sdk`), and
+  SDK paths. The resolver names `SDKROOT` after the symlink that spells the
+  SDK's canonical name, as xcodebuild does. The 15.4, 16.4 and 26.5 captures
+  have no symlinks (re-run `04_snapshot_xcspecs.py --force` on that Xcode to
+  add them), so their oracle-mode `SDKROOT` names the bare `MacOSX.sdk`.
 - **Compiler-args oracles** under `compiler-args/` — see
   [§7.2](#72-the-oracle-capture-and-scoring).
 
@@ -223,16 +253,18 @@ Hand-built fixtures cover paths no real corpus project exercises:
 | `_synthetic-custom-config` | A third configuration `Profile`: config-name-driven selection + a `[config=Profile]` xcconfig override (`scripts/15_custom_configuration.py`) |
 | `metadata/_synthetic/<override>` (under alamofire) | `KEY=VALUE` xcodebuild overrides for flags no real project enables: library evolution, LTO, arm64e, Swift 6, mergeable libraries… (`scripts/07_synthetic_overrides.py`) |
 | `_synthetic-staticlib` | `libtool -static` link + ObjC++ (`.mm`) language gate (`scripts/17_static_library.py`) |
-| `_synthetic-rich` | Rich settings: UBSan (+ sub-checks), exceptions, hidden visibility, warnings, `SWIFT_STRICT_CONCURRENCY = complete` (`scripts/18_rich_settings.py`) |
+| `_synthetic-rich` | Rich settings: UBSan (+ sub-checks), exceptions, hidden visibility, warnings, `SWIFT_STRICT_CONCURRENCY = complete` (`scripts/18_rich_settings.py`). Built for all six platforms (`--platform`), which is where the compiler-args oracle's per-`(version, sdk)` cells come from |
 | `_synthetic-multimodule` | App + two framework targets with a real cross-module `import` — the BSP pilot fixture (`scripts/19_multimodule.py`) |
 | `_synthetic-objc-headers` | ObjC header search paths for the BSP loop (`scripts/20_objc_headers.py`) |
 | `_synthetic-headermaps` | The ObjC imports only Xcode's header maps and generated-sources dirs resolve — a sibling dir's header, a mixed target's `-Swift.h`, a framework target's public header, with no `HEADER_SEARCH_PATHS` anywhere (`scripts/23_header_maps.py`) |
 | `_synthetic-multiplatform` | One `SDKROOT = auto` target with `SUPPORTED_PLATFORMS = iphoneos iphonesimulator macosx` — the IceCubesApp shape that keeps the SDK-binding regression in CI |
 | `_synthetic-{coredata,assetsym,strcat,intents,cocoapods,macro,tests}` | BSP generated-source / CocoaPods / Swift-macro / XCTest coverage — each a forced `Probe*.swift` referencing a build-time-generated / Pod / macro-expanded symbol |
 | `_synthetic-spm`, `_synthetic-workspace` | SwiftPM package products (`-F …/PackageFrameworks`); multi-project `.xcworkspace` resolution |
+| `_synthetic-destination-platforms` | The SDK one run destination binds each target of a scheme to: an iOS app Designed for iPad or Mac Catalyst under `platform=macOS`, a macOS app beside an iOS app under either destination (`tests/destination_platform_oracle.rs`) |
+| `_synthetic-search-paths` | `FRAMEWORK_SEARCH_PATHS`, `HEADER_SEARCH_PATHS` and `LIBRARY_SEARCH_PATHS` authored without `$(inherited)` keep the products dir in front, and the Swift arguments keep its `-F` (`tests/search_paths_oracle.rs`) |
 | `_synthetic-spm-graph` | One workspace reaching a local package six ways — its own `FileRef` member, the member project's declared package, both of their `.package(path:)` dependencies, and two under a `PBXFileSystemSynchronizedRootGroup` — plus a package carrying a `.swiftpm/xcode` scheme container and one whose only target is an `executableTarget` (`tests/spm_graph_oracle.rs` in sweetpad-core) |
 | `_global` | Per-SDK metadata (`sdks/<sdk>.json`), xcodebuild version banner |
-| `_tuist-src` | Generated tuist examples adding a command-line tool (`mh_execute`) and a standalone dynamic library (`mh_dylib`) to the compiler-args oracle |
+| `_tuist-src` | Generated tuist examples adding a command-line tool (`mh_execute`) and a standalone dynamic library (`mh_dylib`) to the compiler-args oracle. `16_capture_compiler_args.py --slug _tuist-src` resolves `corpus/_tuist-src`, which is a symlink to `corpus/tuist-fixtures/examples/xcode/generated_command_line_tool_with_dynamic_library`; 16 does not copy `raw/`, so a new version needs the `.xcodeproj` copied in by hand |
 
 ### 4.4 Capture scripts index
 
@@ -304,7 +336,10 @@ bundled-SDK bump, which the canonicalizer strips), so the newest released minor
 is the single best representative of a major; per-minor sweeps are explicitly
 not done. A refresh = capture the new minor, then drop the old one entirely
 ([§10](#10-runbook-updating-xcode-versions)). Apple jumped 16 → 26 (no 17–25);
-on macOS 26 the realistically capturable majors are 26, 16, 15.
+on macOS 27 the realistically capturable majors are 27, 26, 16, 15. Adding a
+major is cheaper than refreshing one: nothing is dropped, so none of §10.7's
+repointing applies — only the *additive* hardcodes need a new arm (the seven
+floor tables and `tests/serializer_roundtrip.rs`'s per-version allowlist).
 
 Capturing a **new major is the highest-ROI coverage move**: version-conditional
 keystone bugs (e.g. `XCODE_VERSION_MAJOR` nested expansion, the `DEVELOPER_DIR`
@@ -322,6 +357,7 @@ without reinstalling the Xcode.
 
 | Xcode | Captured | Notes |
 |---|---|---|
+| `27.0.0` | Full corpus (all 5 projects) | Newest major — 1036 captures; per-target + project-defaults + scheme build-settings across iOS/tvOS/watchOS/visionOS simulators + macOS + synthetic + xcconfig, all at parity with 26.5. Compiler-args cover all six platforms via the synthetic fixtures; the corpus projects' own cells are lost to the new deployment-target floors ([§5.4](#54-the-corpus-wall-older-majors)). Behaviour deltas modelled ([§11.2](#112-xcode-27-behaviour-deltas-modelled)) |
 | `26.5.0` | Full corpus (all 5 projects) | Latest non-beta 26.x — refreshed from 26.0.1 (dropped); per-target + project-defaults + 568 scheme captures across iOS/tvOS/watchOS/visionOS simulators + macOS + synthetic + xcconfig; all oracle sources |
 | `16.4.0` | alamofire, kingfisher (per-target + project-defaults + macOS scheme) | Second major; ice-cubes incompatible (Swift-tools 6.2 manifests); iOS scheme captures need the user-gated `xcodebuild -downloadPlatform iOS` |
 | `15.4.0` | kingfisher, tuist-fixtures (per-target + project-defaults + macOS scheme) | Third major; exposed two undomained-xcspec parser bugs (`PACKAGE_TYPE`/`BUNDLE_FORMAT` clobber, fixed) and a family of 16+-calibrated built-in rules now version-gated (see `tests/version_and_optimization_gates.rs` and the `legacy_xcode15` gates in `src/project.rs`); alamofire/netnewswire/ice-cubes walled off (objectVersion 76/77, Swift-tools 6.2) |
@@ -361,6 +397,30 @@ needs **era-appropriate refs** — pin each corpus project to a tag whose
 pbxproj objectVersion / Swift-tools the target Xcode supports. The shared
 single-clone model breaks here; older majors may need per-version checkouts.
 
+The same wall blocks the **newest** major, and there it stops builds rather
+than parsing. Xcode 27 raised the minimum deployment targets and the pinned
+refs sit under the new floors — Alamofire declares macOS 10.12 (floor 12.0),
+iOS and tvOS 10.0 (floor 15.0), watchOS 3.0 (floor 9.0); Kingfisher declares macOS
+10.15 and its demo app 11.0. All of them built on 26.5. `-showBuildSettings`
+does not care, so every settings oracle captures normally; only the
+compiler-args oracle ([§7.2](#72-the-oracle-capture-and-scoring)), which needs a
+real build, loses those cells.
+
+The synthetic fixtures are the way out, and they are why the wall costs nothing
+on 27. `_synthetic-rich` is authored with `SDKROOT = auto`, a
+`SUPPORTED_PLATFORMS` list, and deployment targets above every floor, so
+`scripts/18_rich_settings.py --platform <slug>` builds the same scratch project
+for macOS, iOS, iOS-sim, tvOS, watchOS and visionOS. That gives the oracle a
+cell per `(version, sdk)` without depending on what a pinned OSS project happens
+to declare. Prefer this to the two alternatives: bumping the pins costs the
+shared-sources property that makes `scripts/14_compare_versions.py` meaningful
+and forces a full recapture, and capturing under deployment-target overrides
+means teaching the resolver the same overrides to keep the comparison honest.
+
+A corpus project is still the better witness for *shape* — real framework and
+app targets, workspaces, extensions — so the corpus cells remain worth having
+whenever the pins allow them.
+
 ## 6. Settings resolution
 
 ### 6.1 Scope
@@ -370,7 +430,9 @@ the Apple xcspec/SDKSettings defaults. This includes signing settings that are
 pass-through or per-SDK/per-platform defaults: `DEVELOPMENT_TEAM` (resolved via
 self-reference inheritance — `KEY = $(KEY)` inherits the lower layer), the
 literal `CODE_SIGN_IDENTITY` per-SDK default (`-` on simulators,
-`Apple Development` on macOS), `CODE_SIGN_STYLE`, the
+`Apple Development` on macOS, and `-` for a macOS app, tool or test bundle
+with no `DEVELOPMENT_TEAM` and no authored identity, whatever
+`CODE_SIGNING_ALLOWED` says), `CODE_SIGN_STYLE`, the
 `ENABLE_HARDENED_RUNTIME` per-platform default, and the `maccatalyst.`
 `PRODUCT_BUNDLE_IDENTIFIER` prefix.
 
@@ -558,6 +620,10 @@ the build server via `buildTarget/prepare` — *we* must produce the modules.
   (`build_settings::resolve_file_arguments`; Swift = the module's swiftc
   invocation, clang = gated to the file's language), editor mode (strips
   `-explicit-module-build`/emit/`-c`, advertises the build's index store).
+  The index store is in the DerivedData folder `xcodebuild` writes, which is
+  named by the hash of the container's standardized path
+  (`derived_data::container_hash`), so a root opened through a symlink or
+  spelled `/private/tmp/…` points at that folder too.
   Server: `bsp-server bsp` — `build/initialize`, `workspace/buildTargets`,
   `buildTarget/sources` (+ `inverseSources`), `textDocument/sourceKitOptions`,
   `buildTarget/didChange` with a poll-based pbxproj watcher, shutdown/exit;
@@ -594,7 +660,13 @@ the build server via `buildTarget/prepare` — *we* must produce the modules.
   - a failure is recorded and pushed as a `failed` status, which the
     extension's Doctor reports. The reply is still sent — a missing one wedges
     sourcekit-lsp's semantics for that target — so the failure needs a channel
-    of its own.
+    of its own;
+  - the build keeps the user's `TMPDIR`, where SwiftPM's locks are shared, and
+    the build service's `swiftc --version` leaves a `TemporaryDirectory.*`
+    there. Once the build exits, the server removes each new one that holds
+    only the driver's `.keep-directory` (`scratch::TmpdirLeftovers`, which the
+    CLI's builds use too), unless a Swift driver with that `TMPDIR` is running
+    or a process names it.
 
   The `swiftc` fast path below produces no header maps, but needs none: it
   requires the whole closure to be pure Swift.
@@ -603,7 +675,12 @@ the build server via `buildTarget/prepare` — *we* must produce the modules.
   products, C-family sources, script phases, or build rules), emit each
   dependency with `swiftc -emit-module` directly (topo order, reusing the
   editor args; ~1s vs ~5s), falling back to the v2 xcodebuild path for any
-  non-self-buildable closure or failed self-build. Remaining for "full" v3:
+  non-self-buildable closure or failed self-build. The `swiftc`s share a
+  `TMPDIR` that the server removes when it exits, and exiting kills a
+  `swiftc` that is still running, as it does a prepare `xcodebuild`. The
+  server inherits the user's `TMPDIR`, and the driver leaves a
+  `TemporaryDirectory.*` in its `TMPDIR` when it dies before it finishes.
+  Remaining for "full" v3:
   per-target mixing, code-gen-resource classification, owning more
   output-layout geometry for mixed-language deps.
 
@@ -650,9 +727,27 @@ CI (`.github/workflows/sweetpad-lib.yaml`) runs the fast tier — fmt, clippy
 `-D warnings`, `cargo test` — on every push/PR; the build-gated tiers run
 locally/nightly against the corpus.
 
-**Expand later:** the build-gated BSP oracles (Layers 0/2, corpus run) are
-pinned to **Xcode 26.5 only**; expand to 15.4/16.4 by keying the harness by
-version like the compiler-args oracle. The fast hermetic tiers are
+The build-gated oracles (Layers 0/2, `tests/bsp_prepare.rs`, the corpus run
+and the live differential) build with the Xcode that `BSP_ORACLE_XCODE` names
+(the `.app` or its `Developer` directory), or else with the selected one
+(`DEVELOPER_DIR`, then `xcode-select -p`). `tests/oracle_xcode/` holds that
+choice for all of them. Except for `bsp_prepare`, their `xcodebuild`,
+`sourcekit-lsp` and toolchain runs get a `TMPDIR` of the test's own, which goes
+when the test ends. The live differential resolves against the specs of that
+same Xcode, not a committed `xcspec-cache/` capture.
+
+The live differential compares each target on the platforms its
+`SUPPORTED_PLATFORMS` names, read under the target's own `SDKROOT` the way a
+plain `-showBuildSettings` reads it. A device or macOS platform is bound with
+`-target … -sdk`. A simulator platform is bound to a concrete simulator
+through the scheme that builds the target (`-scheme … -destination id=…`),
+since every simulator build runs on one: with `-sdk iphonesimulator` alone,
+xcodebuild keeps the full `ARCHS` that a Debug simulator build collapses to
+the active arch, and the resolver models the build. Where no scheme or no
+simulator is available, the cell falls back to `-sdk` and skips `ARCHS`,
+`ONLY_ACTIVE_ARCH` and `BUILD_ACTIVE_RESOURCES_ONLY`. The asserted keys are the
+SDK, platform, arch and triple inputs plus `SWIFT_ACTIVE_COMPILATION_CONDITIONS`,
+`GCC_PREPROCESSOR_DEFINITIONS` and `SWIFT_VERSION`. The fast hermetic tiers are
 version-agnostic.
 
 ### 8.4 Engine fixes the harness drove (knowledge catalog)
@@ -746,7 +841,10 @@ unit tests rather than a corpus capture.
 | `<Name>-<hash>` collapses whitespace runs in the name to `_`; the bare `<Name>` keeps them | ✅ | src/derived_data.rs (`hashed_name_collapses_whitespace_runs_only`, `hashed_name_leaves_every_other_character_alone`, `stock_layout_collapses_whitespace_in_the_folder_name`, `workspace_relative_style_keeps_whitespace_verbatim`) |
 | `BuildLocationStyle = CustomLocation` × {Absolute, RelativeToDerivedData, RelativeToWorkspace} | ✅ | src/derived_data.rs (`custom_location_*`) |
 | Precedence: `CustomLocation` outranks `-derivedDataPath`, which outranks the container's DerivedData style | ✅ | src/derived_data.rs (`custom_location_outranks_the_derived_data_path_flag`) |
+| `xcodebuild -project` keys DerivedData by the `.xcodeproj` even when a workspace beside it lists it (Xcode 27, `info.plist` `WorkspacePath`); only a declared workspace keys it by the workspace | ✅ | sweetpad-core/src/build_context.rs (`a_project_beside_a_workspace_that_lists_it_keys_derived_data_by_itself`) |
 | Ignored by xcodebuild: the `xcshareddata` copy, `DeterminedByTargets`, app-wide `IDEBuildLocationStyle` | ✅ | src/derived_data.rs (`ignores_the_shared_settings_copy`, `determined_by_targets_is_a_no_op`) |
+| A moved `SYMROOT` / `OBJROOT` / `DSTROOT` / `CONFIGURATION_BUILD_DIR` (and the other locations xcodebuild settles) folded lexically, a relative one read against the project's directory, and the settings built from it following; `BUILD_DIR` and every other path setting keep their spelling (Xcode 27.0, command line, `-xcconfig` and project) | ✅ | sweetpad-core/tests/build_location_fold_oracle.rs; sweetpad-core/src/build_context.rs (`FOLDED_LOCATIONS`) |
+| The container's own folder (`Locations::folder`), where the index and logs stay under a custom build location; `derived-data`, `clean --purge`, `open dd` and the BSP index find it through this locator | ✅ | src/derived_data.rs (`the_app_wide_root_is_the_custom_location_in_xcodes_preferences`); sweetpad-cli/tests/derived_data_purge.rs; sweetpad-core/tests/bsp_conformance.rs (`bsp_index_store_follows_xcodes_derived_data_location`) |
 
 ### Target / product types
 
@@ -895,6 +993,7 @@ answers to the package name too. `Manifest::scheme_names` in
 | `appletvos` / `appletvsimulator` | ✅ | fixtures/alamofire/.../schemes/Alamofire tvOS |
 | `xros` / `xrsimulator` (visionOS) | ✅ | fixtures/ice-cubes/.../schemes/IceCubesApp (visionOS-Simulator captures) |
 | Mac Catalyst variant | ✅ | fixtures/ice-cubes/.../schemes/IceCubesApp/build-settings/Debug__macOS.json |
+| The SDK a destination binds per target: `platform=macOS` builds an iOS app Designed for iPad (`iphoneos`) or for Mac Catalyst, chosen per scheme; a target that can't run on the destination builds for its own platform | ✅ | fixtures/_synthetic-destination-platforms/xcode-27.0.0/captures/*.json (`tests/destination_platform_oracle.rs`) |
 | DriverKit | ❌ | — |
 
 ### Architectures
@@ -1188,6 +1287,10 @@ If the flag is accepted, the spawn in `sweetpad-core` that resolves the local
 package graph's schemes (issue #327) can lean on it for the common case —
 it is one spawn per package, so a graph pays the most.
 
+**Still absent in Xcode 27** (Swift 6.4): the probe returns `error: Unknown
+option '--experimental-manifest-processing-mode'`. The spawn stays as it is;
+re-probe on the next major.
+
 ### 10.8 Green, docs, commit
 
 - `cargo test` (all versions green), `cargo fmt`, `cargo clippy --tests`.
@@ -1218,6 +1321,32 @@ Keep the new Xcode app + the other majors' apps if still capturing.
 - **07 doesn't self-set `DEVELOPER_DIR`** — export it when running directly.
 - **`--no-runtime`** only skips the builds; 02 still captures simulator
   destinations if runtimes are installed.
+
+Four more the Xcode 27 capture hit, all fixed in the repo:
+
+- **An Xcode installed as `/Applications/Xcode.app`** is invisible to
+  `discover_installed_xcodes()`, which matches `Xcode-<ver>.app` only. A
+  symlink beside it is enough and needs no sudo, but then `xcodebuild` reports
+  paths through the *real* app name while the resolver uses the symlinked one;
+  `canon_path_token` now splits a `-L`/`-I`/`-F`/`-isystem` prefix off a token
+  before canonicalizing, which is what made `OTHER_LDFLAGS` agree. That split
+  is for the oracle. When resolving against a live Xcode, `xcode::locate`
+  canonicalizes the install, so a symlinked `DEVELOPER_DIR` resolves through
+  the real app name as `xcodebuild` does, and both spellings share one catalog
+  cache file. `xcode::install_at`, behind the extension's `xcodeVersion`,
+  reports the Developer directory through the same real path.
+- **`01_clone_corpus.py` re-resolves `latest-release`** whenever a clone is
+  missing, so re-materialising the corpus for a new version silently moves the
+  pins. Use **`--from-manifest`** to clone each project at its recorded SHA.
+- **A fresh clone skips `tuist generate`**, because the manifest still records
+  `generated: true` from the previous host. The check now also requires the
+  `.xcodeproj` to be on disk. Worth watching: `tuist-fixtures` is ~76% of all
+  corpus keys, so this failure is near-silent and very expensive.
+- **The preflight demanded `xcodes`** even when every requested version was
+  already installed and the acquire step is a no-op; it is now gated on
+  actually needing an install. The validate step likewise still ran
+  `cargo test --test <oracle>` from `sweetpad-lib`, where those targets stopped
+  living at the crate split — it now passes `-p sweetpad-core` / `-p sweetpad-cli`.
 
 ## 11. Roadmap & open work
 
@@ -1333,7 +1462,37 @@ Mac-host capture steps
 (A1, A3, D16, D17) need a macOS machine with the corpus Xcodes; everything
 else runs anywhere against committed fixtures.
 
-### 11.2 Audit follow-ups (June 2026)
+### 11.2 Xcode 27 behaviour deltas (modelled)
+
+Capturing 27 surfaced seven settings the resolver got wrong on that major and
+only that major; all are modelled now and 27's systematic-mismatch tally is
+back to zero, level with every other version. Each was grounded in the 27
+corpus and unanimous across the targets it touches. Kept here because the
+*shape* recurs: this is what a new major's first tally looks like.
+
+| Key | Misses | Ours | Xcode 27 | Where it comes from |
+|---|---|---|---|---|
+| `SYSROOT` | 154 | `""` | the SDK path (`= SDKROOT`) | New in 27's `Swift.xcspec`/`Ld.xcspec` as a `Path` option with **no `DefaultValue`**, gated on `$(SWIFTC_PASS_SYSROOT)`. 26.5 never emitted the key at all, so it was never a shared key |
+| `SWIFTC_PASS_SYSROOT` | 154 | `YES` | `NO` | New in 27's `CoreBuildSystem.xcspec` with a bare `DefaultValue = YES` and no `Condition`, yet xcodebuild reports `NO` on every target. Nothing in the spec tree or any `SDKSettings.plist` says `NO` — the build system overrides its own declared default |
+| `VALID_ARCHS` | 144 | no `arm64e.x1` | adds `arm64e.x1` | A new arch in 27, on `iphoneos` (102 targets), `macosx` (24) and `watchos` (18) |
+| `SWIFT_ENABLE_TESTABILITY` | 77 | `NO` | `YES` | Also newly emitted in 27 (absent from every 26.5 capture): `YES` on all 74 Debug targets, plus the 4 Release targets that set it explicitly |
+| `ARCHS` / `ARCHS_BASE` / `ARCHS_STANDARD` | 56 | the full pair | the 64-bit slice alone | Each platform has one legacy secondary slice that 27 drops once the deployment target passes the release that stopped needing it: `x86_64` on macOS, `arm64_32` on watchOS. `ARCHS_STANDARD_64_BIT` and `ARCHS_STANDARD_INCLUDING_64_BIT` keep the full pair. An unauthored deployment target takes the SDK default, which on 27 is past the cutoff |
+| `ARCHS` (watchOS `armv7k`) | 6 | keeps `armv7k` | drops it | 27 retires `armv7k` from resolved `ARCHS` at *every* watchOS deployment target, including the 3.0/6.0 that still carried it on 26.5 — but `ARCHS_STANDARD` still reports it, the same split 15.4 has |
+| `SWIFT_SYSTEM_INCLUDE_PATHS` | 44 | `""` | the platform's `Developer/usr/lib` | New in 27 on test bundles only (44 captures, all unit-test or ui-testing), by the same `$(inherited) $(TEST_LIBRARY_SEARCH_PATHS)` recipe whose expansion gives the double leading space |
+
+Four of the seven are keys 26.5 simply did not report, which is why they cost
+nothing until now: a key the oracle omits is never scored. A new major's first
+tally has this shape most of the time, so read it as a list of settings that
+just became visible before reading it as a list of regressions.
+
+Two lessons worth keeping. The `SWIFTC_PASS_SYSROOT` case says a spec
+`DefaultValue` is a claim, not a measurement — the corpus outranks it, which is
+the grounding order in [§3.3](#33-grounding-rules-investigating-how-a-build-setting-behaves)
+working as intended. And the arch drops only became legible once macOS and
+watchOS were read together: one platform alone looks like a special case, the
+pair shows one rule with a per-platform slice.
+
+### 11.2b Audit follow-ups (June 2026)
 
 A full library audit (line references against `54c40a1`) landed with commit
 `51bb938`, which **fixed all P0 and P1 findings except P0.3**:
@@ -1378,12 +1537,13 @@ A full library audit (line references against `54c40a1`) landed with commit
 - No PR/push CI for the extension (`ci.yaml` triggers only on tags) — add a PR
   workflow on `macos-latest`: `npm ci && npm run check:all && npm test && npm
   run build`.
-- Embedded-catalog staleness unguarded: no test calls
-  `catalog_cache::embedded()`; bumping `FORMAT_VERSION` or refreshing
-  `xcspec-cache/` without regenerating ships stale defaults with green CI. Add
-  a byte-equality test against a fresh serialize; default
-  `examples/gen_embedded_catalog.rs` to the newest `xcspec-cache/xcode-*`
-  instead of a hardcoded version.
+- Embedded-catalog staleness is guarded only for the Xcode it names:
+  `catalog_cache::tests::the_embedded_blob_regenerates_byte_for_byte` fails
+  on a `FORMAT_VERSION` bump or a refreshed capture of that version, but
+  adding a newer `xcspec-cache/xcode-*` without regenerating still ships the
+  older defaults with green CI. Default `examples/gen_embedded_catalog.rs`
+  (and that test) to the newest `xcspec-cache/xcode-*` instead of a hardcoded
+  version.
 - Stale universal `.node` shadows fresh debug builds
   (`rolldown.config.mjs` prefers any lingering `*universal*.node`): delete
   `sweetpad-lib/*.node` before debug builds or pick by newest mtime.
@@ -1428,9 +1588,7 @@ A full library audit (line references against `54c40a1`) landed with commit
 - `parent_group_of` is O(all objects) per group level — build a child→parent
   index once per parsed pbxproj.
 - Filesystem rescans per resolve (`fs::canonicalize`,
-  `find_derived_data_container` double `read_dir`, `darwin_user_cache_dir`) —
-  cache at `BuildContext::open`. (`find_derived_data_container` also picks the
-  lexicographically first container on collision — document or fix.)
+  `darwin_user_cache_dir`) — cache at `BuildContext::open`.
 - `source_kit_options` resolves twice per request (probe + real) — cache the
   probe per target.
 - `decode_entities` is O(n²) on entity-dense text — cap the `;` window.
@@ -1442,10 +1600,15 @@ A full library audit (line references against `54c40a1`) landed with commit
 - Catalog disk-cache writes are non-atomic on a path shared by two processes —
   write temp + `rename`.
 - `file_cache` stamp is `(len, mtime)` — fold in inode/ctime.
-- Process-lifetime caches never evict; disk `catalog-*.bin` never GC'd — wire
-  into `xcode::flush_caches()`; prune on write.
-- Server exit mid-prepare orphans the spawned `xcodebuild`; `$/cancelRequest`
-  is ignored — keep the child handle, kill on shutdown.
+- Process-lifetime caches never evict; disk `catalog-v<format>-*.bin` never
+  GC'd — wire into `xcode::flush_caches()`; prune on write. Pruning has to
+  spare other formats' files. Each `FORMAT_VERSION` names its own file, so the
+  brew CLI, a dev build and the addon don't evict each other, and no binary can
+  tell whether the sweetpad that reads another format is still installed. That
+  includes the unversioned `catalog-<hash>.bin` written by releases through
+  0.1.9.
+- `$/cancelRequest` is ignored, so a cancelled prepare runs to the end. The
+  child handle is kept for shutdown already; kill it on a cancel too.
 - No lifecycle gating: requests served before `build/initialize` / after
   `build/shutdown` — BSP expects `-32002`-style errors.
 - The change watcher polls only member `project.pbxproj` files — watch
@@ -1461,6 +1624,305 @@ A full library audit (line references against `54c40a1`) landed with commit
 → P0.3 packaging → §11.1 Track A/C → P3.1/3.2 project.rs split + parameter
 structs (best before more corpus-derived rules accrete; protected by the green
 oracle) → P4/P5 as independently shippable background tasks.
+
+### 11.3 The JSON project format (`project.xcproj`)
+
+Xcode 27 reads a second project definition: `project.xcproj`, a JSON-shaped
+document that replaces `project.pbxproj` inside the same `.xcodeproj` bundle.
+27.0 and 27.1 only read it; **27.2 is the first release that writes one**, via
+
+    xcodebuild -project <project>.xcodeproj -convert-project "Xcode Project"
+
+or `xcrun xcprojformatter`, which lives in `Contents/Developer/usr/bin` rather
+than `/usr/bin`. Xcode's output, the formatter's, and Apple's published
+`apple/xcode-project-format` 0.1.0 agree byte for byte on all 61 corpus
+projects that convert, so any of the three can regenerate a fixture.
+
+Despite the name, it is not JSON: real documents carry trailing commas and
+comments, and `serde_json` rejects them. `src/xcproj.rs` holds the parser and a
+printer that reproduces Xcode's layout byte for byte. Density is not derivable
+from content — whether a container prints on one line is a property of the
+document — so the parser records it and the printer replays it, the same trick
+`pbxproj::Dict::single_line` uses. `src/schema_xcproj.rs` is the typed view over
+that tree, and `src/project_xcproj.rs` builds the ordinary `project::Project`
+from it. `project::open` and `project::build_settings` pick the reader from
+which definition file the bundle holds; a bundle holding both is an error,
+which is what Xcode itself says.
+
+**Where the same information moved.** A configuration is a name in the
+project's `configurations` list, not an `XCBuildConfiguration` per target, and
+there is one `build-settings` map per scope. One map per configuration became a
+condition on the key, `SWIFT_OPTIMIZATION_LEVEL[config=Debug]`, the spelling
+`.xcconfig` has always used and one the resolver already matches. A target's
+`kind` carries what `isa` did, and its `product-type` is stored with
+`com.apple.product-type.` dropped (`full-product-type` holds anything else
+whole). A file's `sourceTree` became a token inside its path: `<PROJECT>`,
+`<PRODUCTS>`, `<SDK>`, `<DEVELOPER>`, or nothing for the parent group's
+directory.
+
+**A configuration's `file` is a navigator path, not a disk path.** Its segments
+are display names, which is why CocoaPods' xcconfig reads
+`Pods/Pods-App.debug.xcconfig` for a file that lives at
+`Pods/Target Support Files/Pods-App/Pods-App.debug.xcconfig`. Resolving it
+means walking the `files` tree and rebuilding each node's navigator path; a
+group's own name can hold a `/`, so the input cannot simply be split. An
+xcconfig inside a synchronized folder has no node at all, and takes the
+`{ anchor, relative-path }` form instead, the anchor being the folder's
+navigator path.
+
+**Measured against the pbxproj path.** Converting the whole corpus in place and
+reading both copies gives the same targets, configurations and schemes on all
+61 projects. Four differ in configuration *order* only, and there the converted
+document is what `xcodebuild -list` reports for it: Xcode's converter sorts
+`Debug, Release, Profile` into `Debug, Profile, Release`. Resolved settings
+agree everywhere, as measured below. The converter keeps
+`SWIFT_OPTIMIZATION_LEVEL = -Owholemodule` as written, whether it sits at
+project level, at target level or in an xcconfig, and `-showBuildSettings` on
+Xcode 27.0 and 27.2 reports it unchanged for either format, with no
+`SWIFT_COMPILATION_MODE` implied. So the resolver passes it through as stored.
+
+Copy whole project directories for this measurement, not the `.xcodeproj`
+bundles. A bare bundle silently loses every local Swift package and nested
+sub-project, and the missing targets look exactly like reader bugs: the first
+run of this comparison reported 24 differences that way, and all but three were
+the copy.
+
+18 of the 79 corpus projects cannot be converted at all, every one of them
+Tuist output. 12 fail with "The project has an unsupported root group path, it
+should be the project directory" and 6 with "A copy build phase is missing a
+required value for destination path". Both are Xcode refusing to save, not a
+limit of this reader.
+
+**The file tree inverts the pbxproj's relation.** Membership is recorded on the
+file, not in the phase: a node carries `target-membership`, whose entries name
+`<target>/<phase>` — `compile-sources`, `resources`, `frameworks`, `headers`,
+or `copy/<name>` — as a bare string, or as an object under `build-phase` when
+the membership has attributes (`header-role`, `code-sign-on-copy`). A
+synchronized folder names the target alone, with no phase, and its
+`membership-exceptions` adjust that per target: `exclusions` drop a file from a
+default member, `inclusions` hand named files to a target that is not one. A
+product imported from another project lives in a top-level `imported-products`
+list rather than in `files`, and carries membership just the same. A linked
+package product is on the target under `package-product-members`, which is a
+different list from the `{ kind: package }` dependency edge.
+
+**Measuring the graph queries turned up two bugs in the pbxproj path, not the
+new one.** Across 931 comparisons (seven queries × every target of all 61
+projects) 889 agree. 40 of the 42 differences are order only, the converter
+having replaced each phase's order with navigator order — information the
+document simply no longer carries, so each reader is faithful to its own file.
+Both bugs are fixed:
+
+- **Synchronized-folder inclusions were read as exclusions.**
+  `membershipExceptions` is one list whose sense depends on whether the target
+  is in the folder's `fileSystemSynchronizedGroups`: files unchecked from a
+  member, files checked into a non-member. We treated every entry as an
+  exclusion and never scanned a folder for a target that was not a default
+  member, so five NetNewsWire extension targets came back with no sources at
+  all, `Subscribe to Feed` among them, though its exception set names four
+  `.swift` files. The JSON format splits the two senses into separate keys,
+  which is how this surfaced.
+- **A package product linked only through a build file's `productRef` was
+  missed.** Both spellings reach the same `XCSwiftPackageProductDependency`:
+  the target's `packageProductDependencies`, and a frameworks-phase
+  `PBXBuildFile` carrying `productRef` where an ordinary file has `fileRef`.
+  Tuist's `xcode_project_with_registry_and_alamofire` links Alamofire with only
+  the second. The oracle totals are unchanged by the fix, since no scored
+  capture reaches the `ALLOW_TARGET_PLATFORM_SPECIALIZATION` gate this way.
+
+The two remaining set differences are not a bug on either side: converting
+NetNewsWire puts `Tests/NetNewsWire-iOSTests/ActivityItemSourceTests.swift` in
+a "Recovered References" group with explicit membership, where the pbxproj
+excludes it from `NetNewsWireTests` and gives it to nothing. Each reader
+reports its own document.
+
+**One parse, either format.** `project::Document` is the parsed document,
+`Pbxproj(Arc<pbxproj::Value>)` or `Xcproj(Arc<xcproj::Value>)`, and it answers
+`open` and `build_settings`. `BuildContext` holds one of those rather than a
+pbxproj tree, which is what carries the format past this library: `settings
+show`, `build`, `test`, `archive`, `app run` and the BSP server all resolve
+through that single cached parse, and a `project.xcproj` project builds.
+
+Resolving both formats of the same project is the measurement. Every project
+under `corpus/` and `fixtures/_synthetic-*` that Xcode 27.2 (27B5019j) converts,
+57 of them, gives 232 target × configuration resolutions and 44,938 setting
+comparisons, and the two formats agree on all of them. The comparison masks
+each copy's own directory and the DerivedData hash derived from it. Copy whole
+directories here too: `_synthetic-spm-graph` copied without the sibling
+`Graph.xcworkspace` that names its DerivedData container differs on 46 settings
+for that reason alone.
+`tests/xcproj_parity.rs` holds one project's worth of that in the suite: the
+fixture document is Xcode's conversion of `_synthetic-objectversion-110`, so
+the test copies that tree, swaps the document in, and compares the resolved
+settings and a scripted BSP session between the two.
+
+The measurement found one gap in this reader. A test bundle whose document
+does not name a `test-host-target` got no host at all, where the pbxproj path
+falls back to the application the bundle depends on, so `TEST_HOST` and
+`TARGET_BUILD_SUBPATH` went missing for a bundle Xcode's converter recorded no
+host for. Both paths now scan the dependencies.
+
+**Editing the stored settings layer, and what `[config=…]` really means.**
+`stored_settings` holds the request and the report — scope, assignment,
+change — and `settings_pbxproj` and `settings_xcproj` are the two backends;
+`synchronized` and `sync_pbxproj`/`sync_xcproj` split the same way for
+membership exceptions. Writing the JSON document needed the format's
+conditional rule pinned down, so `xcodebuild -showBuildSettings` was asked
+directly, on Xcode 27, one probe per shape:
+
+| stored in one `build-settings` map | Debug | Release |
+| --- | --- | --- |
+| `KEY[config=Debug]` | the value | absent |
+| `KEY[config=Debug]` + `KEY[config=Release]` | Debug's | Release's |
+| `KEY` + `KEY[config=Debug]`, either order | **`KEY`** | `KEY` |
+| `KEY` + `KEY[sdk=macosx*]` | the sdk one | the sdk one |
+| `KEY[config=Debug]` + `KEY[sdk=macosx*]` | the sdk one | the sdk one |
+| `KEY[sdk=macosx*][config=Debug]`, either order | the value | absent |
+
+So a key written without a `config=` clause **shadows** every `[config=…]`
+spelling of itself — the one place the format departs from xcconfig's
+more-specific-wins rule — while any other clause stays an ordinary conditional
+and combines with `config=` in either order. Two things follow. The reader
+drops a conditional entry when the plain one is present, which it previously
+let win; no corpus document is affected, because Xcode never writes both forms
+(0 of the 161 converted `build-settings` maps do). And an edit states the
+picture it wants rather than adding a key: it computes the value each
+configuration should end up with, deletes every stored form of the key, and
+writes one plain key when they agree or one `[config=…]` key each when they
+don't. Naming a single configuration therefore splits a plain key, and
+agreeing on a split key collapses it — each a one-line diff, which
+`xcodebuild` then reads back as intended.
+
+**Editing membership.** `membership` holds the vocabulary — phase, entry,
+removal, folder report — and `membership_pbxproj`/`membership_xcproj` and
+`sync_pbxproj`/`sync_xcproj` are the four backends. The per-file details map
+one for one, which a conversion of a project carrying each of them settled:
+
+| `PBXBuildFile` | node |
+| --- | --- |
+| `settings.COMPILER_FLAGS` | `arguments` |
+| `settings.ATTRIBUTES` `Public` / `Private` | `header-role` |
+| `settings.ATTRIBUTES` `RemoveHeadersOnCopy` | `header-preservation` |
+| `settings.ATTRIBUTES` `CodeSignOnCopy` | `code-sign-on-copy` |
+| `platformFilters` | `platforms` |
+
+Two behaviours cannot be the same on both, because the formats disagree about
+what a file is. A pbxproj file reference exists to be pointed at, so removing
+the last membership deletes it and prunes the groups that empties; a
+`project.xcproj` node *is* the navigator entry, and stays listed exactly as
+Xcode leaves a file nothing builds. The same goes for a folder: detaching the
+last target deletes the pbxproj group object, and leaves the JSON node as a
+folder that builds for nothing, which is what Xcode writes for one added for
+reference only. `membership add` also has nothing to create first here, and
+nothing to invent: a path the navigator does not hold is an error rather than a
+new reference, so `--fileref` — a pbxproj object id — is refused.
+
+Verified end to end on a converted project: `folder add` then a build compiles
+the new folder's sources, `membership add` then a build compiles the named
+file, and `exclude`/`include` and `folder add`/`remove` round-trip the document
+byte for byte. The same sweep found the pbxproj path leaving an emptied
+`fileSystemSynchronizedGroups = ( )` behind after a detach, where it already
+pruned the sibling `exceptions`; both are pruned now.
+
+**Editing the navigator, and how a node is named.** `tree` holds the rows and
+the outcomes; `tree_pbxproj` and `tree_xcproj` are the backends. Naming had to
+be settled first, because the formats disagree at the root. A pbxproj keeps
+every node in a flat `objects` dict under a 24-hex id, and a group's `children`
+is a list of references to those ids, so an id names a node wherever it is
+listed — and the same node can be listed twice. The JSON document has no such
+dict: `files` is a literal nested array, a node is its own entry, and nothing
+points at it. Across 80 converted corpus documents holding 1,903 file
+nodes, `files` carries 192 ids and every one of them sits on a `<PRODUCTS>/…`
+node — the product a target points at. Targets carry 193 more. Not one
+ordinary source file has an id to be named by.
+
+So a node is addressed by its **navigator path** — the display names from the
+root joined by `/`, `Sources/App/ContentView.swift`. That is the spelling
+`membership` and `folder` already take, and the one the document itself uses: a
+target's `product` reads `Products/App.app`, the navigator path of a node whose
+own `path` is `<PRODUCTS>/App.app`. Ids are not synthesized to keep the pbxproj
+argument shape working; the listings print the address their format wants back.
+A pbxproj group answers to its navigator path too, beside the id and the
+resolved directory it already took, so one spelling selects a group in either
+format — and it is the only one that separates two organizational groups, which
+all resolve to their parent's directory.
+The navigator path is not the disk path — a node stored as
+`<PROJECT>/Sources/Deep.swift` but listed at the root appears as `Deep.swift` —
+so every row carries both, and an address matching two siblings is an error
+naming them rather than a pick.
+
+Three things have no meaning in the JSON format, and each is refused naming
+what to use instead rather than silently doing nothing:
+
+| refused there | why | instead |
+| --- | --- | --- |
+| `group attach` / `detach` | a group holds its children rather than listing references to them, so a node is in one place | `group move <node> [--to G]`, new and working on both |
+| `group remove --orphan-children` | the children are nested inside the group, so deleting it deletes them | `group move` to empty the group first |
+| a `--source-tree` the format has no word for | `SOURCE_ROOT`/`BUILT_PRODUCTS_DIR`/`SDKROOT`/`DEVELOPER_DIR` map onto `<PROJECT>`/`<PRODUCTS>`/`<SDK>`/`<DEVELOPER>`; `<group>` and `<absolute>` stay | an error listing the anchors there are |
+
+`fileref remove --dangling` does carry, with the consequence stated per format:
+a pbxproj is left with build files pointing at nothing, while here the
+memberships live on the node and go with it. The guard is the same one either
+way — a delete that drops membership asks first.
+
+**`move` keeps the file, not the spelling.** A `<group>`-relative path names a
+different file under a different group, so moving a node rewrites it: the new
+group's directory comes off the front when it prefixes the resolved path, and
+the node is anchored at the project root (`<PROJECT>/…` here, `SOURCE_ROOT`
+there) when it does not. A relative path that descends is what Xcode writes
+where one reaches — at the navigator root it spells 30 of 32 multi-component
+paths that way, and 52 nested nodes carry one too. Where none reaches, Xcode
+has both spellings available (one corpus node climbs out with
+`../Alamofire.xcodeproj`) and this picks the anchor, which does not depend on
+how deep the group sits. Either way a move and its reverse leave the document
+byte for byte as it was, and each outcome reports the resolved path, so the
+preservation is checkable rather than promised.
+
+**Editing packages.** `spm` holds the vocabulary — declared package,
+requirement, product link — and `spm_pbxproj` and `spm_xcproj` are the two
+backends. The pbxproj's three object kinds become two places. A declared
+package is an entry in the top-level `packages` list. A product a target
+consumes is a reference on the target: an entry in `package-product-members`
+when a build phase links it, and a `{ kind: package }` entry in `dependencies`
+when the target only depends on it, which is what a static library's
+`PBXTargetDependency` with a `productRef` converts to.
+`packageProductDependencies` has no counterpart. Converting a project that
+carries each requirement kind settled their spelling, and Apple's published
+schema agrees:
+
+| pbxproj `requirement.kind` | `version` key |
+| --- | --- |
+| `upToNextMajorVersion` | `up-to-next-major-version` |
+| `upToNextMinorVersion` | `up-to-next-minor-version` |
+| `exactVersion` | `version` |
+| `versionRange` | `version-range`, as `1.3.0..<1.5.0` |
+| `branch` | `branch` |
+| `revision` | `revision` |
+
+A range with a bound that is not plain dotted numbers, a prerelease for
+instance, is written as a `version-range-min` / `version-range-max` pair
+instead.
+
+A product reference names its package by the name Xcode gives it rather than
+pointing at an object: a repository's last path component without `.git`, with
+its case kept (`SFSafeSymbols`, where SwiftPM's identity is lowercase), a
+registry identity's name (`Alamofire` for `Alamofire.Alamofire`), and a local
+package's directory name (`LocalKit` for `Packages/LocalKit`). A reference with
+no `package` at all is a local package's product that the pbxproj recorded
+without a back-reference. It converts that way, and `remove` matches it by the
+product names the package's manifest declares, as on the pbxproj path. Xcode
+keeps `package-product-members` sorted in the published schema's order
+(package, product, product type, then build phase, with the references that
+name no package first), while `packages` and `dependencies` keep the order
+entries were added in.
+
+The `PackageProbe` and `SpmStaticLibrary` fixtures are Xcode's conversions of
+one pbxproj project each, before and after `dependency add` edited it. Making
+the same edits through `spm_xcproj` reproduces the converted document byte for
+byte, and removing them gives the earlier document back. On a converted
+project, `add`, a resolve, a build that imports the product, `update` and
+`remove` all work on Xcode 27.2, and the round trip leaves the document as it
+was.
 
 ## 12. Project history
 
@@ -1520,4 +1982,105 @@ lives in the sections above and in the named commits.
   splitting, geometry closures (CCHROOT, sanitizer object dirs, tuist capture
   roots). Corpus oracle now 89–88 exact / 97–100 canonical / 99–100 structural
   per version with a single remaining systematic mismatch (§6.3). Open items
-  consolidated into §11.2.
+  consolidated into §11.2b.
+- **2026-09-20 — Xcode 27 added as a fourth major.** Full corpus captured
+  against 27.0.0 (1036 captures) alongside 26.5/16.4/15.4, at parity with 26.5
+  on every settings oracle source — per-target 156, project-defaults 84,
+  synthetic overrides 26, xcconfig resolution 48. Adding rather than refreshing,
+  so nothing was dropped and §10.7's repointing did not apply. Four capture-script
+  bugs fixed on the way (pin re-resolution, skipped `tuist generate`, the
+  unconditional `xcodes` preflight, the post-crate-split `cargo test` target) plus
+  a canonicalizer gap on `-L`-prefixed paths. Seven 27-only behaviour deltas
+  found and modelled (§11.2), returning 27's systematic-mismatch tally to zero;
+  floors ratcheted to the post-fix run. Xcode 27's raised deployment-target
+  floors cost the corpus projects their compiler-args cells (§5.4), so
+  `_synthetic-rich` became multi-platform and now supplies a cell for all six
+  platforms instead.
+- **2026-09-20 — the pbxproj serializer learned Xcode's second annotation
+  dialect.** Xcode changed how it spells `/* … */` annotations, and a project's
+  `objectVersion` is the only durable signal of which spelling a file uses. From
+  format 90 (Xcode 16.3; 100 is 26.3, 110 is 27.0) a build configuration names
+  the target it configures, a synchronized folder's exception set names the
+  folder and the target, a reference with no `name` carries its whole `path`
+  rather than the last component, and every line of a `shellScript` array is
+  quoted however plain it is. Measured by converting all 60 projects in
+  `corpus/`, `fixtures/` and the extension's examples through
+  `xcodebuild -convert-project` at each of the five formats Xcode 27 offers, then
+  re-serializing; before the fix, one `pbxproj settings set` on a converted
+  project rewrote 451 lines. A newer Xcode saving into an older format writes the
+  newer spellings into it and nothing in the file records that, so the threshold
+  takes the older reading — what every ≤77 project in the corpus has. Two
+  annotation bugs unrelated to the dialect came out of the same sweep: a package
+  product's `plugin:` prefix and a repository URL's `#fragment` are both dropped
+  from the annotation. Pinned by `fixtures/_synthetic-objectversion-110`, an
+  Xcode 27-converted project carrying all four constructs.
+
+- **2026-09-20 — reading Xcode 27.2's `project.xcproj`.** The JSON-shaped
+  project definition gained a parser, a byte-exact printer, a typed settings
+  view, and a reader that builds the same `project::Project` a pbxproj does, so
+  `project info`, `scheme list` and the settings layers work on either format
+  and callers never learn which one the bundle held. Verified by converting the
+  corpus in place with Xcode 27.2 and reading both copies: identical targets,
+  configurations and schemes on all 61 projects, and identical resolved
+  settings on 255 of 270 target × configuration pairs, with every remaining
+  difference traced to a rewrite Xcode's own converter performs. §11.3 has the
+  format notes, the measurement, and what is still pbxproj-only.
+
+- **2026-09-20 — the `project.xcproj` file-tree view.** Membership, synchronized
+  folders and imported products, which completes the read surface:
+  `target_source_files`, the dependency and package queries, and the linking
+  queries all answer either format. Comparing the two readers over 931 queries
+  across the corpus put 875 in agreement, left 39 differing only in the order
+  Xcode's converter rewrote, and showed every one of the remaining 17 to be the
+  pbxproj reader under-reporting — synchronized-folder inclusions read as
+  exclusions (five NetNewsWire targets with no sources at all), and a package
+  product linked only through a build file's `productRef`. Both are §11.3's to
+  fix on their own.
+
+- **2026-09-20 — building a `project.xcproj` project.** `project::Document`
+  replaced the pbxproj tree `BuildContext` cached, so every verb above the
+  library — `settings show`, `build`, `test`, `archive`, `app run`, BSP — reads
+  either format from one parse. Resolving both copies of all 61 convertible
+  projects agrees on 52,563 of 52,639 settings, with the remaining 76 split
+  between one fixture copied without the workspace that names its DerivedData
+  container and the `-Owholemodule` rewrite; the sweep also found this reader
+  giving a test bundle no host when the document names none, which the pbxproj
+  path had always inferred from the dependency edge.
+
+- **2026-09-20 — editing `project.xcproj`'s stored settings.** `pbxproj
+  settings show/set/unset` reads and writes both formats through a shared
+  vocabulary (`stored_settings`) and two backends. Six `-showBuildSettings`
+  probes settled how `[config=…]` resolves, which corrected the reader (a
+  plain key shadows its conditional spellings) and fixed the shape an edit
+  writes; a custom `INFOPLIST_FILE` inside a synchronized folder records its
+  membership exception on this format too.
+
+- **2026-09-20 — editing `project.xcproj` membership.** `pbxproj folder` and
+  `pbxproj membership` read and write both formats, over a shared vocabulary
+  and four backends; a conversion probe settled how the per-file details are
+  spelled. Where the formats genuinely differ they now say so rather than
+  pretending: a node and a folder survive losing their last membership, which
+  a pbxproj reference and group do not. Checked by building a converted
+  project after attaching a folder and after adding a file, and by
+  round-tripping every reversible verb byte for byte.
+
+- **2026-09-20 — editing `project.xcproj`'s navigator.** `pbxproj fileref` and
+  `pbxproj group` cross, which needed the addressing question answered first:
+  the 192 ids in 80 converted documents all sit on products, so a node is named
+  by its navigator path and no id is invented to keep the old argument shape.
+  `group move` is the new verb `attach`/`detach` become where a node sits in
+  one place, and it keeps the file by rewriting the stored path. Measuring the
+  corpus also pinned the key order Xcode writes a node with, which is
+  positional rather than alphabetical; `target-membership` and a fresh
+  membership exception were landing in the wrong place before.
+
+- **2026-09-26 — no `-Owholemodule` rewrite after all.** §11.3 put the
+  remaining settings the two formats disagreed on down to Xcode's converter
+  splitting `-Owholemodule` into `-O` plus `SWIFT_COMPILATION_MODE =
+  wholemodule`, and planned to make the resolver do the same. Neither half
+  holds on Xcode 27.2 (27B5019j). The converter keeps the value at project
+  level, at target level and in an xcconfig, and `-showBuildSettings` on 27.0
+  and 27.2 reports it unchanged for either format. Rerunning the sweep found no
+  difference left at all, 0 of 44,938 settings over 57 projects, so the
+  normalization would only have made the resolver disagree with Xcode, and it
+  is dropped.

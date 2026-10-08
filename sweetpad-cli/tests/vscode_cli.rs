@@ -8,19 +8,24 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use common::TempDir;
 use serde_json::{Value, json};
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("sweetpad-vscode-cli-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_dir(tag: &str) -> TempDir {
+    TempDir::new(&format!("sweetpad-vscode-cli-{tag}"))
+}
+
+/// Where a test's socket goes: under `/tmp`, since a socket path has to fit in
+/// 104 bytes and one under a long `$TMPDIR` does not.
+fn socket_dir(tag: &str) -> TempDir {
+    TempDir::new_in(Path::new("/tmp"), &format!("sp-vscode-{tag}"))
 }
 
 /// Read one Content-Length-framed message (the request) from the stream.
@@ -108,7 +113,8 @@ fn stderr_envelope(output: &Output) -> Value {
 #[test]
 fn success_round_trip_pretty_and_request_shape() {
     let dir = temp_dir("ok");
-    let socket = dir.join("srv.sock");
+    let sockets = socket_dir("ok");
+    let socket = sockets.join("srv.sock");
     register_project(&dir, &socket);
     let server = spawn_server(
         &socket,
@@ -136,7 +142,8 @@ fn success_round_trip_pretty_and_request_shape() {
 #[test]
 fn raw_minifies_and_flags_reach_the_wire() {
     let dir = temp_dir("raw");
-    let socket = dir.join("srv.sock");
+    let sockets = socket_dir("raw");
+    let socket = sockets.join("srv.sock");
     register_project(&dir, &socket);
     let server = spawn_server(
         &socket,
@@ -187,7 +194,8 @@ fn positional_arguments_are_rejected() {
 #[test]
 fn string_results_print_bare() {
     let dir = temp_dir("str");
-    let socket = dir.join("srv.sock");
+    let sockets = socket_dir("str");
+    let socket = sockets.join("srv.sock");
     register_project(&dir, &socket);
     spawn_server(
         &socket,
@@ -205,7 +213,8 @@ fn string_results_print_bare() {
 #[test]
 fn rpc_errors_exit_1_with_the_servers_stable_code() {
     let dir = temp_dir("err");
-    let socket = dir.join("srv.sock");
+    let sockets = socket_dir("err");
+    let socket = sockets.join("srv.sock");
     register_project(&dir, &socket);
     spawn_server(&socket, |req| {
         json!({
@@ -242,7 +251,8 @@ fn missing_project_and_dead_socket_exit_2() {
 
     // The index points at a socket nobody listens on.
     let dir = temp_dir("dead");
-    register_project(&dir, &dir.join("gone.sock"));
+    let sockets = socket_dir("dead");
+    register_project(&dir, &sockets.join("gone.sock"));
     let output = run_cli(&dir, &dir, &["scheme.list"]);
     assert_eq!(output.status.code(), Some(2));
     let envelope = stderr_envelope(&output);

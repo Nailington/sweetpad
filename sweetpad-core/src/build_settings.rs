@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::build_context::{BuildContext, ResolveQuery};
+use crate::build_context::{BuildContext, MacVariant, ResolveQuery};
 use sweetpad_lib::destination::RunDestination;
 use sweetpad_lib::xcspec::Catalog;
 use sweetpad_lib::{catalog_cache, compiler_args, project, scheme, workspace, xcode};
@@ -47,6 +47,9 @@ pub struct BuildSettingsOptions {
     pub catalog_cache: Option<PathBuf>,
     /// `xcodebuild -derivedDataPath` override.
     pub derived_data_path: Option<PathBuf>,
+    /// `KEY=VALUE` build settings from the `xcodebuild` command line, applied
+    /// above every other layer, in order, as `xcodebuild` applies them.
+    pub overrides: Vec<(String, String)>,
     /// Place build output the way this machine's Xcode is configured to,
     /// instead of assuming the stock DerivedData layout (see
     /// [`sweetpad_lib::derived_data`]). Interfaces that go on to install,
@@ -63,7 +66,7 @@ pub struct BuildSettingsOptions {
 }
 
 /// One target's resolved build settings.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TargetSettings {
     pub target: String,
     pub settings: BTreeMap<String, String>,
@@ -108,14 +111,16 @@ impl Selection {
 }
 
 /// Resolve the `scheme` / `target` choice once, before the per-project loop.
-/// A scheme file is looked up across every container that can hold one — the
-/// workspace bundle itself, then each member project, shared then per-user
-/// directories (mirroring where xcodebuild finds schemes). A scheme with no
+/// A scheme file is looked up where `xcodebuild` finds it
+/// ([`scheme::locate`]): the workspace bundle itself, then each member
+/// project, then each local package, shared then the current user's
+/// directories. A scheme with no
 /// file falls back to [`Selection::AutoScheme`] only when Xcode's scheme
-/// autocreation would surface it: no container holds *any* scheme file, and
-/// the shared workspace settings don't disable autocreation. Otherwise the
-/// unknown name is an error, matching `xcodebuild -scheme Nope` against a
-/// container that does have schemes.
+/// autocreation surfaces it: when the container lists it the way
+/// `xcodebuild -list` does ([`project::Project::schemes`],
+/// [`workspace::Workspace::project_for_scheme`]), which autocreates per
+/// target rather than per container. Otherwise the unknown name is an
+/// error, matching `xcodebuild -scheme Nope`.
 fn resolve_selection(
     opts: &BuildSettingsOptions,
     projects: &[PathBuf],
@@ -127,10 +132,10 @@ fn resolve_selection(
             .into_iter()
             .chain(projects.iter().map(PathBuf::as_path))
             .collect();
-        for container in &containers {
-            let Some(path) = scheme::find_scheme_file(container, name) else {
-                continue;
-            };
+        if let Some(path) = containers
+            .first()
+            .and_then(|primary| scheme::locate(primary, name))
+        {
             let parsed = scheme::parse_file(&path)
                 .map_err(|e| format!("failed to parse scheme {name} at {}: {e}", path.display()))?;
             return Ok(Selection::Scheme {
@@ -138,13 +143,13 @@ fn resolve_selection(
                 parsed: Box::new(parsed),
             });
         }
-        let any_scheme_files = containers
-            .iter()
-            .any(|c| !scheme::container_schemes(c).is_empty());
-        let autocreation = containers
-            .first()
-            .is_some_and(|primary| scheme::autocreation_allowed(primary));
-        if any_scheme_files || !autocreation {
+        let listed = match opts.workspace.as_deref() {
+            Some(ws) => workspace::open(ws).is_ok_and(|ws| ws.project_for_scheme(name).is_some()),
+            None => projects.first().is_some_and(|p| {
+                project::open(p).is_ok_and(|project| project.schemes.iter().any(|s| s == name))
+            }),
+        };
+        if !listed {
             return Err(format!(
                 "the workspace/project does not contain a scheme named {name:?}"
             ));
@@ -430,6 +435,7 @@ pub fn resolve_file_arguments(
                 arguments: compiler_args::swift_arguments(
                     settings,
                     &query.arch,
+                    &swift_inputs,
                     swift_opts,
                     xcode_version,
                     has_package_products,
@@ -622,12 +628,9 @@ fn build_one_context(
     // Xcode keys DerivedData by whichever container it opened. When the caller
     // selected a `-workspace`, every member project's DerivedData paths
     // (`BUILD_DIR`, `OBJROOT`, `BUILT_PRODUCTS_DIR`, …) must hash the WORKSPACE
-    // path, not the project's own location. Declare it explicitly so the
-    // context doesn't fall back to inferring a container from the project —
-    // inference (`find_derived_data_container`) only finds a workspace sitting
-    // in the project's parent or grandparent dir, so a member nested deeper, or
-    // a workspace living elsewhere, resolves the wrong tree and the built app
-    // can't be found (issue #265).
+    // path, not the project's own location, or the built app can't be found
+    // (issue #265). With no workspace the context hashes the project, as a
+    // `-project` build does.
     if let Some(ws) = workspace {
         ctx = ctx.with_derived_data_container(ws);
     }
@@ -664,25 +667,89 @@ fn build_queries(
                 arch,
                 destination,
             );
-            for mut q in plan.entries {
-                if let Some(p) = &opts.derived_data_path {
-                    q = q.with_derived_data_path(p.clone());
-                }
-                queries.push(q);
-            }
+            queries.extend(plan.entries);
         }
         Selection::Target(target_name) | Selection::AutoScheme(target_name) => {
             let mut q = ResolveQuery::new(target_name, &opts.configuration, sdk, arch);
             if let Some(d) = destination {
                 q = q.with_destination(d.clone());
             }
-            if let Some(p) = &opts.derived_data_path {
-                q = q.with_derived_data_path(p.clone());
-            }
             queries.push(q);
         }
     }
+    let mut queries: Vec<ResolveQuery> = queries
+        .into_iter()
+        .map(|mut q| {
+            if let Some(p) = &opts.derived_data_path {
+                q = q.with_derived_data_path(p.clone());
+            }
+            for (key, value) in &opts.overrides {
+                q = q.with_override(key, value);
+            }
+            q
+        })
+        .collect();
+    if destination.is_some() {
+        bind_destination_sdks(ctx, &mut queries);
+    }
     queries
+}
+
+/// Bind each query's SDK the way xcodebuild specializes a build's targets
+/// for its one run destination, which [`build_queries`] first binds every
+/// query to. On a macOS destination an iOS target builds for Mac Catalyst or
+/// "Designed for iPad" on `iphoneos` ([`BuildContext::mac_destination_variant`]).
+/// xcodebuild picks that destination for the whole build, from its apps, so a
+/// framework the app embeds builds for `iphoneos` too, although on its own it
+/// would take Catalyst; with no app among the queries, each target's own
+/// variant decides. That destination is an `iphoneos` one to the scheme's
+/// other targets, so a macOS app beside the iOS app builds as it would for an
+/// iOS device (full `ARCHS`, `ONLY_ACTIVE_ARCH = NO`). Any other target that
+/// can't run on the destination builds for its own platform
+/// ([`BuildContext::own_platform_sdk`]).
+fn bind_destination_sdks(ctx: &BuildContext, queries: &mut [ResolveQuery]) {
+    let variants: Vec<Option<MacVariant>> = queries
+        .iter()
+        .map(|q| {
+            if q.destination.as_ref().is_some_and(RunDestination::is_macos) {
+                ctx.mac_destination_variant(q).ok().flatten()
+            } else {
+                None
+            }
+        })
+        .collect();
+    let is_app = |target: &str| {
+        ctx.project.targets.iter().any(|t| {
+            t.name == target
+                && t.product_type.as_deref() == Some("com.apple.product-type.application")
+        })
+    };
+    let apps: Vec<MacVariant> = queries
+        .iter()
+        .zip(&variants)
+        .filter(|(q, _)| is_app(&q.target))
+        .filter_map(|(_, v)| *v)
+        .collect();
+    let designed_app = !apps.is_empty() && apps.iter().all(|v| *v == MacVariant::DesignedForIpad);
+    for (q, variant) in queries.iter_mut().zip(variants) {
+        if let Some(variant) = variant {
+            let designed = if apps.is_empty() {
+                variant == MacVariant::DesignedForIpad
+            } else {
+                designed_app
+            };
+            if designed {
+                q.sdk = "iphoneos".into();
+            }
+            continue;
+        }
+        if designed_app && let Some(destination) = &mut q.destination {
+            destination.platform = "iphoneos".into();
+        }
+        if let Ok(Some(sdk)) = ctx.own_platform_sdk(q) {
+            q.sdk = sdk;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -690,16 +757,8 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A unique scratch dir under the OS temp dir (no tempfile dep).
-    fn scratch(tag: &str) -> PathBuf {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("sweetpad-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::scratch::ScratchDir;
 
     fn write_file(path: &Path, bytes: &[u8], exec: bool) {
         std::fs::File::create(path)
@@ -718,7 +777,7 @@ mod tests {
 
     #[test]
     fn macro_plugin_filter_picks_only_host_executables() {
-        let dir = scratch("plugin-filter");
+        let dir = ScratchDir::new("sweetpad-plugin-filter").unwrap();
         let plugin = dir.join("MyMacros"); // the macro plugin: ext-less, +x, Mach-O
         write_file(&plugin, MACHO, true);
         write_file(&dir.join("MyMacros.o"), MACHO, true); // build product (extension)
@@ -740,12 +799,11 @@ mod tests {
                 "should skip {skip}"
             );
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn collect_macro_plugins_scans_the_host_config_dir() {
-        let root = scratch("plugin-collect");
+        let root = ScratchDir::new("sweetpad-plugin-collect").unwrap();
         let host = root.join("Debug");
         std::fs::create_dir_all(&host).unwrap();
         write_file(&host.join("BetaMacros"), MACHO, true);
@@ -764,6 +822,5 @@ mod tests {
 
         // Missing BUILD_DIR/CONFIGURATION → never scans.
         assert!(collect_macro_plugins(&BTreeMap::new()).is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

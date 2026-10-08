@@ -1,6 +1,6 @@
 //! One-shot input collection for the build-settings resolver.
 //!
-//! [`BuildContext::open`] parses the `project.pbxproj`, optionally accepts an
+//! [`BuildContext::open`] parses the project document, optionally accepts an
 //! xcspec catalog and an extra `.xcconfig`, and exposes [`BuildContext::resolve`]
 //! as the cheap repeated query. Same context, different `(target, config, sdk,
 //! arch, destination, overrides)` — re-resolution walks the cached parse
@@ -10,21 +10,25 @@
 //!
 //! 1. xcspec + SDKSettings defaults (when [`with_xcspec`] is set).
 //! 2. Computed built-in settings (`PROJECT_DIR`, `ARCHS`, `BUILD_DIR`, …).
-//! 3. The four user-authored layers from pbxproj (project xcconfig, project
-//!    inline buildSettings, target xcconfig, target inline buildSettings).
-//! 4. The extra `.xcconfig` overlay (when [`with_extra_xcconfig`] is set).
+//! 3. The four user-authored layers from the project document (project
+//!    xcconfig, project settings, target xcconfig, target settings).
+//! 4. The extra `.xcconfig` overlay (when [`with_extra_xcconfig`] is set),
+//!    with the command-line overrides of the keys it also sets just below
+//!    it (see [`BuildContext::split_overrides`]).
 //! 5. Forced xcodebuild overrides (e.g. config-derived `ENABLE_PREVIEWS`).
 //! 6. SDKROOT in its absolute-path form when the catalog supplied one.
-//! 7. Command-line `KEY=VALUE` overrides from [`ResolveQuery::overrides`].
+//! 7. Command-line `KEY=VALUE` overrides from [`ResolveQuery::overrides`],
+//!    the rest of them.
+//! 8. The build locations `xcodebuild` folds (`SYMROOT`, `OBJROOT`, …),
+//!    pinned to their folded values when resolving changed their spelling
+//!    (see `resolve_folding_locations`).
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use sweetpad_lib::destination::RunDestination;
-use sweetpad_lib::pbxproj::Value;
-use sweetpad_lib::project::{self, Project};
+use sweetpad_lib::project::{self, Document, Project};
 use sweetpad_lib::resolver::{self, ResolveContext};
 use sweetpad_lib::scheme::{self, BuildableRef, Scheme};
 use sweetpad_lib::xcconfig::Assignment;
@@ -35,10 +39,11 @@ use sweetpad_lib::xcspec::Catalog;
 pub struct BuildContext {
     /// High-level project metadata (targets, configurations, schemes, path).
     pub project: Project,
-    /// Parsed pbxproj root — a shared, mtime-validated cache entry (see
-    /// [`project::parse_pbxproj`]) reused by each [`Self::resolve`] and shared
-    /// across every `BuildContext` opened on the same project.
-    pbxproj: Arc<Value>,
+    /// The parsed project document, in whichever format the bundle holds — a
+    /// shared, mtime-validated cache entry (see [`Document::parse`]) reused by
+    /// each [`Self::resolve`] and shared across every `BuildContext` opened on
+    /// the same project.
+    document: Document,
     /// xcspec + `SDKSettings.plist` defaults catalog. `None` skips the
     /// defaults layer — you'll get only the user-authored settings + built-ins.
     pub xcspec: Option<Catalog>,
@@ -66,6 +71,35 @@ pub struct BuildContext {
     pub read_xcode_locations: bool,
 }
 
+/// The SDK a target resolves against when a query names neither an SDK nor a
+/// destination: the platform its own `SDKROOT` names, which is what a plain
+/// `xcodebuild -showBuildSettings` picks. `auto`, an unset `SDKROOT` and
+/// anything that isn't a platform fall back to `macosx`, the SDK a
+/// multiplatform target's no-platform view resolves under.
+fn default_sdk(layers: &[Vec<Assignment>]) -> String {
+    project::natural_sdkroot(layers)
+        .map(|sdkroot| {
+            // A path to an SDK names it by its directory, `iPhoneOS17.0.sdk`.
+            let name = sdkroot.rsplit('/').next().unwrap_or(&sdkroot);
+            let name = name.strip_suffix(".sdk").unwrap_or(name);
+            project::canonicalize_sdk_base(&name.to_ascii_lowercase())
+        })
+        .filter(|sdk| sweetpad_lib::destination::Platform::from_sdk(sdk).is_some())
+        .unwrap_or_else(|| "macosx".to_string())
+}
+
+/// How an iOS target builds for a macOS run destination
+/// ([`BuildContext::mac_destination_variant`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacVariant {
+    /// Mac Catalyst: the `macosx` SDK with the iOS support libraries.
+    Catalyst,
+    /// "Designed for iPad": the `iphoneos` SDK, the iOS app run on the Mac.
+    DesignedForIpad,
+    /// Neither: xcodebuild has no macOS destination for it.
+    None,
+}
+
 /// One resolution query against a [`BuildContext`].
 #[derive(Debug, Clone)]
 pub struct ResolveQuery {
@@ -74,7 +108,8 @@ pub struct ResolveQuery {
     /// Configuration name (e.g. `Debug`, `Release`).
     pub configuration: String,
     /// Canonical SDK base (e.g. `macosx`, `iphonesimulator`). Drives
-    /// `[sdk=...]` conditionals and platform-specific defaults.
+    /// `[sdk=...]` conditionals and platform-specific defaults. Empty, with
+    /// no destination either, means the SDK the target's own `SDKROOT` names.
     pub sdk: String,
     /// Active architecture (e.g. `arm64`). Drives `[arch=...]` conditionals.
     pub arch: String,
@@ -102,7 +137,8 @@ pub struct ResolveQuery {
     /// Whether the driving scheme's `TestAction` has
     /// `codeCoverageEnabled="YES"`. When set, xcodebuild forces
     /// `CLANG_COVERAGE_MAPPING=YES` on every target it resolves for the
-    /// scheme — a scheme-level fact the per-target pbxproj can't carry.
+    /// scheme — a scheme-level fact the per-target project document can't
+    /// carry.
     pub code_coverage_enabled: bool,
     /// The driving scheme's `LaunchAction` sanitizer toggles
     /// (`enableAddressSanitizer` / `enableThreadSanitizer` /
@@ -110,8 +146,8 @@ pub struct ResolveQuery {
     /// `ENABLE_*_SANITIZER = YES` on every target it resolves for the scheme
     /// and suffixes the per-variant object dirs (Swift Build's
     /// `Settings.swift` appends `-asan` / `-tsan` / `-ubsan` to
-    /// `OBJECT_FILE_DIR_<variant>`). Another scheme-level fact the pbxproj
-    /// can't carry; defaults to all-off.
+    /// `OBJECT_FILE_DIR_<variant>`). Another scheme-level fact the project
+    /// document can't carry; defaults to all-off.
     pub scheme_sanitizers: scheme::SanitizerEnables,
 }
 
@@ -288,11 +324,11 @@ impl From<resolver::Error> for Error {
 impl BuildContext {
     /// Parse the `.xcodeproj` once and cache it.
     pub fn open(project_path: &Path) -> Result<Self, Error> {
-        let pbxproj = project::parse_pbxproj(project_path)?;
-        let project = project::open_from_value(&pbxproj, project_path)?;
+        let document = Document::parse(project_path)?;
+        let project = document.open(project_path)?;
         Ok(Self {
             project,
-            pbxproj,
+            document,
             xcspec: None,
             extra_xcconfig: Vec::new(),
             derived_data_container: None,
@@ -311,9 +347,10 @@ impl BuildContext {
 
     /// Declare the container this build was opened with (the
     /// `.xcworkspace` of a `-workspace` invocation). DerivedData paths
-    /// (`BUILD_DIR`, `OBJROOT`, `SYMROOT`, …) hash this path instead of
-    /// inferring a container from the project's own location — Xcode keys
-    /// DerivedData by whatever was opened, for every member project.
+    /// (`BUILD_DIR`, `OBJROOT`, `SYMROOT`, …) hash this path instead of the
+    /// project's own. Xcode keys DerivedData by whatever was opened, for
+    /// every member project, and `xcodebuild -project` opens the project even
+    /// when a workspace beside it lists it.
     #[must_use]
     pub fn with_derived_data_container(mut self, container: impl Into<PathBuf>) -> Self {
         self.derived_data_container = Some(container.into());
@@ -336,25 +373,174 @@ impl BuildContext {
         Ok(self)
     }
 
+    /// Split the command-line overrides around the `-xcconfig` overlay:
+    /// `(below, above)`. xcodebuild applies the overlay above command-line
+    /// `KEY=VALUE` settings (its man page: the file's settings "override all
+    /// other settings, including settings passed individually on the command
+    /// line"). With `-xcconfig X.xcconfig FOO=cli SWIFT_VERSION=5.9` and
+    /// `X.xcconfig` holding `FOO = $(inherited) x` and `SWIFT_VERSION = 6.0`,
+    /// Xcode 27 resolves `FOO = cli x` and `SWIFT_VERSION = 6.0`. So an
+    /// override of a key the overlay assigns goes just below the overlay,
+    /// where the overlay's `$(inherited)` reads it; every other override stays
+    /// on top of all the layers.
+    fn split_overrides(&self, overrides: &[Assignment]) -> (Vec<Assignment>, Vec<Assignment>) {
+        overrides
+            .iter()
+            .cloned()
+            .partition(|o| self.extra_xcconfig.iter().any(|a| a.key == o.key))
+    }
+
     /// Resolve build settings for one `(target, config, sdk, arch, …)` tuple.
     /// Cheap to call repeatedly against the same context.
     pub fn resolve(&self, query: &ResolveQuery) -> Result<Resolved, Error> {
-        let bundle = project::build_settings_from_value(
-            &self.pbxproj,
+        let bundle = self.document.build_settings(
             &self.project.path,
             &query.target,
             &query.configuration,
         )?;
+        let defaulted;
+        let query = if query.sdk.is_empty() && query.destination.is_none() {
+            defaulted = ResolveQuery {
+                sdk: default_sdk(&bundle.layers),
+                ..query.clone()
+            };
+            &defaulted
+        } else {
+            query
+        };
         let probe = self.authored_probe(&bundle, query);
         let layers = self.build_layers(&bundle, query, &probe);
-        let layer_refs: Vec<&[Assignment]> = layers.iter().map(Vec::as_slice).collect();
         Ok(Resolved {
             // The probe pre-resolved the user layers under the very same
             // bindings (see [`Self::authored_probe`]), so the gates and the
             // final resolve agree on every conditional.
-            settings: resolver::resolve(&layer_refs, &probe.ctx),
+            settings: resolve_folding_locations(layers, &probe.ctx),
             product_type: bundle.product_type,
         })
+    }
+
+    /// The SDK `query`'s target builds with when its run destination's
+    /// platform isn't one the target supports, or `None` when it is. A
+    /// build for one destination builds each target that can't run there for
+    /// its own platform: on Xcode 27, a scheme with an iOS app and a macOS app
+    /// builds the macOS app for `macosx` under an iOS Simulator destination. A
+    /// simulator destination takes the simulator of the target's platform
+    /// where the target supports it (a watchOS app under an iPhone simulator).
+    /// The supported platforms are the target's authored
+    /// `SUPPORTED_PLATFORMS` under its own SDK, else that SDK's default: a
+    /// device SDK and its simulator (`iphoneos iphonesimulator`), or `macosx`.
+    pub fn own_platform_sdk(&self, query: &ResolveQuery) -> Result<Option<String>, Error> {
+        let Some(destination) = &query.destination else {
+            return Ok(None);
+        };
+        let bundle = self.document.build_settings(
+            &self.project.path,
+            &query.target,
+            &query.configuration,
+        )?;
+        let own = default_sdk(&bundle.layers);
+        let probe = ResolveQuery {
+            sdk: own.clone(),
+            destination: None,
+            ..query.clone()
+        };
+        let simulator = own
+            .strip_suffix("os")
+            .map(|family| format!("{family}simulator"));
+        let supported: Vec<String> = self
+            .authored_probe(&bundle, &probe)
+            .settings
+            .get("SUPPORTED_PLATFORMS")
+            .map_or_else(
+                || {
+                    std::iter::once(own.clone())
+                        .chain(simulator.clone())
+                        .collect()
+                },
+                |authored| {
+                    authored
+                        .split_whitespace()
+                        .map(str::to_ascii_lowercase)
+                        .collect()
+                },
+            );
+        let supports = |sdk: &str| supported.iter().any(|p| p == sdk);
+        if supports(&destination.platform) {
+            return Ok(None);
+        }
+        let simulator = simulator.filter(|sim| destination.is_simulator() && supports(sim));
+        Ok(Some(simulator.unwrap_or(own)))
+    }
+
+    /// How `query`'s target builds for a macOS run destination (`-destination
+    /// platform=macOS`) when its own SDK is `iphoneos`, or `None` for any
+    /// other target, and for one whose `SUPPORTED_PLATFORMS` lists `macosx`,
+    /// which builds natively. xcodebuild picks the Mac Catalyst destination for a
+    /// target that supports Catalyst, and otherwise the "Designed for iPad"
+    /// one, which builds for `iphoneos` and runs the iOS app on the Mac. On
+    /// Xcode 27 an iOS app with neither `SUPPORTS_MACCATALYST` nor
+    /// `SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD` authored reports `PLATFORM_NAME
+    /// = iphoneos` and builds into `Debug-iphoneos` there. An application or
+    /// app extension doesn't support Catalyst unless it says so (their product
+    /// types default `SUPPORTS_MACCATALYST` to `NO`); a framework or library
+    /// does (the iOS platform's default is `YES`). The query's `-xcconfig` and
+    /// `KEY=VALUE` settings count, as they do for the build.
+    pub fn mac_destination_variant(
+        &self,
+        query: &ResolveQuery,
+    ) -> Result<Option<MacVariant>, Error> {
+        let bundle = self.document.build_settings(
+            &self.project.path,
+            &query.target,
+            &query.configuration,
+        )?;
+        if default_sdk(&bundle.layers) != "iphoneos" {
+            return Ok(None);
+        }
+        let ios = ResolveQuery {
+            sdk: "iphoneos".into(),
+            destination: None,
+            ..query.clone()
+        };
+        let authored = self.authored_probe(&bundle, &ios).settings;
+        // A target that lists `macosx` among its supported platforms builds
+        // natively for a macOS destination, as xcodebuild builds it.
+        if authored
+            .get("SUPPORTED_PLATFORMS")
+            .is_some_and(|platforms| {
+                platforms
+                    .split_whitespace()
+                    .any(|p| p.eq_ignore_ascii_case("macosx"))
+            })
+        {
+            return Ok(None);
+        }
+        let yes = |key: &str| authored.get(key).map(|v| v.eq_ignore_ascii_case("YES"));
+        let catalyst = yes("SUPPORTS_MACCATALYST").unwrap_or_else(|| {
+            let default = self.xcspec.as_ref().and_then(|catalog| {
+                let layer = catalog.layer_for(bundle.product_type.as_deref(), Some("iphoneos"));
+                project::last_unconditional_setting(&[layer], "SUPPORTS_MACCATALYST")
+            });
+            default.map_or_else(
+                || {
+                    !matches!(
+                        bundle.product_type.as_deref(),
+                        Some(
+                            "com.apple.product-type.application"
+                                | "com.apple.product-type.app-extension"
+                        )
+                    )
+                },
+                |v| v.eq_ignore_ascii_case("YES"),
+            )
+        });
+        Ok(Some(if catalyst {
+            MacVariant::Catalyst
+        } else if yes("SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD").unwrap_or(true) {
+            MacVariant::DesignedForIpad
+        } else {
+            MacVariant::None
+        }))
     }
 
     /// Turn a scheme's `BuildAction` into a list of [`ResolveQuery`]s
@@ -462,9 +648,16 @@ impl BuildContext {
         if !self.extra_xcconfig.is_empty() {
             sans_overrides_layers.push(self.extra_xcconfig.clone());
         }
-        let mut layers = sans_overrides_layers.clone();
-        if !query.overrides.is_empty() {
-            layers.push(query.overrides.clone());
+        let (below_overlay, above) = self.split_overrides(&query.overrides);
+        let mut layers = bundle.layers.clone();
+        if !below_overlay.is_empty() {
+            layers.push(below_overlay);
+        }
+        if !self.extra_xcconfig.is_empty() {
+            layers.push(self.extra_xcconfig.clone());
+        }
+        if !above.is_empty() {
+            layers.push(above);
         }
         // xcodebuild binds `[sdk=...]` conditionals against the resolved
         // SDK's canonical (versioned) name, e.g. `macosx26.0` — that's why
@@ -648,7 +841,7 @@ impl BuildContext {
             .or(catalog_code_signing_required)
             .is_none_or(|v| !v.eq_ignore_ascii_case("NO"));
 
-        layers.push(project::built_in_settings(
+        let mut built_in = project::built_in_settings(
             &self.project.path,
             &query.target,
             &query.configuration,
@@ -677,7 +870,17 @@ impl BuildContext {
             self.xcspec.as_ref().and_then(|c| c.host_macos.as_deref()),
             macos_destination_unbound,
             query.scheme_sanitizers,
-        ));
+        );
+        // `built_in_settings` never sees the project document, so it reports
+        // `en`; xcodebuild reports the project's own development region.
+        if let Some(region) = &bundle.development_region
+            && let Some(language) = built_in
+                .iter_mut()
+                .find(|a| a.key == "DEVELOPMENT_LANGUAGE")
+        {
+            language.value.clone_from(region);
+        }
+        layers.push(built_in);
 
         // Target-graph derived settings (parent-app / test-host edges).
         // Sits between built-ins and user layers so an explicit user value
@@ -710,6 +913,10 @@ impl BuildContext {
 
         layers.extend(bundle.layers.iter().cloned());
 
+        let (below_overlay, above_overrides) = self.split_overrides(&query.overrides);
+        if !below_overlay.is_empty() {
+            layers.push(below_overlay);
+        }
         if !self.extra_xcconfig.is_empty() {
             layers.push(self.extra_xcconfig.clone());
         }
@@ -753,16 +960,36 @@ impl BuildContext {
         if let Some(p) = resolved_sdkroot
             && !auto_no_destination
         {
-            layers.push(vec![Assignment {
+            let mut sdk_layer = vec![Assignment {
                 key: "SDKROOT".into(),
                 conditions: Vec::new(),
-                value: p,
+                value: p.clone(),
                 condition: None,
-            }]);
+            }];
+            // Xcode 27 reports SYSROOT alongside SDKROOT and always equal to
+            // it (154/154 per-target captures; the two exceptions are the
+            // `SDKROOT = auto` targets, where 27 omits SYSROOT too, which is
+            // why this sits under the same guard). 26.5 and older never
+            // emitted the key. Its `Swift.xcspec` entry is a `Path` option
+            // with no `DefaultValue`, so the spec alone resolves it empty.
+            if project::effective_xcode_major(
+                self.xcspec
+                    .as_ref()
+                    .and_then(|c| c.xcode_version.as_deref()),
+            ) >= 27
+            {
+                sdk_layer.push(Assignment {
+                    key: "SYSROOT".into(),
+                    conditions: Vec::new(),
+                    value: p,
+                    condition: None,
+                });
+            }
+            layers.push(sdk_layer);
         }
 
-        if !query.overrides.is_empty() {
-            layers.push(query.overrides.clone());
+        if !above_overrides.is_empty() {
+            layers.push(above_overrides);
         }
 
         layers
@@ -812,6 +1039,97 @@ impl BuildContext {
         };
         Some(format!("/{wrapper}.app{contents}/PlugIns"))
     }
+}
+
+/// The build-location settings `xcodebuild` folds once they resolve, in the
+/// order it settles them: `.` and empty components dropped and each `..`
+/// folded into the component before it, without reading the filesystem, so
+/// `SYMROOT=/tmp/../tmp/x` reports `/tmp/x`. Those marked `true` read a
+/// relative value against the project's directory first, so `OBJROOT=obj`
+/// is `<project dir>/obj`. The settings built from one see the folded value,
+/// `BUILD_DIR` from `SYMROOT` among them, while a `BUILD_DIR` set itself
+/// keeps its spelling like any setting not listed here. Pinned against
+/// `xcodebuild -showBuildSettings` on Xcode 27 with the value typed on the
+/// command line, in an `-xcconfig` and in the project (the
+/// `build_location_fold_oracle` suite).
+const FOLDED_LOCATIONS: [(&str, bool); 12] = [
+    ("SYMROOT", true),
+    ("OBJROOT", true),
+    ("DSTROOT", true),
+    ("CONFIGURATION_BUILD_DIR", true),
+    ("BUILT_PRODUCTS_DIR", true),
+    ("CONFIGURATION_TEMP_DIR", true),
+    ("TARGET_TEMP_DIR", true),
+    ("TEMP_DIR", true),
+    ("SHARED_PRECOMPS_DIR", true),
+    ("INSTALL_DIR", false),
+    ("LOCROOT", true),
+    ("LOCSYMROOT", true),
+];
+
+/// Resolve `layers`, folding [`FOLDED_LOCATIONS`] the way `xcodebuild` does.
+/// Each one that changes is pinned to its folded value in a layer on top and
+/// the stack resolved again, so everything expanded from it afterwards sees
+/// the folded spelling. The default layout folds to itself, so a project that
+/// moves nothing resolves once.
+///
+/// `TARGET_BUILD_DIR` is the exception Xcode 27 makes: a value set for it is
+/// reported folded, never anchored, while `CODESIGNING_FOLDER_PATH` and
+/// `METAL_LIBRARY_OUTPUT_DIR` keep the spelling it was given, so only the
+/// reported value is folded.
+fn resolve_folding_locations(
+    mut layers: Vec<Vec<Assignment>>,
+    ctx: &ResolveContext,
+) -> BTreeMap<String, String> {
+    let resolve = |layers: &[Vec<Assignment>]| {
+        let refs: Vec<&[Assignment]> = layers.iter().map(Vec::as_slice).collect();
+        resolver::resolve(&refs, ctx)
+    };
+    let mut settings = resolve(&layers);
+    let pinned = layers.len();
+    for (key, anchored) in FOLDED_LOCATIONS {
+        let project_dir = settings.get("PROJECT_DIR").filter(|_| anchored);
+        let Some(folded) = settings
+            .get(key)
+            .and_then(|value| folded_location(value, project_dir.map(String::as_str)))
+        else {
+            continue;
+        };
+        if layers.len() == pinned {
+            layers.push(Vec::new());
+        }
+        layers[pinned].push(Assignment {
+            key: key.to_string(),
+            conditions: Vec::new(),
+            // A literal: a `$` in the path is not a reference.
+            value: folded.replace('$', "$$"),
+            condition: None,
+        });
+        settings = resolve(&layers);
+    }
+    if let Some(folded) = settings
+        .get("TARGET_BUILD_DIR")
+        .and_then(|value| folded_location(value, None))
+    {
+        settings.insert("TARGET_BUILD_DIR".to_string(), folded);
+    }
+    settings
+}
+
+/// `value` folded as a build location, read against `project_dir` when it is
+/// relative and one is given, or `None` when that changes nothing. An empty
+/// value stays empty: Xcode 15 reports an empty `LOCROOT`.
+fn folded_location(value: &str, project_dir: Option<&str>) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let folded = match project_dir {
+        Some(dir) if !value.starts_with('/') => {
+            resolver::standardize_path(&format!("{dir}/{value}"))
+        }
+        _ => resolver::standardize_path(value),
+    };
+    (folded != value).then_some(folded)
 }
 
 /// Whether a scheme entry's `ReferencedContainer` (e.g.
@@ -883,6 +1201,7 @@ fn target_graph_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::ScratchDir;
     use std::path::PathBuf;
 
     fn scratch_path() -> PathBuf {
@@ -965,13 +1284,13 @@ mod tests {
         assert!(err.is_lookup_miss(), "a missing target is a lookup miss");
     }
 
-    /// A unique scratch dir holding `content` as an extra `.xcconfig`.
-    fn scratch_xcconfig(tag: &str, content: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sweetpad-bc-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A unique scratch dir holding `content` as an extra `.xcconfig`, which
+    /// goes when the returned guard drops.
+    fn scratch_xcconfig(tag: &str, content: &str) -> (ScratchDir, PathBuf) {
+        let dir = ScratchDir::new(&format!("sweetpad-bc-{tag}")).unwrap();
         let path = dir.join("overlay.xcconfig");
         std::fs::write(&path, content).unwrap();
-        path
+        (dir, path)
     }
 
     fn get(resolved: &Resolved, key: &str) -> String {
@@ -1010,7 +1329,7 @@ mod tests {
     /// source-derived order.)
     #[test]
     fn orthogonal_sanitizers_concatenate_object_dir_suffix_in_order() {
-        let xcconfig = scratch_xcconfig(
+        let (_dir, xcconfig) = scratch_xcconfig(
             "sanitizers",
             "ENABLE_ADDRESS_SANITIZER = YES\nENABLE_UNDEFINED_BEHAVIOR_SANITIZER = YES\n",
         );
@@ -1036,7 +1355,7 @@ mod tests {
     /// an optimized build.
     #[test]
     fn extra_xcconfig_flips_the_optimization_gates() {
-        let xcconfig = scratch_xcconfig(
+        let (_dir, xcconfig) = scratch_xcconfig(
             "opt-gate",
             "MY_LEVEL = 0\nGCC_OPTIMIZATION_LEVEL[config=Debug] = $(MY_LEVEL)\n",
         );
@@ -1078,7 +1397,7 @@ mod tests {
     /// matches the query's SDK binding.
     #[test]
     fn conditional_supports_maccatalyst_reaches_the_catalyst_gate() {
-        let xcconfig =
+        let (_dir, xcconfig) =
             scratch_xcconfig("catalyst-gate", "SUPPORTS_MACCATALYST[sdk=macosx*] = YES\n");
         let plain = BuildContext::open(&scratch_path()).unwrap();
         let overlaid = BuildContext::open(&scratch_path())
@@ -1093,6 +1412,95 @@ mod tests {
         );
     }
 
+    /// `PROJECT_DIR`, `SRCROOT`, `PROJECT_FILE_PATH` and every location read
+    /// against them take the one spelling `xcodebuild -showBuildSettings`
+    /// prints however the project is named: symlinks resolved, and a leading
+    /// `/private` dropped.
+    ///
+    /// Captured on Xcode 27 for a project at `/private/tmp/…/app`, opened as
+    /// `/tmp/…/app`, as `/private/tmp/…/app` and through a symlinked
+    /// `/private/tmp/…/link`, each as an absolute `-project` and as a relative
+    /// one from a directory reached that way. All six reported `PROJECT_DIR =
+    /// /tmp/…/app`, and with `SYMROOT=build` on the command line, `SYMROOT =
+    /// BUILD_DIR = /tmp/…/app/build`. A symlinked checkout under `/Users`
+    /// reported its real directory. A `-derivedDataPath` loses the `/private`,
+    /// and keeps the symlink until the directory exists: `/private/tmp/…/link/dd`
+    /// reported `BUILD_DIR = /tmp/…/link/dd/Build/Products`, and `/tmp/…/app/dd/
+    /// Build/Products` once a run had created it. The scratch project here sits
+    /// under `$TMPDIR`, which `/var` reaches the way `/tmp` reaches
+    /// `/private/tmp`.
+    #[test]
+    fn project_paths_take_the_spelling_xcodebuild_prints() {
+        let root = ScratchDir::new("sweetpad-bc-spelling").unwrap();
+        let private = std::fs::canonicalize(&*root).unwrap();
+        let short = sweetpad_lib::project::standardize(&private);
+        if short == private {
+            eprintln!(
+                "skipped: {} is not under a /private root",
+                private.display()
+            );
+            return;
+        }
+        let real = private.join("real");
+        std::fs::create_dir_all(real.join("Scratch.xcodeproj")).unwrap();
+        std::fs::copy(
+            scratch_path().join("project.pbxproj"),
+            real.join("Scratch.xcodeproj/project.pbxproj"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, private.join("link")).unwrap();
+
+        let dir = short.join("real").display().to_string();
+        let query = ResolveQuery::new("Scratch", "Debug", "macosx", "arm64");
+        for opened in [
+            short.join("real/Scratch.xcodeproj"),
+            private.join("real/Scratch.xcodeproj"),
+            private.join("link/Scratch.xcodeproj"),
+            short.join("link/Scratch.xcodeproj"),
+        ] {
+            let ctx = BuildContext::open(&opened).unwrap();
+            let relocated = ctx
+                .resolve(&query.clone().with_override("SYMROOT", "build"))
+                .unwrap();
+            for (key, value) in [
+                ("PROJECT_DIR", dir.clone()),
+                ("SRCROOT", dir.clone()),
+                ("PROJECT_FILE_PATH", format!("{dir}/Scratch.xcodeproj")),
+                ("SYMROOT", format!("{dir}/build")),
+                ("BUILD_DIR", format!("{dir}/build")),
+                ("TARGET_BUILD_DIR", format!("{dir}/build/Debug")),
+            ] {
+                assert_eq!(
+                    get(&relocated, key),
+                    value,
+                    "{key} for {}",
+                    opened.display()
+                );
+            }
+
+            let moved = ctx
+                .resolve(
+                    &query
+                        .clone()
+                        .with_derived_data_path(private.join("link/dd")),
+                )
+                .unwrap();
+            assert_eq!(
+                get(&moved, "BUILD_DIR"),
+                short.join("link/dd/Build/Products").display().to_string(),
+                "BUILD_DIR for {}",
+                opened.display()
+            );
+        }
+
+        std::fs::create_dir(real.join("dd")).unwrap();
+        let ctx = BuildContext::open(&private.join("link/Scratch.xcodeproj")).unwrap();
+        let moved = ctx
+            .resolve(&query.with_derived_data_path(private.join("link/dd")))
+            .unwrap();
+        assert_eq!(get(&moved, "BUILD_DIR"), format!("{dir}/dd/Build/Products"));
+    }
+
     /// The DerivedData container hash uses the *standardized* project path —
     /// symlinks resolved, a leading `/private` dropped for the symlinked roots
     /// — because that is the spelling xcodebuild hashes.
@@ -1105,8 +1513,7 @@ mod tests {
     /// `build --json`'s `productPath`) to a folder no build ever wrote.
     #[test]
     fn derived_data_hash_uses_the_standardized_path() {
-        let root = std::env::temp_dir().join(format!("sweetpad-bc-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = ScratchDir::new("sweetpad-bc-link").unwrap();
         let real = root.join("real");
         let link = root.join("link");
         std::fs::create_dir_all(real.join("Scratch.xcodeproj")).unwrap();
@@ -1142,7 +1549,6 @@ mod tests {
             !build_dir.contains(&format!("Scratch-{link_hash}")),
             "BUILD_DIR must not hash the symlink spelling: {build_dir}"
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Regression for #285: when the declared DerivedData container is the
@@ -1153,8 +1559,7 @@ mod tests {
     /// for the built app in a directory Xcode never wrote to.
     #[test]
     fn xcodeproj_stub_workspace_container_resolves_to_the_outer_project() {
-        let root = std::env::temp_dir().join(format!("sweetpad-bc-stub-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = ScratchDir::new("sweetpad-bc-stub").unwrap();
         let xcodeproj = root.join("Scratch.xcodeproj");
         std::fs::create_dir_all(&xcodeproj).unwrap();
         std::fs::copy(
@@ -1174,9 +1579,8 @@ mod tests {
             .unwrap();
         let build_dir = get(&resolved, "BUILD_DIR");
 
-        let project_hash =
-            sweetpad_lib::xcode_hash::derived_data_hash(&xcodeproj.display().to_string());
-        let stub_hash = sweetpad_lib::xcode_hash::derived_data_hash(&stub.display().to_string());
+        let project_hash = sweetpad_lib::derived_data::container_hash(&xcodeproj);
+        let stub_hash = sweetpad_lib::derived_data::container_hash(&stub);
         assert!(
             build_dir.contains(&format!("Scratch-{project_hash}")),
             "BUILD_DIR must use the outer .xcodeproj name + hash: {build_dir}"
@@ -1185,6 +1589,48 @@ mod tests {
             !build_dir.contains(&format!("project-{stub_hash}")),
             "BUILD_DIR must not use the project.xcworkspace stub: {build_dir}"
         );
-        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `xcodebuild -project Scratch.xcodeproj` on Xcode 27 builds into
+    /// `Scratch-<hash of the project>`, whose `info.plist` names the
+    /// `.xcodeproj` as its `WorkspacePath`, even with a workspace beside it
+    /// that lists the project. Only a declared workspace keys DerivedData.
+    #[test]
+    fn a_project_beside_a_workspace_that_lists_it_keys_derived_data_by_itself() {
+        let root = crate::scratch::ScratchDir::new("sweetpad-bc-member").unwrap();
+        let xcodeproj = root.join("Scratch.xcodeproj");
+        std::fs::create_dir_all(&xcodeproj).unwrap();
+        std::fs::copy(
+            scratch_path().join("project.pbxproj"),
+            xcodeproj.join("project.pbxproj"),
+        )
+        .unwrap();
+        let workspace = root.join("App.xcworkspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("contents.xcworkspacedata"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Workspace version = \"1.0\">\n   \
+             <FileRef location = \"group:Scratch.xcodeproj\"></FileRef>\n</Workspace>\n",
+        )
+        .unwrap();
+        let query = ResolveQuery::new("Scratch", "Debug", "macosx", "arm64");
+        let project_hash = sweetpad_lib::derived_data::container_hash(&xcodeproj);
+        let workspace_hash = sweetpad_lib::derived_data::container_hash(&workspace);
+
+        let alone = BuildContext::open(&xcodeproj).unwrap();
+        let build_dir = get(&alone.resolve(&query).unwrap(), "BUILD_DIR");
+        assert!(
+            build_dir.contains(&format!("/Scratch-{project_hash}/")),
+            "{build_dir}"
+        );
+
+        let through = BuildContext::open(&xcodeproj)
+            .unwrap()
+            .with_derived_data_container(&workspace);
+        let build_dir = get(&through.resolve(&query).unwrap(), "BUILD_DIR");
+        assert!(
+            build_dir.contains(&format!("/App-{workspace_hash}/")),
+            "{build_dir}"
+        );
     }
 }

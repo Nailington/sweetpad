@@ -1,10 +1,12 @@
-//! `sweetpad pbxproj …` — the plumbing namespace for `project.pbxproj`
-//! object-graph surgery (CLI_DESIGN §9g).
+//! `sweetpad pbxproj …` — the plumbing namespace for project-document
+//! surgery (CLI_DESIGN §9g).
 //!
-//! Inside this namespace you are thinking about pbxproj *objects* — stored
-//! build settings, synchronized folders, per-file target membership, merge
-//! resolution — not everyday tasks (those stay porcelain: `settings show`,
-//! `dependency`, `build`, …). The commands here are built for scripts and
+//! Inside this namespace you are thinking about what the project file stores —
+//! build settings, synchronized folders, per-file target membership, the
+//! navigator tree, merge resolution — not everyday tasks (those stay
+//! porcelain: `settings show`, `dependency`, `build`, …). Everything but
+//! `resolve` and `group attach`/`detach` reads and writes either document
+//! format, `project.pbxproj` or `project.xcproj`. The commands here are built for scripts and
 //! agents: explicit, idempotent, never guessing — an ambiguous workspace,
 //! target, or configuration is a hard error naming the flag that
 //! disambiguates, on a TTY or off. All mutation rides the shared
@@ -18,7 +20,6 @@ use crate::cli::merge::{self, Kind};
 use crate::cli::pbxedit;
 use crate::cli::resolve;
 use crate::cli::{CliError, CommandResult, ContainerArgs, Context};
-use sweetpad_lib::pbxproj::Value;
 
 pub mod fileref;
 pub mod folder;
@@ -54,8 +55,8 @@ pub enum Action {
         #[command(subcommand)]
         action: membership::Action,
     },
-    /// File references: the objects that say a file exists in the project,
-    /// independent of any group or target.
+    /// The files the project holds, independent of which group shows them
+    /// or which target builds them.
     Fileref {
         #[command(subcommand)]
         action: fileref::Action,
@@ -79,47 +80,48 @@ pub fn run(ctx: &mut Context, action: &Action) -> CommandResult {
     }
 }
 
-/// Locate and parse the pbxproj a namespace action operates on, under the
-/// shared never-guess rules ([`pbxedit::mutation_xcodeproj`]).
-pub(super) fn open_project(
+/// Locate and parse the project document a namespace action operates on,
+/// under the shared never-guess rules ([`pbxedit::mutation_xcodeproj`]).
+pub(super) fn open_document(
     ctx: &mut Context,
     container_args: &ContainerArgs,
     target: Option<&String>,
-) -> Result<(PathBuf, Value), CliError> {
+) -> Result<(PathBuf, pbxedit::Editable), CliError> {
     ctx.targeting = container_args.clone().into();
     let container = resolve::container(ctx)?;
     let targets: Vec<String> = target.cloned().into_iter().collect();
     let xcodeproj = pbxedit::mutation_xcodeproj(ctx, &container, &targets)?;
-    let root = pbxedit::parse_owned(&xcodeproj)?;
-    Ok((xcodeproj, root))
+    let document = pbxedit::Editable::parse(&xcodeproj)?;
+    Ok((xcodeproj, document))
 }
 
-/// [`open_project`] for the *mutation* verbs: additionally refuses to edit a
+/// [`open_document`] for the *mutation* verbs: additionally refuses to edit a
 /// generated project without `--force` ([`pbxedit::guard_generated`]), before
 /// any work or disk side effect happens.
-pub(super) fn open_project_mut(
+pub(super) fn open_document_mut(
     ctx: &mut Context,
     container_args: &ContainerArgs,
-    target: Option<&String>,
+    targets: &[String],
     force: bool,
-) -> Result<(PathBuf, Value), CliError> {
+) -> Result<(PathBuf, pbxedit::Editable), CliError> {
     ctx.targeting = container_args.clone().into();
     let container = resolve::container(ctx)?;
-    let targets: Vec<String> = target.cloned().into_iter().collect();
-    let xcodeproj = pbxedit::mutation_xcodeproj(ctx, &container, &targets)?;
+    let xcodeproj = pbxedit::mutation_xcodeproj(ctx, &container, targets)?;
     pbxedit::guard_generated(ctx.project_file(&container), &xcodeproj, force)?;
-    let root = pbxedit::parse_owned(&xcodeproj)?;
-    Ok((xcodeproj, root))
+    let document = pbxedit::Editable::parse(&xcodeproj)?;
+    Ok((xcodeproj, document))
 }
 
 /// The target to act on: the `--target` flag, or the project's only target.
 /// Multiple targets without a flag is ambiguity — a hard error naming them.
-pub(super) fn settle_target(root: &Value, flag: Option<&String>) -> Result<String, CliError> {
+pub(super) fn settle_target(
+    document: &pbxedit::Editable,
+    flag: Option<&String>,
+) -> Result<String, CliError> {
     if let Some(target) = flag {
         return Ok(target.clone());
     }
-    let names = sweetpad_lib::settings_pbxproj::target_names(root);
-    match names.as_slice() {
+    match document.target_names().as_slice() {
         [] => Err(CliError::new("the project declares no targets")),
         [only] => Ok(only.clone()),
         many => Err(CliError::new(format!(

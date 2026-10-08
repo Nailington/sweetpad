@@ -26,7 +26,12 @@ sweetpad-core.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 dialoguer.workspace = true
+toml_edit.workspace = true
 libc.workspace = true
+minreq.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+sha2 = "0.10"
 
 [lints]
 workspace = true

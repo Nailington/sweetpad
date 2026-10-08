@@ -69,6 +69,7 @@ pub fn run(ctx: &mut Context, action: &Action) -> CommandResult {
 fn new(ctx: &mut Context, args: &NewArgs) -> CommandResult {
     let interactive = ctx.out.is_interactive();
     let color = ctx.out.use_color();
+    validate_typed(args)?;
     let cwd = std::env::current_dir()
         .map_err(|e| CliError::new(format!("cannot read current directory: {e}")))?;
 
@@ -115,6 +116,24 @@ struct Answers {
     git: bool,
 }
 
+/// Refuse a typed name, bundle identifier, or deployment target that can't
+/// be used, before the wizard asks anything else. The command line alone
+/// decides it, so it is a usage error. A name taken from the current
+/// directory is checked later, with the rest of the answers.
+fn validate_typed(args: &NewArgs) -> Result<(), CliError> {
+    let usage = |e: String| CliError::new(e).kind(ErrorKind::Usage);
+    if let Some(name) = &args.name {
+        scaffold::validate_name(name).map_err(usage)?;
+    }
+    if let Some(bundle_id) = &args.bundle_id {
+        scaffold::validate_bundle_id(bundle_id).map_err(usage)?;
+    }
+    if let Some(target) = &args.deployment_target {
+        scaffold::validate_deployment_target(target).map_err(usage)?;
+    }
+    Ok(())
+}
+
 fn dir_basename(dir: &Path) -> Option<String> {
     dir.file_name().map(|n| n.to_string_lossy().into_owned())
 }
@@ -153,6 +172,7 @@ fn gather_answers(
                 "a project name is required (pass it as an argument, or use \
                  --current-dir to name the project after the current directory)",
             )
+            .kind(ErrorKind::Usage)
         })?,
     };
 
@@ -266,8 +286,8 @@ fn confirm(prompt: &str, default: bool, color: bool) -> Result<bool, CliError> {
 }
 
 /// Refuse to scaffold over an existing non-empty directory. `--force` waives the
-/// check outright; on a TTY without it, the user is asked (default no); off a
-/// TTY it's a hard error.
+/// check outright; on a TTY without it, the user is asked (default no), and a
+/// no is a cancel; off a TTY it's a usage error naming `--force`.
 fn ensure_writable(root: &Path, force: bool, interactive: bool, color: bool) -> CliResult {
     let mut entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -282,19 +302,22 @@ fn ensure_writable(root: &Path, force: bool, interactive: bool, color: bool) -> 
     if entries.next().is_none() || force {
         return Ok(());
     }
-    if interactive
-        && confirm(
-            &format!("{} is not empty. Scaffold into it anyway?", root.display()),
-            false,
-            color,
-        )?
-    {
-        return Ok(());
-    }
-    Err(CliError::new(format!(
+    let refusal = CliError::new(format!(
         "{} already exists and is not empty (use --force to scaffold into it anyway)",
         root.display()
-    )))
+    ));
+    if !interactive {
+        // '--force' is the answer the prompt would have asked for.
+        return Err(refusal.kind(ErrorKind::Usage));
+    }
+    if confirm(
+        &format!("{} is not empty. Scaffold into it anyway?", root.display()),
+        false,
+        color,
+    )? {
+        return Ok(());
+    }
+    Err(refusal.kind(ErrorKind::UserCancel))
 }
 
 /// Write each generated file under `root`, creating parent directories.
@@ -505,7 +528,10 @@ fn gather(container: &Container) -> Result<Info, CliError> {
             })?;
             // `info` is an explicit enumeration, so it pays for the packages'
             // manifests rather than under-reporting what the workspace holds.
-            let members = sweetpad_core::package_members::resolve_workspace(&ws, None);
+            let members = sweetpad_core::package_members::resolve_workspace(
+                &ws,
+                &sweetpad_core::package_members::Toolchain::default(),
+            );
             Ok(Info {
                 kind: "workspace",
                 name: ws.name.clone(),
@@ -523,7 +549,10 @@ fn gather(container: &Container) -> Result<Info, CliError> {
             let proj = sweetpad_lib::project::open(p).map_err(|e| {
                 CliError::new(format!("failed to read project {}: {e}", p.display()))
             })?;
-            let members = sweetpad_core::package_members::resolve_project(&proj, None);
+            let members = sweetpad_core::package_members::resolve_project(
+                &proj,
+                &sweetpad_core::package_members::Toolchain::default(),
+            );
             Ok(Info {
                 kind: "project",
                 name: proj.name.clone(),
@@ -537,17 +566,17 @@ fn gather(container: &Container) -> Result<Info, CliError> {
         }
         Container::SwiftPackage(_) => {
             // No pbxproj to read; evaluate the manifest instead. Targets are
-            // every declared target; schemes mirror the synthesized set
-            // (products plus the package aggregate). SwiftPM builds are
-            // debug/release.
-            let manifest = crate::cli::swiftpm::manifest(container)?;
+            // every declared target; schemes are what `xcodebuild -list`
+            // prints in the package directory (its scheme files, products
+            // and the package aggregate). SwiftPM builds are debug/release.
+            let package = crate::cli::swiftpm::package_names(container)?;
             Ok(Info {
                 kind: "package",
-                name: manifest.name.clone(),
+                name: package.name,
                 path,
-                targets: manifest.targets.iter().map(|t| t.name.clone()).collect(),
+                targets: package.targets,
                 configurations: vec!["Debug".to_string(), "Release".to_string()],
-                schemes: manifest.scheme_names(),
+                schemes: package.schemes,
             })
         }
     }

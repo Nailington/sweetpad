@@ -1,9 +1,11 @@
 //! Hand-authored configuration: `~/.config/sweetpad/config.toml`.
 //!
 //! Global settings plus optional per-project overrides keyed by canonicalized
-//! project path. **The tool only ever reads this file** — it never rewrites it,
-//! so user comments and formatting are preserved. Machine-written remembered
-//! selections live separately in [`crate::cli::state`].
+//! project path. The file is the user's: the one write is `feedback off|on`
+//! setting `[feedback] enabled` through [`set_feedback_enabled`], which edits
+//! that key in place and keeps every other line, comments included.
+//! Machine-written remembered selections live separately in
+//! [`crate::cli::state`].
 //!
 //! Honors `XDG_CONFIG_HOME`, falling back to `~/.config`.
 
@@ -11,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use sweetpad_core::xcodebuild_args::{self, has_flag};
 
 /// Parsed `config.toml`. Missing file ⇒ [`Config::default`] (all empty).
 #[derive(Debug, Default, Deserialize)]
@@ -20,6 +23,8 @@ pub struct Config {
     pub defaults: Defaults,
     /// Per-project overrides, keyed by absolute project/workspace path.
     pub projects: BTreeMap<String, Defaults>,
+    /// `[feedback]`: whether `feedback submit` may send a report.
+    pub feedback: FeedbackConfig,
     /// Lint findings from [`load`](Config::load): unknown keys (typos parse
     /// cleanly and are silently ignored otherwise) and `[projects."…"]` tables
     /// whose key can't match a real container. Surfaced as warnings by the
@@ -56,6 +61,13 @@ pub struct TestingDefaults {
     /// Default test target: `test run` narrows to `-only-testing:<target>`
     /// when no explicit `--only-testing` selector is given.
     pub target: Option<String>,
+}
+
+/// The `[feedback]` table. Unset means on.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
+pub struct FeedbackConfig {
+    pub enabled: Option<bool>,
 }
 
 impl Config {
@@ -119,6 +131,105 @@ impl Config {
     }
 }
 
+/// What [`set_feedback_enabled`] did to `config.toml`.
+#[derive(Debug)]
+pub struct FeedbackEdit {
+    pub path: PathBuf,
+    /// Whether the file was written.
+    pub changed: bool,
+}
+
+/// Set `[feedback] enabled` in the user's `config.toml`, editing that key and
+/// keeping the rest of the file as written.
+///
+/// Turning feedback off writes `enabled = false`, creating the table, and the
+/// file, when they are missing. Turning it on sets an `enabled` key that is
+/// there to true and otherwise leaves the file alone, since unset means on, so
+/// `on` never creates a config file.
+///
+/// The write goes to a temporary file beside the real one and is renamed over
+/// it, so an interrupted write leaves the old file. A symlinked config (a
+/// dotfiles checkout) is written at the link's target, with its permissions.
+pub fn set_feedback_enabled(enabled: bool) -> Result<FeedbackEdit, String> {
+    let path = Config::path()
+        .ok_or("can't locate config.toml: neither XDG_CONFIG_HOME nor HOME is set")?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let edited =
+        edit_feedback_enabled(&text, enabled).map_err(|e| format!("{}: {e}", path.display()))?;
+    let Some(edited) = edited.filter(|new| *new != text) else {
+        return Ok(FeedbackEdit {
+            path,
+            changed: false,
+        });
+    };
+    let target = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let write = || -> std::io::Result<()> {
+        if let Some(dir) = target.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = target.with_file_name(format!(
+            ".{}.sweetpad-{}",
+            target
+                .file_name()
+                .map_or_else(|| "config.toml".into(), |n| n.to_string_lossy()),
+            std::process::id()
+        ));
+        std::fs::write(&tmp, &edited)?;
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &target).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    };
+    write().map_err(|e| format!("{}: {e}", target.display()))?;
+    Ok(FeedbackEdit {
+        path,
+        changed: true,
+    })
+}
+
+/// `text` with `[feedback] enabled` set to `enabled`, or `None` when turning
+/// feedback on needs no edit. A trailing comment on an existing `enabled`
+/// line stays on it.
+fn edit_feedback_enabled(text: &str, enabled: bool) -> Result<Option<String>, String> {
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| e.to_string())?;
+    match doc.get_mut("feedback") {
+        None if enabled => return Ok(None),
+        None => {
+            let mut table = toml_edit::Table::new();
+            table.insert("enabled", toml_edit::value(false));
+            doc.insert("feedback", toml_edit::Item::Table(table));
+        }
+        Some(item) => {
+            let Some(table) = item.as_table_like_mut() else {
+                return Err("'feedback' must be a table: [feedback]".to_string());
+            };
+            match table
+                .get_mut("enabled")
+                .and_then(toml_edit::Item::as_value_mut)
+            {
+                Some(value) => {
+                    let decor = value.decor().clone();
+                    *value = toml_edit::Value::from(enabled);
+                    *value.decor_mut() = decor;
+                }
+                None if enabled => return Ok(None),
+                None => {
+                    table.insert("enabled", toml_edit::value(false));
+                }
+            }
+        }
+    }
+    Ok(Some(doc.to_string()))
+}
+
 /// Overlay a per-project override onto a base value, keeping the base when the
 /// override is unset.
 fn layer(base: &mut Option<String>, over: Option<&String>) {
@@ -148,8 +259,15 @@ fn lint(raw: &toml::Value) -> Vec<String> {
                     }
                 }
             }
+            "feedback" => {
+                if let Some(table) = value.as_table() {
+                    for key in table.keys().filter(|k| *k != "enabled") {
+                        warnings.push(format!("config: unknown key '{key}' in [feedback]"));
+                    }
+                }
+            }
             other => warnings.push(format!(
-                "config: unknown key `{other}` (did you mean `defaults` or `projects`?)"
+                "config: unknown key '{other}' (did you mean 'defaults', 'projects' or 'feedback'?)"
             )),
         }
     }
@@ -166,15 +284,15 @@ fn lint_defaults(value: &toml::Value, at: &str, warnings: &mut Vec<String>) {
             if let Some(testing) = sub.as_table() {
                 for tkey in testing.keys() {
                     if !TESTING_KEYS.contains(&tkey.as_str()) {
-                        warnings.push(format!("config: unknown key `{tkey}` in {at} testing"));
+                        warnings.push(format!("config: unknown key '{tkey}' in {at} testing"));
                     }
                 }
             }
         } else if !DEFAULTS_KEYS.contains(&key.as_str()) {
             let hint = suggest(key, &DEFAULTS_KEYS)
-                .map(|s| format!(" (did you mean `{s}`?)"))
+                .map(|s| format!(" (did you mean '{s}'?)"))
                 .unwrap_or_default();
-            warnings.push(format!("config: unknown key `{key}` in {at}{hint}"));
+            warnings.push(format!("config: unknown key '{key}' in {at}{hint}"));
         }
     }
 }
@@ -315,9 +433,23 @@ pub struct XcodebuildDefaults {
     pub args: Vec<String>,
 }
 
+/// The effective `xcodebuild` passthrough for one invocation, and the file's
+/// arguments the typed tail replaced in it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MergedXcodebuildArgs {
+    pub args: Vec<String>,
+    /// Each file argument left out for a flag the tail also gives, as
+    /// `[flag, value]`: see [`SINGLE_USE_FLAGS`].
+    pub replaced: Vec<[String; 2]>,
+}
+
 /// The effective `xcodebuild` passthrough for one invocation: the committed
 /// `[xcodebuild] args` first, then the `--` tail typed on the command line, so
-/// a typed argument wins under `xcodebuild`'s last-one-wins.
+/// a typed argument wins under `xcodebuild`'s last-one-wins. A flag
+/// `xcodebuild` takes only once ([`SINGLE_USE_FLAGS`]) has no last one to
+/// win, so when the tail gives it, the file's copy and its value are left out.
+/// Both lists are read with [`xcodebuild_args::read`]: a value spelled like
+/// a flag (`-xcconfig -jobs`) is the value, and no copy of that flag.
 ///
 /// The file's arguments are refused when they name something the CLI already
 /// owns — [`configured_arg_refusal`] explains each case. Refusing is an error
@@ -326,43 +458,105 @@ pub struct XcodebuildDefaults {
 pub fn effective_xcodebuild_args(
     configured: &[String],
     tail: &[String],
-) -> Result<Vec<String>, String> {
-    if let Some((arg, fix)) = configured
-        .iter()
-        .find_map(|a| configured_arg_refusal(a).map(|fix| (a, fix)))
+) -> Result<MergedXcodebuildArgs, String> {
+    if let Some((arg, fix)) = xcodebuild_args::read(configured)
+        .find_map(|a| configured_arg_refusal(a.word).map(|fix| (a.word, fix)))
     {
         return Err(format!(
-            "sweetpad.toml: `{arg}` in [xcodebuild] args — {fix}"
+            "sweetpad.toml: '{arg}' in [xcodebuild] args — {fix}"
         ));
     }
-    let mut merged = configured.to_vec();
-    merged.extend(tail.iter().cloned());
-    Ok(merged)
+    // Merged, the tail would hand the flag its value, so the file has to
+    // give it one.
+    if let Some(flag) = xcodebuild_args::dangling_flag(configured) {
+        return Err(format!(
+            "sweetpad.toml: '{flag}' in [xcodebuild] args — add its value after it"
+        ));
+    }
+    let mut args = Vec::with_capacity(configured.len() + tail.len());
+    let mut replaced = Vec::new();
+    for arg in xcodebuild_args::read(configured) {
+        if SINGLE_USE_FLAGS.contains(&arg.word) && has_flag(tail, arg.word) {
+            let value = arg.value.unwrap_or_default();
+            replaced.push([arg.word.to_string(), value.to_string()]);
+        } else {
+            args.extend(arg.words().map(String::from));
+        }
+    }
+    args.extend(tail.iter().cloned());
+    Ok(MergedXcodebuildArgs { args, replaced })
 }
 
+/// The `xcodebuild` flags that fail a second copy ("option '-xcconfig' may
+/// only be provided once"), each of which takes a value, as Xcode 27 refuses
+/// them. The single-use flags [`configured_arg_refusal`] keeps out of the file
+/// (`-scheme`, `-derivedDataPath`, …) are not listed, and neither are the
+/// value flags a build may repeat (`-destination`, `-arch`, `-toolchain`,
+/// `-packageCachePath`).
+const SINGLE_USE_FLAGS: [&str; 31] = [
+    "-xcconfig",
+    "-jobs",
+    "-destination-timeout",
+    "-clonedSourcePackagesDirPath",
+    "-resultStreamPath",
+    "-resultBundleVersion",
+    "-xctestrun",
+    "-testProductsPath",
+    "-enableCodeCoverage",
+    "-enableAddressSanitizer",
+    "-enableThreadSanitizer",
+    "-enableUndefinedBehaviorSanitizer",
+    "-enablePerformanceTestsDiagnostics",
+    "-enableCodesizeProfile",
+    "-codesizeProfileOutputDir",
+    "-testLanguage",
+    "-testRegion",
+    "-test-iterations",
+    "-test-repetition-relaunch-enabled",
+    "-test-timeouts-enabled",
+    "-default-test-execution-time-allowance",
+    "-maximum-test-execution-time-allowance",
+    "-parallel-testing-enabled",
+    "-parallel-testing-worker-count",
+    "-maximum-parallel-testing-workers",
+    "-maximum-concurrent-test-device-destinations",
+    "-maximum-concurrent-test-simulator-destinations",
+    "-authenticationKeyPath",
+    "-authenticationKeyID",
+    "-authenticationKeyIssuerID",
+    "-scmProvider",
+];
+
 /// Why a given argument can't live in a committed `[xcodebuild] args`, if it
-/// can't. Three groups: the inputs the resolver settles and passes itself (a
+/// can't. Four groups: the inputs the resolver settles and passes itself (a
 /// second copy makes the build depend on which `xcodebuild` honors), the
-/// result bundle the CLI writes and then reads back, and `-derivedDataPath` —
-/// whose relative value would resolve against the working directory while
-/// every other path in this file resolves against the file, so the same
-/// committed line would mean a different directory per caller.
+/// result bundle `test` writes and then reads back, the paths `archive`
+/// names for its archive and export, and `-derivedDataPath`.
+/// Only the builds, `clean` and the app locator read this file, so a
+/// committed location would split them from `clean --purge`, `derived-data`
+/// and the BSP index, which keep the default one. A relative value would also
+/// resolve against the directory holding the project, where `xcodebuild`
+/// runs, while the file's `workspace`/`project` keys resolve against the file.
 fn configured_arg_refusal(arg: &str) -> Option<&'static str> {
     Some(match arg {
-        "-workspace" | "-project" => "name the container with the `workspace`/`project` key",
-        "-scheme" => "use the `scheme` key",
-        "-configuration" => "use the `configuration` key",
-        "-destination" => "use the `destination` key",
-        "-sdk" => "use the `sdk` key",
+        "-workspace" | "-project" => "name the container with the 'workspace'/'project' key",
+        "-scheme" => "use the 'scheme' key",
+        "-configuration" => "use the 'configuration' key",
+        "-destination" => "use the 'destination' key",
+        "-sdk" => "use the 'sdk' key",
         "-derivedDataPath" => {
-            "a relative value would resolve against the working directory rather than \
-             the file, so it would name a different place per caller; pass it per \
-             command instead"
+            "'clean --purge', 'derived-data' and the editor index would keep using the \
+             DerivedData location Xcode's settings name, and a relative value resolves against \
+             the project's directory, not this file's; pass it per command instead"
         }
         "-resultBundlePath" => {
-            "sweetpad writes and reads back its own result bundle; pass it per command \
-             if you need a second one"
+            "'sweetpad test' writes and reads back its own result bundle; name one per run \
+             with 'test --result-bundle', or after '--' on a build"
         }
+        "-archivePath" | "-exportPath" => {
+            "'sweetpad archive' names its own; use 'archive --output-file'"
+        }
+        "-exportOptionsPlist" => "'sweetpad archive' names its own; use 'archive --export-options'",
         _ => return None,
     })
 }
@@ -509,7 +703,7 @@ fn lint_project_file(raw: &toml::Value, warnings: &mut Vec<String>) {
     let Some(top) = raw.as_table() else { return };
     if top.contains_key("workspace") && top.contains_key("project") {
         warnings.push(
-            "sweetpad.toml: `workspace` and `project` are both set; using `workspace`".to_string(),
+            "sweetpad.toml: 'workspace' and 'project' are both set; using 'workspace'".to_string(),
         );
     }
     for (key, value) in top {
@@ -523,7 +717,7 @@ fn lint_project_file(raw: &toml::Value, warnings: &mut Vec<String>) {
                     .is_some_and(|s| std::path::Path::new(s).is_absolute())
                 {
                     warnings.push(format!(
-                        "sweetpad.toml: `{key}` is an absolute path, which won't resolve for \
+                        "sweetpad.toml: '{key}' is an absolute path, which won't resolve for \
                          anyone else with this repo — make it relative to sweetpad.toml"
                     ));
                 }
@@ -533,7 +727,7 @@ fn lint_project_file(raw: &toml::Value, warnings: &mut Vec<String>) {
                     for tkey in t.keys() {
                         if !TESTING_KEYS.contains(&tkey.as_str()) {
                             warnings
-                                .push(format!("sweetpad.toml: unknown key `{tkey}` in [testing]"));
+                                .push(format!("sweetpad.toml: unknown key '{tkey}' in [testing]"));
                         }
                     }
                 }
@@ -542,7 +736,7 @@ fn lint_project_file(raw: &toml::Value, warnings: &mut Vec<String>) {
                 if let Some(t) = value.as_table() {
                     for rkey in t.keys() {
                         if !["hot", "hot_recompiler", "auto_unsandbox"].contains(&rkey.as_str()) {
-                            warnings.push(format!("sweetpad.toml: unknown key `{rkey}` in [run]"));
+                            warnings.push(format!("sweetpad.toml: unknown key '{rkey}' in [run]"));
                         }
                     }
                 }
@@ -552,7 +746,7 @@ fn lint_project_file(raw: &toml::Value, warnings: &mut Vec<String>) {
                     for fkey in t.keys() {
                         if fkey != "tool" {
                             warnings
-                                .push(format!("sweetpad.toml: unknown key `{fkey}` in [format]"));
+                                .push(format!("sweetpad.toml: unknown key '{fkey}' in [format]"));
                         }
                     }
                 }
@@ -562,7 +756,7 @@ fn lint_project_file(raw: &toml::Value, warnings: &mut Vec<String>) {
                     for xkey in t.keys() {
                         if xkey != "args" {
                             warnings.push(format!(
-                                "sweetpad.toml: unknown key `{xkey}` in [xcodebuild]"
+                                "sweetpad.toml: unknown key '{xkey}' in [xcodebuild]"
                             ));
                         }
                     }
@@ -570,9 +764,9 @@ fn lint_project_file(raw: &toml::Value, warnings: &mut Vec<String>) {
             }
             other if !PROJECT_FILE_KEYS.contains(&other) => {
                 let hint = suggest(other, &PROJECT_FILE_KEYS)
-                    .map(|s| format!(" (did you mean `{s}`?)"))
+                    .map(|s| format!(" (did you mean '{s}'?)"))
                     .unwrap_or_default();
-                warnings.push(format!("sweetpad.toml: unknown key `{other}`{hint}"));
+                warnings.push(format!("sweetpad.toml: unknown key '{other}'{hint}"));
             }
             _ => {}
         }
@@ -596,6 +790,7 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::testdir::TempDir;
 
     #[test]
     fn for_project_layers_overrides_on_defaults() {
@@ -639,19 +834,19 @@ mod tests {
         // `[default]` instead of `[defaults]`, and a `schme` typo — both parse
         // cleanly (serde drops them), so the lint is the only signal.
         let cfg = Config::parse("[default]\nscheme = \"App\"\n").unwrap();
-        assert!(cfg.warnings.iter().any(|w| w.contains("`default`")));
+        assert!(cfg.warnings.iter().any(|w| w.contains("'default'")));
 
         let cfg = Config::parse("[defaults]\nschme = \"App\"\n").unwrap();
         assert!(
             cfg.warnings
                 .iter()
-                .any(|w| w.contains("`schme`") && w.contains("did you mean `scheme`?")),
+                .any(|w| w.contains("'schme'") && w.contains("did you mean 'scheme'?")),
             "warnings: {:?}",
             cfg.warnings
         );
 
         let cfg = Config::parse("[defaults.testing]\nsdk = \"x\"\n").unwrap();
-        assert!(cfg.warnings.iter().any(|w| w.contains("`sdk`")));
+        assert!(cfg.warnings.iter().any(|w| w.contains("'sdk'")));
 
         // A clean config produces no warnings.
         let cfg = Config::parse("[defaults]\nscheme = \"App\"\n").unwrap();
@@ -662,7 +857,7 @@ mod tests {
     fn project_key_that_is_a_directory_is_warned() {
         // The CLI_DESIGN doc-example mistake: keying by the project's directory
         // instead of the container path. It parses, then silently never matches.
-        let dir = std::env::temp_dir().join(format!("sweetpad-cfg-{}", std::process::id()));
+        let dir = TempDir::new("sweetpad-cfg");
         std::fs::create_dir_all(dir.join("App.xcodeproj")).unwrap();
         let text = format!("[projects.\"{}\"]\nscheme = \"App\"\n", dir.display());
         let cfg = Config::parse(&text).unwrap();
@@ -673,7 +868,6 @@ mod tests {
             "warnings: {:?}",
             cfg.warnings
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -681,14 +875,80 @@ mod tests {
         // A key with the right shape (even if absent on this machine's disk at
         // lint time it canonicalize-fails → no crash, no false "matches no
         // project on disk" for the container-shaped case).
-        let dir = std::env::temp_dir().join(format!("sweetpad-cfg2-{}", std::process::id()));
+        let dir = TempDir::new("sweetpad-cfg2");
         let proj = dir.join("App.xcodeproj");
         std::fs::create_dir_all(&proj).unwrap();
         let key = std::fs::canonicalize(&proj).unwrap();
         let text = format!("[projects.\"{}\"]\nscheme = \"App\"\n", key.display());
         let cfg = Config::parse(&text).unwrap();
         assert!(cfg.warnings.is_empty(), "warnings: {:?}", cfg.warnings);
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn feedback_off_adds_the_key_and_keeps_the_rest_of_the_file() {
+        let text = "# my defaults\n[defaults]\nscheme = \"App\"   # the main one\n\n\
+                    [projects.\"/work/App.xcodeproj\"]\nconfiguration = \"Debug\"\n";
+        let off = edit_feedback_enabled(text, false).unwrap().unwrap();
+        assert!(off.starts_with(text), "{off}");
+        assert!(off.ends_with("[feedback]\nenabled = false\n"), "{off}");
+        let cfg = Config::parse(&off).unwrap();
+        assert_eq!(cfg.feedback.enabled, Some(false));
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+
+        // On sets the same key back, comment and all; a second off is the
+        // file it started as.
+        let with_comment = off.replace("enabled = false", "enabled = false # quiet, please");
+        let on = edit_feedback_enabled(&with_comment, true).unwrap().unwrap();
+        assert!(on.contains("enabled = true # quiet, please"), "{on}");
+        assert_eq!(on.replace("true", "false"), with_comment);
+        assert_eq!(
+            edit_feedback_enabled(&on, false).unwrap().unwrap(),
+            with_comment
+        );
+    }
+
+    #[test]
+    fn feedback_on_needs_no_file_and_no_table() {
+        assert_eq!(edit_feedback_enabled("", true).unwrap(), None);
+        assert_eq!(
+            edit_feedback_enabled("[defaults]\nscheme = \"A\"\n", true).unwrap(),
+            None
+        );
+        // Off on an empty file is the table alone.
+        assert_eq!(
+            edit_feedback_enabled("", false).unwrap().unwrap(),
+            "[feedback]\nenabled = false\n"
+        );
+        // A dotted key and an inline table are edited where they are.
+        assert_eq!(
+            edit_feedback_enabled("feedback.enabled = true\n", false)
+                .unwrap()
+                .unwrap(),
+            "feedback.enabled = false\n"
+        );
+        assert_eq!(
+            edit_feedback_enabled("feedback = { enabled = false }\n", true)
+                .unwrap()
+                .unwrap(),
+            "feedback = { enabled = true }\n"
+        );
+    }
+
+    #[test]
+    fn feedback_edits_refuse_a_file_they_cant_read_as_toml() {
+        let err = edit_feedback_enabled("[defaults\n", false).unwrap_err();
+        assert!(!err.is_empty());
+        let err = edit_feedback_enabled("feedback = 1\n", false).unwrap_err();
+        assert!(err.contains("[feedback]"), "{err}");
+        // An unknown key in the table is a lint warning, like any other.
+        let cfg = Config::parse("[feedback]\nenable = false\n").unwrap();
+        assert!(
+            cfg.warnings
+                .iter()
+                .any(|w| w.contains("'enable' in [feedback]")),
+            "{:?}",
+            cfg.warnings
+        );
     }
 
     #[test]
@@ -747,13 +1007,101 @@ mod tests {
         // Committed first, typed second — xcodebuild takes the last one, so a
         // typed argument beats the file's.
         assert_eq!(
-            effective_xcodebuild_args(&s(&["-skipMacroValidation"]), &s(&["FOO=1"])).unwrap(),
+            effective_xcodebuild_args(&s(&["-skipMacroValidation"]), &s(&["FOO=1"]))
+                .unwrap()
+                .args,
             ["-skipMacroValidation", "FOO=1"]
         );
         // Either side alone.
-        assert_eq!(effective_xcodebuild_args(&s(&["-a"]), &[]).unwrap(), ["-a"]);
-        assert_eq!(effective_xcodebuild_args(&[], &s(&["-b"])).unwrap(), ["-b"]);
-        assert!(effective_xcodebuild_args(&[], &[]).unwrap().is_empty());
+        assert_eq!(
+            effective_xcodebuild_args(&s(&["-a"]), &[]).unwrap().args,
+            ["-a"]
+        );
+        assert_eq!(
+            effective_xcodebuild_args(&[], &s(&["-b"])).unwrap().args,
+            ["-b"]
+        );
+        assert!(effective_xcodebuild_args(&[], &[]).unwrap().args.is_empty());
+    }
+
+    #[test]
+    fn a_typed_single_use_flag_replaces_the_files_copy() {
+        let s = |args: &[&str]| args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>();
+
+        // Xcode 27 fails a second copy: "xcodebuild: error: option '-xcconfig'
+        // may only be provided once". The typed one is the one the caller
+        // asked for, so the file's goes, value and all.
+        let merged = effective_xcodebuild_args(
+            &s(&["-xcconfig", "a.xcconfig", "-skipMacroValidation", "FOO=1"]),
+            &s(&["-xcconfig", "b.xcconfig"]),
+        )
+        .unwrap();
+        assert_eq!(
+            merged.args,
+            ["-skipMacroValidation", "FOO=1", "-xcconfig", "b.xcconfig"]
+        );
+        assert_eq!(
+            merged.replaced,
+            [["-xcconfig".to_string(), "a.xcconfig".to_string()]]
+        );
+
+        // Every listed flag, and only when the tail gives it.
+        for flag in SINGLE_USE_FLAGS {
+            let merged =
+                effective_xcodebuild_args(&s(&[flag, "file"]), &s(&[flag, "typed"])).unwrap();
+            assert_eq!(merged.args, [flag, "typed"], "{flag}");
+            let kept = effective_xcodebuild_args(&s(&[flag, "file"]), &s(&["FOO=1"])).unwrap();
+            assert_eq!(kept.args, [flag, "file", "FOO=1"], "{flag}");
+            assert!(kept.replaced.is_empty(), "{flag}");
+        }
+
+        // A value flag a build may repeat keeps both copies, the way
+        // xcodebuild takes them.
+        let merged =
+            effective_xcodebuild_args(&s(&["-arch", "arm64"]), &s(&["-arch", "x86_64"])).unwrap();
+        assert_eq!(merged.args, ["-arch", "arm64", "-arch", "x86_64"]);
+        assert!(merged.replaced.is_empty());
+    }
+
+    /// A value spelled like a single-use flag is its flag's value, in the
+    /// file and in the tail, as xcodebuild reads it.
+    #[test]
+    fn a_value_spelled_like_a_single_use_flag_is_no_copy_of_it() {
+        let s = |args: &[&str]| args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>();
+
+        // The file's '-jobs' names its xcconfig, so the typed '-jobs'
+        // replaces nothing.
+        let merged =
+            effective_xcodebuild_args(&s(&["-xcconfig", "-jobs"]), &s(&["-jobs", "4"])).unwrap();
+        assert_eq!(merged.args, ["-xcconfig", "-jobs", "-jobs", "4"]);
+        assert!(merged.replaced.is_empty());
+        // The typed '-jobs' names the tail's xcconfig, so the file's stays.
+        let merged =
+            effective_xcodebuild_args(&s(&["-jobs", "4"]), &s(&["-xcconfig", "-jobs"])).unwrap();
+        assert_eq!(merged.args, ["-jobs", "4", "-xcconfig", "-jobs"]);
+        assert!(merged.replaced.is_empty());
+
+        // Each takes a value, which leaves with it.
+        for flag in SINGLE_USE_FLAGS {
+            assert!(xcodebuild_args::takes_value(flag), "{flag}");
+        }
+    }
+
+    #[test]
+    fn the_files_flags_take_their_values_inside_the_file() {
+        let s = |args: &[&str]| args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>();
+
+        // Merged, the tail's first argument would become the file's value.
+        for tail in [&[][..], &["FOO=1"]] {
+            let err = effective_xcodebuild_args(&s(&["-quiet", "-xcconfig"]), &s(tail))
+                .expect_err("a dangling flag");
+            assert_eq!(
+                err,
+                "sweetpad.toml: '-xcconfig' in [xcodebuild] args — add its value after it"
+            );
+        }
+        assert!(effective_xcodebuild_args(&s(&["-xcconfig", "a.xcconfig"]), &[]).is_ok());
+        assert!(effective_xcodebuild_args(&s(&["-xcconfig", "-quiet"]), &[]).is_ok());
     }
 
     #[test]
@@ -761,26 +1109,53 @@ mod tests {
         let s = |args: &[&str]| args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>();
 
         for (arg, hint) in [
-            ("-scheme", "`scheme` key"),
-            ("-configuration", "`configuration` key"),
-            ("-destination", "`destination` key"),
-            ("-sdk", "`sdk` key"),
-            ("-workspace", "`workspace`/`project` key"),
-            ("-project", "`workspace`/`project` key"),
+            ("-scheme", "'scheme' key"),
+            ("-configuration", "'configuration' key"),
+            ("-destination", "'destination' key"),
+            ("-sdk", "'sdk' key"),
+            ("-workspace", "'workspace'/'project' key"),
+            ("-project", "'workspace'/'project' key"),
             ("-derivedDataPath", "per command"),
-            ("-resultBundlePath", "own result bundle"),
+            // The fix names the flags that work: a build takes a typed
+            // '-resultBundlePath' after '--', and 'test' has its own flag.
+            (
+                "-resultBundlePath",
+                "'test --result-bundle', or after '--' on a build",
+            ),
+            ("-archivePath", "'archive --output-file'"),
+            ("-exportPath", "'archive --output-file'"),
+            ("-exportOptionsPlist", "'archive --export-options'"),
         ] {
             let err = effective_xcodebuild_args(&s(&[arg, "value"]), &[])
                 .expect_err("a refused argument must not merge");
             assert!(err.contains(arg) && err.contains(hint), "{arg}: {err}");
         }
 
+        // The reason has to hold: xcodebuild runs from the project's directory,
+        // so a relative value never meant the caller's working directory. What
+        // a committed one would break is every command that doesn't read it.
+        let err = effective_xcodebuild_args(&s(&["-derivedDataPath", "dd"]), &[]).unwrap_err();
+        assert!(!err.contains("working directory"), "{err}");
+        assert!(err.contains("project's directory"), "{err}");
+        assert!(
+            err.contains("'clean --purge'") && err.contains("'derived-data'"),
+            "{err}"
+        );
+
         // Typing one is still the caller's own business — only the committed
         // file is policed, since everyone else inherits it unseen.
         assert_eq!(
-            effective_xcodebuild_args(&[], &s(&["-derivedDataPath", "/tmp/dd"])).unwrap(),
+            effective_xcodebuild_args(&[], &s(&["-derivedDataPath", "/tmp/dd"]))
+                .unwrap()
+                .args,
             ["-derivedDataPath", "/tmp/dd"]
         );
+
+        // A value spelled like a refused flag is a value, as xcodebuild
+        // reads it: this names an xcconfig called '-scheme'.
+        assert!(effective_xcodebuild_args(&s(&["-xcconfig", "-scheme"]), &[]).is_ok());
+        let err = effective_xcodebuild_args(&s(&["-quiet", "-scheme", "App"]), &[]).unwrap_err();
+        assert!(err.contains("'-scheme'"), "{err}");
     }
 
     #[test]
@@ -805,18 +1180,18 @@ mod tests {
         assert_eq!(d.testing.destination, None);
     }
 
-    /// A scratch directory laid out like the reported case: a git root holding
-    /// the file, a sibling directory to run from, and the project one level
-    /// down.
-    fn nested_repo(tag: &str) -> PathBuf {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("sweetpad-rootfile-{tag}-{n}"));
+    /// Lay `root` out like the reported case: a git root holding the file, a
+    /// sibling directory to run from, and the project one level down.
+    fn lay_out_repo(root: &Path) {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("Scripts")).unwrap();
         std::fs::create_dir_all(root.join("Sources/App.xcodeproj")).unwrap();
+    }
+
+    /// A scratch directory laid out by [`lay_out_repo`].
+    fn nested_repo(tag: &str) -> TempDir {
+        let root = TempDir::new(&format!("sweetpad-rootfile-{tag}"));
+        lay_out_repo(&root);
         root
     }
 
@@ -830,33 +1205,25 @@ mod tests {
         .unwrap();
 
         // Found from the root itself and from a sibling directory below it.
-        for start in [root.clone(), root.join("Scripts")] {
+        for start in [root.to_path_buf(), root.join("Scripts")] {
             let (found, warnings) = RootFile::find_upward(&start).expect("file found");
             assert!(warnings.is_empty(), "{warnings:?}");
-            assert_eq!(found.dir, root);
+            assert_eq!(found.dir, *root);
             // Relative to the file, not to the directory the walk started in.
             let declared = found.declared().expect("declares a project");
             assert_eq!(declared.path(), root.join("Sources/App.xcodeproj"));
         }
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn find_upward_stops_at_the_git_root() {
-        let outer = nested_repo("outer");
         // A file above the repository must not donate its defaults.
-        let above = outer.parent().unwrap().join(format!(
-            "{}-above",
-            outer.file_name().unwrap().to_string_lossy()
-        ));
-        std::fs::create_dir_all(&above).unwrap();
+        let above = TempDir::new("sweetpad-rootfile-above");
         std::fs::write(above.join("sweetpad.toml"), "scheme = \"Stray\"").unwrap();
+        let outer = above.join("repo");
+        lay_out_repo(&outer);
 
         assert!(RootFile::find_upward(&outer.join("Scripts")).is_none());
-
-        std::fs::remove_dir_all(&outer).unwrap();
-        std::fs::remove_dir_all(&above).unwrap();
     }
 
     #[test]
@@ -893,8 +1260,6 @@ mod tests {
             found.declared().unwrap().path(),
             Path::new("/abs/Other.xcodeproj")
         );
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -929,7 +1294,5 @@ mod tests {
         assert!(plain.covers(&crate::cli::resolve::Container::Project(
             root.join("Beside.xcodeproj")
         )));
-
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

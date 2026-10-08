@@ -57,6 +57,21 @@ A few things to know:
   missing, and `> SweetPad: Diagnose BSP (Doctor)` reports it too.
 - An `.xcworkspace` resolves each file against whichever member project declares its target, so a CocoaPods or
   multi-project workspace works the same as a single `.xcodeproj`.
+- A file that several targets compile, such as one an iOS app shares with its watchOS app, gets its compiler arguments
+  from the target your selected scheme builds. If the scheme doesn't settle it, the target for the selected
+  destination's platform wins. While you work on the iOS app, its `#if os(iOS)` branches stay live, and switching the
+  scheme or destination changes the branch autocomplete sees.
+- SweetPad analyzes a target that builds for more than one platform, such as an iOS and macOS app, for the selected
+  destination's platform. Pick My Mac and its `#if os(macOS)` code gets autocomplete. For a destination the target
+  doesn't build for, it falls back to the first of iOS, tvOS, watchOS, visionOS and macOS that the target supports.
+  With My Mac selected, a Mac Catalyst target is analyzed as Catalyst, following how your selected scheme builds it,
+  so its `#if targetEnvironment(macCatalyst)` code gets autocomplete too.
+- The build settings and the `-xcconfig` file in `sweetpad.build.args`, such as
+  `SWIFT_ACTIVE_COMPILATION_CONDITIONS=STAGING` or `-xcconfig ci.xcconfig`, apply to autocomplete too, so the editor
+  compiles each file the way your builds do. An older `sweetpad` CLI ignores them. A `-derivedDataPath` in that setting,
+  or `sweetpad.build.derivedDataPath`, moves the index to your builds' DerivedData. SweetPad restarts the language
+  server when that location changes, unless `sweetpad.build.autoRestartSwiftLSP` is off. Other flags in that setting
+  don't affect autocomplete.
 - A Swift package takes a different route: SourceKit-LSP reads `Package.swift` and indexes it natively, so SweetPad
   writes no `buildServer.json` at all. If one is already sitting in the package directory, delete it, because its presence
   overrides that native support.

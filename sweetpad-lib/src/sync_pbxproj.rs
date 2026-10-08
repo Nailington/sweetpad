@@ -18,67 +18,16 @@
 use std::path::Path;
 
 use crate::pbxproj::{Dict, Value};
+use crate::pbxproj_refs;
 use crate::settings_pbxproj::insert_sorted;
 use crate::spm_pbxproj::fresh_guid;
 
 const ROOT_ISA: &str = "PBXFileSystemSynchronizedRootGroup";
 const EXCEPTION_ISA: &str = "PBXFileSystemSynchronizedBuildFileExceptionSet";
 
-/// One synchronized root as seen by one target: where the folder lives and
-/// which of its files that target opts out of.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RootReport {
-    pub guid: String,
-    /// Project-dir-relative folder path (group-tree walk, like `SRCROOT`).
-    pub dir: String,
-    /// The target's `membershipExceptions`, root-relative, in file order.
-    pub exceptions: Vec<String>,
-}
-
-/// A target's synchronized roots, for `source list`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TargetRoots {
-    pub target: String,
-    pub roots: Vec<RootReport>,
-}
-
-/// The result of attaching a root: a brand-new object, an existing root (used
-/// by another target) newly attached, or nothing to do.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AddOutcome {
-    Created(String),
-    AttachedExisting(String),
-    AlreadyAttached(String),
-}
-
-/// The result of detaching a root. `deleted_object` is set when no other
-/// target still references it, so the group object itself was removed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RemoveOutcome {
-    Detached { guid: String, deleted_object: bool },
-    NotAttached,
-}
-
-/// The result of adding a membership exception.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExcludeOutcome {
-    /// `exception` is the root-relative path now excepted under `root_dir`.
-    Added {
-        root_dir: String,
-        exception: String,
-    },
-    AlreadyExcluded {
-        root_dir: String,
-        exception: String,
-    },
-}
-
-/// The result of dropping a membership exception.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IncludeOutcome {
-    Removed { root_dir: String, exception: String },
-    NotExcluded,
-}
+pub use crate::membership::{
+    AddOutcome, ExcludeOutcome, IncludeOutcome, RemoveOutcome, RootReport, TargetRoots,
+};
 
 /// Synchronized roots and exceptions per target, in file order — targets with
 /// no roots included (empty `roots`), so a report can show "none".
@@ -100,7 +49,6 @@ pub fn list(root: &Value) -> Result<Vec<TargetRoots>, String> {
             roots.push(RootReport {
                 dir: root_dir(objects, &root_guid),
                 exceptions: exceptions_of(objects, &root_guid, target_guid),
-                guid: root_guid,
             });
         }
         out.push(TargetRoots {
@@ -130,11 +78,11 @@ pub fn add_root(root: &mut Value, target: &str, dir: &str) -> Result<AddOutcome,
 
     if let Some(existing) = root_guid_for_dir(objects_ref, &dir) {
         if attached_roots(objects_ref, &target_guid).contains(&existing) {
-            return Ok(AddOutcome::AlreadyAttached(existing));
+            return Ok(AddOutcome::AlreadyAttached);
         }
         let objects = objects_mut(root)?;
         attach_to_target(objects, &target_guid, &existing);
-        return Ok(AddOutcome::AttachedExisting(existing));
+        return Ok(AddOutcome::AttachedExisting);
     }
 
     let objects = objects_mut(root)?;
@@ -149,12 +97,13 @@ pub fn add_root(root: &mut Value, target: &str, dir: &str) -> Result<AddOutcome,
 
     attach_to_target(objects, &target_guid, &guid);
     insert_child(objects, &main_group, products_group.as_deref(), &guid);
-    Ok(AddOutcome::Created(guid))
+    Ok(AddOutcome::Created)
 }
 
 /// Detach the root at `dir` from `target`, dropping the target's exception
-/// set for it. The group object itself (and its group-tree entry) goes only
-/// when no other target still lists it.
+/// set for it. The group object itself (and its group-tree entries) goes
+/// only when nothing else names it: no other target builds it, and no
+/// configuration's xcconfig is anchored in it.
 ///
 /// # Errors
 /// Returns a message when the tree is malformed or the target is missing.
@@ -171,20 +120,18 @@ pub fn remove_root(root: &mut Value, target: &str, dir: &str) -> Result<RemoveOu
 
     let objects = objects_mut(root)?;
     remove_from_array(objects, &target_guid, "fileSystemSynchronizedGroups", &guid);
+    drop_key_if_empty_array(objects, &target_guid, "fileSystemSynchronizedGroups");
     if let Some(set_guid) = exception_set_of(objects, &guid, &target_guid) {
         remove_from_array(objects, &guid, "exceptions", &set_guid);
         drop_key_if_empty_array(objects, &guid, "exceptions");
         objects.remove(&set_guid);
     }
 
-    let still_referenced = objects.iter().any(|(_, o)| {
-        is_target_isa(isa(o))
-            && o.get("fileSystemSynchronizedGroups")
-                .and_then(Value::as_array)
-                .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(guid.as_str())))
-    });
-    if !still_referenced {
-        // Drop the object, its group-tree entry, and any leftover exception
+    // Another target building the folder names it, and so does a
+    // configuration whose xcconfig is anchored in it; either keeps it.
+    let still_named = !pbxproj_refs::referrers(objects, &guid).is_empty();
+    if !still_named {
+        // Drop the object, its group-tree entries, and any leftover exception
         // sets other targets had on it.
         let leftover_sets: Vec<String> = objects
             .get(&guid)
@@ -199,19 +146,11 @@ pub fn remove_root(root: &mut Value, target: &str, dir: &str) -> Result<RemoveOu
         for set in leftover_sets {
             objects.remove(&set);
         }
-        let group_guids: Vec<String> = objects
-            .iter()
-            .filter(|(_, o)| matches!(isa(o), "PBXGroup" | "PBXVariantGroup" | "XCVersionGroup"))
-            .map(|(g, _)| g.clone())
-            .collect();
-        for g in group_guids {
-            remove_from_array(objects, &g, "children", &guid);
-        }
+        pbxproj_refs::unlist(objects, &guid);
         objects.remove(&guid);
     }
     Ok(RemoveOutcome::Detached {
-        guid,
-        deleted_object: !still_referenced,
+        deleted_object: !still_named,
     })
 }
 
@@ -232,10 +171,10 @@ pub fn exclude(root: &mut Value, target: &str, path: &str) -> Result<ExcludeOutc
             .map(|g| root_dir(objects_ref, g))
             .collect();
         Err(if dirs.is_empty() {
-            format!("target `{target}` has no synchronized folders")
+            format!("target '{target}' has no synchronized folders")
         } else {
             format!(
-                "{} is not inside a synchronized folder of target `{target}` \
+                "{} is not inside a synchronized folder of target '{target}' \
                  (folders: {})",
                 normalize(path),
                 dirs.join(", ")
@@ -245,7 +184,9 @@ pub fn exclude(root: &mut Value, target: &str, path: &str) -> Result<ExcludeOutc
 }
 
 /// Drop `target`'s membership exception for `path`. A path that isn't
-/// excepted is a no-op outcome, so re-run scripts stay green.
+/// excepted is a no-op outcome, so re-run scripts stay green. The exception
+/// set goes with its last exception only when it records nothing else, such
+/// as a file's compiler flags.
 ///
 /// # Errors
 /// Returns a message when the tree is malformed or the target is missing.
@@ -265,11 +206,22 @@ pub fn include(root: &mut Value, target: &str, path: &str) -> Result<IncludeOutc
     if !remove_from_array(objects, &set_guid, "membershipExceptions", &rel) {
         return Ok(IncludeOutcome::NotExcluded);
     }
+    // The set goes once it records nothing else. Per-file compiler flags,
+    // attributes, header visibility and platform filters live in the same
+    // set, and deleting it with them would drop those silently.
     let now_empty = objects
         .get(&set_guid)
-        .and_then(|s| s.get("membershipExceptions"))
-        .and_then(Value::as_array)
-        .is_none_or(<[Value]>::is_empty);
+        .and_then(Value::as_dict)
+        .is_none_or(|set| {
+            set.iter().all(|(key, value)| {
+                matches!(key.as_str(), "isa" | "target")
+                    || match value {
+                        Value::Array(items) => items.is_empty(),
+                        Value::Dict(dict) => dict.is_empty(),
+                        Value::String(_) => false,
+                    }
+            })
+        });
     if now_empty {
         objects.remove(&set_guid);
         remove_from_array(objects, &root_guid, "exceptions", &set_guid);
@@ -381,7 +333,7 @@ fn containing_root(objects: &Dict, target_guid: &str, path: &str) -> Option<(Str
 /// The project-dir-relative directory of a synchronized root (group-tree
 /// walk, honoring parent group paths and `sourceTree`).
 fn root_dir(objects: &Dict, guid: &str) -> String {
-    crate::project::group_dir(objects, guid, Path::new(""), 0)
+    crate::project::group_dir(objects, guid, Path::new(""))
         .to_string_lossy()
         .into_owned()
 }
@@ -534,7 +486,7 @@ fn find_target_guid(objects: &Dict, name: &str) -> Result<String, String> {
                 .filter_map(|(_, o)| str_field(o, "name"))
                 .collect();
             format!(
-                "no target named `{name}` (project has: {})",
+                "no target named '{name}' (project has: {})",
                 known.join(", ")
             )
         })
@@ -782,9 +734,7 @@ mod tests {
     fn add_root_creates_attaches_and_reuses() {
         let mut root = parsed();
         let outcome = add_root(&mut root, "Widget", "WidgetSources").unwrap();
-        let AddOutcome::Created(guid) = outcome else {
-            panic!("expected Created, got {outcome:?}");
-        };
+        assert_eq!(outcome, AddOutcome::Created);
         // In the tree before Products, attached to the target, single-line.
         let text = round_trips(&root);
         assert!(text.contains("WidgetSources"));
@@ -795,12 +745,12 @@ mod tests {
         // The same folder attaches to another target by reusing the object.
         assert_eq!(
             add_root(&mut root, "App", "WidgetSources").unwrap(),
-            AddOutcome::AttachedExisting(guid.clone())
+            AddOutcome::AttachedExisting
         );
         // Attaching twice is a no-op.
         assert_eq!(
             add_root(&mut root, "App", "WidgetSources").unwrap(),
-            AddOutcome::AlreadyAttached(guid)
+            AddOutcome::AlreadyAttached
         );
     }
 
@@ -832,7 +782,6 @@ mod tests {
         assert_eq!(
             outcome,
             RemoveOutcome::Detached {
-                guid: "SR1".into(),
                 deleted_object: false
             }
         );
@@ -845,7 +794,6 @@ mod tests {
         assert_eq!(
             outcome,
             RemoveOutcome::Detached {
-                guid: "SR1".into(),
                 deleted_object: true
             }
         );
@@ -858,12 +806,68 @@ mod tests {
         );
     }
 
+    /// An exception set also carries per-file compiler flags, so dropping
+    /// its last membership exception keeps the set while the flags are in it.
+    #[test]
+    fn include_keeps_a_set_that_still_holds_compiler_flags() {
+        let mut root = parsed();
+        exclude(&mut root, "App", "App/Old.swift").unwrap();
+        let dict = objects_mut(&mut root).unwrap();
+        let set = exception_set_of(dict, "SR1", "T1").unwrap();
+        let mut flags = Dict::new();
+        flags.insert("Fast.swift".into(), vstr("-Ounchecked"));
+        dict.get_mut(&set)
+            .and_then(Value::as_dict_mut)
+            .unwrap()
+            .insert(
+                "additionalCompilerFlagsByRelativePath".into(),
+                Value::Dict(flags),
+            );
+
+        include(&mut root, "App", "App/Old.swift").unwrap();
+        let text = round_trips(&root);
+        assert!(text.contains("Fast.swift = \"-Ounchecked\";"), "{text}");
+        assert_eq!(
+            exception_set_of(objects(&root).unwrap(), "SR1", "T1"),
+            Some(set)
+        );
+    }
+
+    /// A folder a configuration's xcconfig is anchored in outlives its last
+    /// target: deleting it would leave the configuration naming nothing, and
+    /// Xcode would then build without that xcconfig.
+    #[test]
+    fn remove_root_keeps_a_folder_an_xcconfig_is_anchored_in() {
+        let mut root = parsed();
+        let objects = objects_mut(&mut root).unwrap();
+        let mut config = Dict::new();
+        config.insert("isa".into(), vstr("XCBuildConfiguration"));
+        config.insert("baseConfigurationReferenceAnchor".into(), vstr("SR1"));
+        config.insert(
+            "baseConfigurationReferenceRelativePath".into(),
+            vstr("Base.xcconfig"),
+        );
+        config.insert("name".into(), vstr("Debug"));
+        objects.insert("CFG".into(), Value::Dict(config));
+
+        let outcome = remove_root(&mut root, "App", "App").unwrap();
+        assert_eq!(
+            outcome,
+            RemoveOutcome::Detached {
+                deleted_object: false
+            }
+        );
+        let text = round_trips(&root);
+        assert!(text.contains("SR1 /* App */ = {"), "{text}");
+        assert!(!text.contains("fileSystemSynchronizedGroups"), "{text}");
+    }
+
     #[test]
     fn normalizes_dot_prefixes_and_trailing_slashes() {
         let mut root = parsed();
         assert_eq!(
             add_root(&mut root, "App", "./App/").unwrap(),
-            AddOutcome::AlreadyAttached("SR1".into())
+            AddOutcome::AlreadyAttached
         );
         let outcome = exclude(&mut root, "App", "./App/Info.plist").unwrap();
         assert_eq!(

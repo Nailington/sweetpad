@@ -6,17 +6,15 @@
 
 #![cfg(unix)]
 
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+mod common;
 
-fn tmp(tag: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("sweetpad-stream-{tag}-{n}"));
-    std::fs::create_dir_all(&dir).unwrap();
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use common::TempDir;
+
+fn tmp(tag: &str) -> TempDir {
+    let dir = TempDir::new(&format!("sweetpad-stream-{tag}"));
     // Stop walk-up discovery at this directory.
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     dir
@@ -55,6 +53,7 @@ fn streaming_command_exits_after_the_tool_does() {
             .args(&args)
             .current_dir(&cwd)
             .env("HOME", &home)
+            .env("CFFIXED_USER_HOME", &home)
             .env("XDG_STATE_HOME", &home)
             .env("XDG_CONFIG_HOME", &home)
             .env("PATH", &path_env)

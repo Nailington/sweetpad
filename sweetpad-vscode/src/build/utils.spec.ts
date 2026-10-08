@@ -1,34 +1,54 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
+import * as sweetpadLib from "@sweetpad/native";
 import type { Mock } from "vitest";
 import * as vscode from "vscode";
 
 import { getBspConfigFile } from "../bsp/paths";
 import {
+  findSchemeFile,
   generateBuildServerConfig,
   generateSweetpadBuildServerConfig,
+  getBuildSettingsList,
   getSweetpadCliPath,
 } from "../common/cli/scripts";
 import { isFileExists, readJsonFile } from "../common/files";
 import { WorkspaceContextService } from "../common/workspace-context";
 import type { WorkspaceStateService } from "../common/workspace-state";
 import {
+  XCODEBUILD_VALUE_FLAGS,
+  XcodeCommandBuilder,
   activateCurrentXcodeWorkspacePath,
+  detectXcodeWorkspacesPaths,
+  findXcodeWorkspaceInDirectory,
   generateBuildServerConfigOnBuild,
   getCurrentXcodeWorkspacePath,
-  launchActionToSettings,
+  getSchemeLaunchSettings,
+  prepareDerivedDataPath,
   repairStaleBuildServerConfig,
   workspaceFoldersContaining,
+  xcodeContainerArgs,
 } from "./utils";
 
 // `./utils` imports the native `@sweetpad/native` addon at module level; stub it so
-// this spec runs without the compiled addon (none of the tested paths touch it).
-vi.mock("@sweetpad/native", () => ({}));
+// this spec runs without the compiled addon. Container discovery and the scheme launch settings
+// are the addon's.
+const scheme = vi.hoisted(() => ({ launchReferencesSettings: false }));
+vi.mock("@sweetpad/native", () => ({
+  discoverContainers: vi.fn(),
+  parseScheme: vi.fn(() => scheme),
+  schemeLaunchSettings: vi.fn(),
+}));
 
 vi.mock("../common/cli/scripts", () => ({
   generateBuildServerConfig: vi.fn(),
   generateSweetpadBuildServerConfig: vi.fn(),
   getSweetpadCliPath: vi.fn(),
+  findSchemeFile: vi.fn(),
+  getBuildSettingsList: vi.fn(),
+  getXcodeBuildCommand: vi.fn(() => "xcodebuild"),
   SWEETPAD_CLI_MISSING_MESSAGE: "cli missing",
 }));
 
@@ -43,96 +63,411 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...original, existsSync: vi.fn(original.existsSync) };
 });
 
-type ArgInput = { argument: string; isEnabled?: boolean };
-type EnvInput = { key: string; value?: string; isEnabled?: boolean };
+const launchOptions = {
+  workspaceRoot: "/w",
+  xcworkspace: "/w/App.xcodeproj",
+  scheme: "App",
+  configuration: "Debug",
+  sdk: "iphonesimulator",
+  destination: "platform=iOS Simulator,id=SIM",
+};
 
-// Build the subset of a parsed scheme (`sweetpadLib.SchemeInfo`) that
-// `launchActionToSettings` reads, defaulting each row to enabled.
-function launch(over: { args?: ArgInput[]; env?: EnvInput[]; language?: string; region?: string }) {
-  return {
-    launchArguments: (over.args ?? []).map((a) => ({ argument: a.argument, isEnabled: a.isEnabled ?? true })),
-    launchEnvironmentVariables: (over.env ?? []).map((e) => ({
-      key: e.key,
-      value: e.value,
-      isEnabled: e.isEnabled ?? true,
-    })),
-    launchLanguage: over.language,
-    launchRegion: over.region,
-  };
-}
-
-describe("launchActionToSettings", () => {
-  it("returns empty settings for a bare launch action", () => {
-    expect(launchActionToSettings(launch({}))).toEqual({ args: [], env: {} });
+// The launch rows are turned into argv and env by the native addon (checked
+// against xcodebuild in sweetpad-lib's scheme tests); this side only finds the
+// scheme file and resolves build settings when a row refers to one.
+describe("getSchemeLaunchSettings", () => {
+  beforeEach(() => {
+    scheme.launchReferencesSettings = false;
+    (findSchemeFile as Mock).mockResolvedValue("/w/App.xcodeproj/xcshareddata/xcschemes/App.xcscheme");
+    (sweetpadLib.schemeLaunchSettings as Mock).mockReturnValue({ args: ["-Flag", "a b"], env: { KEY: "value" } });
   });
 
-  it("auto-injects -AppleLanguages and -AppleLocale from language + region", () => {
-    expect(launchActionToSettings(launch({ language: "he", region: "IL" })).args).toEqual([
-      "-AppleLanguages",
-      "(he)",
-      "-AppleLocale",
-      "he_IL",
+  it("returns empty settings when the scheme has no file", async () => {
+    (findSchemeFile as Mock).mockResolvedValue(undefined);
+    expect(await getSchemeLaunchSettings(launchOptions)).toEqual({ args: [], env: {} });
+    expect(sweetpadLib.schemeLaunchSettings).not.toHaveBeenCalled();
+  });
+
+  it("skips resolving build settings when no row refers to one", async () => {
+    expect(await getSchemeLaunchSettings(launchOptions)).toEqual({ args: ["-Flag", "a b"], env: { KEY: "value" } });
+    expect(getBuildSettingsList).not.toHaveBeenCalled();
+    expect(sweetpadLib.schemeLaunchSettings).toHaveBeenCalledWith(
+      "/w/App.xcodeproj/xcshareddata/xcschemes/App.xcscheme",
+      [],
+    );
+  });
+
+  it("passes the resolved build settings when a row refers to one", async () => {
+    scheme.launchReferencesSettings = true;
+    (getBuildSettingsList as Mock).mockResolvedValue([{ target: "App", settings: { PRODUCT_NAME: "App" } }]);
+    await getSchemeLaunchSettings(launchOptions);
+    expect(getBuildSettingsList).toHaveBeenCalledWith(launchOptions);
+    expect(sweetpadLib.schemeLaunchSettings).toHaveBeenCalledWith(
+      "/w/App.xcodeproj/xcshareddata/xcschemes/App.xcscheme",
+      [{ target: "App", settings: { PRODUCT_NAME: "App" } }],
+    );
+  });
+
+  it("launches without the scheme's settings when they can't be read", async () => {
+    (sweetpadLib.schemeLaunchSettings as Mock).mockImplementation(() => {
+      throw new Error("invalid scheme");
+    });
+    expect(await getSchemeLaunchSettings(launchOptions)).toEqual({ args: [], env: {} });
+  });
+});
+
+// `sweetpad.build.args` joins the command the extension assembles for its own builds.
+describe("XcodeCommandBuilder.addAdditionalArgs", () => {
+  function extensionCommand(): XcodeCommandBuilder {
+    const command = new XcodeCommandBuilder();
+    command.addBuildSettings("ONLY_ACTIVE_ARCH", "YES");
+    command.addParameters("-scheme", "App");
+    command.addParameters("-configuration", "Debug");
+    command.addParameters("-destination", "platform=macOS,arch=arm64");
+    command.addParameters("-derivedDataPath", "/w/dd");
+    command.addOption("-allowProvisioningUpdates");
+    command.addAction("build");
+    return command;
+  }
+
+  it("keeps a setting's value whole past its first '='", () => {
+    const command = new XcodeCommandBuilder();
+    command.addAdditionalArgs(["OTHER_SWIFT_FLAGS=-D A=1", "EMPTY="]);
+    expect(command.build()).toEqual(["xcodebuild", "OTHER_SWIFT_FLAGS=-D A=1", "EMPTY="]);
+  });
+
+  it("keeps every copy of a flag xcodebuild reads more than once, in order", () => {
+    const command = new XcodeCommandBuilder();
+    command.addAdditionalArgs([
+      "-skip-testing",
+      "AppTests/A",
+      "-only-testing:AppTests/B",
+      "-skip-testing",
+      "AppTests/C",
+      "-only-testing:AppTests/D",
+      "-arch",
+      "arm64",
+      "-arch",
+      "x86_64",
+    ]);
+    expect(command.build()).toEqual([
+      "xcodebuild",
+      "-skip-testing",
+      "AppTests/A",
+      "-only-testing:AppTests/B",
+      "-skip-testing",
+      "AppTests/C",
+      "-only-testing:AppTests/D",
+      "-arch",
+      "arm64",
+      "-arch",
+      "x86_64",
     ]);
   });
 
-  it("emits -AppleLanguages but not -AppleLocale when only language is set", () => {
-    expect(launchActionToSettings(launch({ language: "ar" })).args).toEqual(["-AppleLanguages", "(ar)"]);
+  it("keeps the last copy of a flag xcodebuild takes once", () => {
+    const command = new XcodeCommandBuilder();
+    command.addAdditionalArgs(["-jobs", "2", "-quiet", "-jobs", "4", "-quiet"]);
+    expect(command.build()).toEqual(["xcodebuild", "-jobs", "4", "-quiet"]);
   });
 
-  it("emits no locale flags when only region is set (bare region is not a valid locale id)", () => {
-    expect(launchActionToSettings(launch({ region: "JP" })).args).toEqual([]);
+  it("replaces the extension's own copy of a flag the user gives", () => {
+    const command = extensionCommand();
+    command.addAdditionalArgs([
+      "-derivedDataPath",
+      "custom",
+      "-destination",
+      "platform=iOS Simulator,name=A",
+      "-destination",
+      "platform=iOS Simulator,name=B",
+      "ONLY_ACTIVE_ARCH=NO",
+      "-skipMacroValidation",
+    ]);
+    expect(command.build()).toEqual([
+      "xcodebuild",
+      "ONLY_ACTIVE_ARCH=NO",
+      "-scheme",
+      "App",
+      "-configuration",
+      "Debug",
+      "-allowProvisioningUpdates",
+      "-derivedDataPath",
+      "custom",
+      "-destination",
+      "platform=iOS Simulator,name=A",
+      "-destination",
+      "platform=iOS Simulator,name=B",
+      "-skipMacroValidation",
+      "build",
+    ]);
   });
 
-  it("tokenizes command-line argument rows on whitespace", () => {
-    expect(
-      launchActionToSettings(launch({ args: [{ argument: "-AppleLanguages (he)" }, { argument: "--flag" }] })).args,
-    ).toEqual(["-AppleLanguages", "(he)", "--flag"]);
+  it("leaves the extension's command alone without user args", () => {
+    const command = extensionCommand();
+    const before = command.build();
+    command.addAdditionalArgs([]);
+    expect(command.build()).toEqual(before);
   });
 
-  it("skips disabled command-line arguments", () => {
-    expect(
-      launchActionToSettings(launch({ args: [{ argument: "--keep" }, { argument: "--skip", isEnabled: false }] })).args,
-    ).toEqual(["--keep"]);
+  // xcodebuild reads the argument after a value flag as its value, dashes and all: `-xcconfig -quiet` reads a
+  // file named '-quiet'.
+  it("reads the argument after a value flag as its value, even one spelled as a flag", () => {
+    const command = extensionCommand();
+    command.addAdditionalArgs(["-xcconfig", "-derivedDataPath", "-jobs", "-quiet"]);
+    expect(command.build()).toEqual([
+      "xcodebuild",
+      "ONLY_ACTIVE_ARCH=YES",
+      "-scheme",
+      "App",
+      "-configuration",
+      "Debug",
+      "-destination",
+      "platform=macOS,arch=arm64",
+      "-derivedDataPath",
+      "/w/dd",
+      "-allowProvisioningUpdates",
+      "-xcconfig",
+      "-derivedDataPath",
+      "-jobs",
+      "-quiet",
+      "build",
+    ]);
   });
 
-  it("collects enabled environment variables and drops disabled ones", () => {
-    expect(
-      launchActionToSettings(
-        launch({
-          env: [
-            { key: "KEEP", value: "1" },
-            { key: "SKIP", value: "x", isEnabled: false },
-          ],
-        }),
-      ).env,
-    ).toEqual({ KEEP: "1" });
+  it("keeps a switch apart from the setting or action after it", () => {
+    const command = extensionCommand();
+    command.addAdditionalArgs(["-quiet", "ONLY_ACTIVE_ARCH=NO", "-skipMacroValidation", "build"]);
+    expect(command.build()).toEqual([
+      "xcodebuild",
+      "ONLY_ACTIVE_ARCH=NO",
+      "-scheme",
+      "App",
+      "-configuration",
+      "Debug",
+      "-destination",
+      "platform=macOS,arch=arm64",
+      "-derivedDataPath",
+      "/w/dd",
+      "-allowProvisioningUpdates",
+      "-quiet",
+      "-skipMacroValidation",
+      "build",
+    ]);
   });
 
-  it("drops environment variables with no value (distinct from empty string)", () => {
-    expect(launchActionToSettings(launch({ env: [{ key: "NOVALUE" }, { key: "EMPTY", value: "" }] })).env).toEqual({
-      EMPTY: "",
+  it("keeps the value of a flag outside the value-flag list", () => {
+    const command = new XcodeCommandBuilder();
+    command.addAdditionalArgs(["-flagFromNewerXcode", "YES", "-destination", "platform=macOS", "-quiet"]);
+    expect(command.build()).toEqual([
+      "xcodebuild",
+      "-flagFromNewerXcode",
+      "YES",
+      "-destination",
+      "platform=macOS",
+      "-quiet",
+    ]);
+  });
+
+  // A value spelled like a setting or an action is still the flag's: a registry URL with a query, or a
+  // directory named `build`.
+  it("reads the value of a testing or package flag as its value", () => {
+    const command = new XcodeCommandBuilder();
+    command.addAdditionalArgs([
+      "-enableCodeCoverage",
+      "YES",
+      "-defaultPackageRegistryURL",
+      "https://registry.example.com/?region=eu",
+      "-enableCodesizeProfile",
+      "YES",
+      "-codesizeProfileOutputDir",
+      "build",
+      "-only-testing",
+      "AppTests/Slow",
+    ]);
+    expect(command.build()).toEqual([
+      "xcodebuild",
+      "-enableCodeCoverage",
+      "YES",
+      "-defaultPackageRegistryURL",
+      "https://registry.example.com/?region=eu",
+      "-enableCodesizeProfile",
+      "YES",
+      "-codesizeProfileOutputDir",
+      "build",
+      "-only-testing",
+      "AppTests/Slow",
+    ]);
+  });
+});
+
+// The BSP server reads the `buildArgs` in bsp.json with sweetpad-core's `VALUE_FLAGS`, so the index and the
+// builds only agree on which argument is a flag's value while the two lists match.
+describe("XCODEBUILD_VALUE_FLAGS", () => {
+  it("matches sweetpad-core's VALUE_FLAGS", () => {
+    const source = readFileSync(path.resolve(__dirname, "../../../sweetpad-core/src/xcodebuild_args.rs"), "utf8");
+    const list = source.match(/pub const VALUE_FLAGS: \[&str; \d+\] = \[([^\]]*)\];/);
+    expect(list).not.toBeNull();
+    const coreFlags = [...(list?.[1] ?? "").matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+    expect(coreFlags.length).toBeGreaterThan(0);
+    expect([...XCODEBUILD_VALUE_FLAGS].toSorted()).toEqual(coreFlags.toSorted());
+  });
+});
+
+// Builds, the app locator and the BSP index all read DerivedData through `prepareDerivedDataPath`, so a
+// `-derivedDataPath` in `sweetpad.build.args` has to move all of them.
+describe("prepareDerivedDataPath", () => {
+  const mockGetConfiguration = vscode.workspace.getConfiguration as Mock;
+
+  function mockConfig(values: Record<string, unknown>) {
+    mockGetConfiguration.mockReturnValue({
+      get: vi.fn((key: string) => values[key]),
     });
+  }
+
+  afterEach(() => {
+    mockGetConfiguration.mockReset();
   });
 
-  it("keeps both explicit locale args and language/region attrs (discussion #197)", () => {
-    const { args } = launchActionToSettings(
-      launch({
-        args: [
-          { argument: "-AppleLanguages (he)" },
-          { argument: "-AppleLocale he_IL" },
-          { argument: "-WMFVisualTestBatchRecordMode" },
-        ],
-        language: "he",
-        region: "IL",
-      }),
+  it("leaves the location to xcodebuild when nothing sets it", () => {
+    mockConfig({});
+    expect(prepareDerivedDataPath({ workspaceRoot: "/w" })).toBeNull();
+  });
+
+  it("resolves the setting against the workspace folder", () => {
+    mockConfig({ "build.derivedDataPath": ".build/dd" });
+    expect(prepareDerivedDataPath({ workspaceRoot: "/w" })).toBe("/w/.build/dd");
+  });
+
+  it("takes the last -derivedDataPath in the build args over the setting", () => {
+    mockConfig({
+      "build.derivedDataPath": "/setting/dd",
+      "build.args": ["-derivedDataPath", "dd-a", "-quiet", "-derivedDataPath", "/abs/dd-b", "-derivedDataPath"],
+    });
+    expect(prepareDerivedDataPath({ workspaceRoot: "/w" })).toBe("/abs/dd-b");
+  });
+
+  it("reads the build args' flag values the way xcodebuild does", () => {
+    // The '-derivedDataPath' here is the xcconfig file's name.
+    mockConfig({ "build.derivedDataPath": "/setting/dd", "build.args": ["-xcconfig", "-derivedDataPath", "dd"] });
+    expect(prepareDerivedDataPath({ workspaceRoot: "/w" })).toBe("/setting/dd");
+
+    mockConfig({ "build.derivedDataPath": "/setting/dd", "build.args": ["-derivedDataPath", "-dd"] });
+    expect(prepareDerivedDataPath({ workspaceRoot: "/w" })).toBe("/w/-dd");
+  });
+
+  it("names the directory the build's own command line does", () => {
+    const buildArgs = ["-derivedDataPath", "dd-a", "-derivedDataPath", "dd-b"];
+    mockConfig({ "build.derivedDataPath": "/setting/dd", "build.args": buildArgs });
+    const derivedDataPath = prepareDerivedDataPath({ workspaceRoot: "/w" });
+
+    const command = new XcodeCommandBuilder();
+    command.addParameters("-derivedDataPath", derivedDataPath ?? "");
+    command.addAdditionalArgs(buildArgs);
+    const parts = command.build();
+    const built = parts[parts.lastIndexOf("-derivedDataPath") + 1];
+    // xcodebuild runs in the workspace folder, so it reads a relative path against it.
+    expect(path.resolve("/w", built)).toBe(derivedDataPath);
+    expect(derivedDataPath).toBe("/w/dd-b");
+  });
+
+  // xcodebuild reads a relative path against the physical directory it runs in, and the CLI joins the
+  // project's standardized directory for that reason. A folder opened through a symlink has to name the same
+  // directory the same way.
+  it("resolves a relative path against the directory a symlinked folder points at", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "sweetpad-dd-link-"));
+    try {
+      mkdirSync(path.join(root, "real", "app"), { recursive: true });
+      symlinkSync(path.join(root, "real", "app"), path.join(root, "link"));
+      const link = path.join(root, "link");
+      const real = path.join(root, "real", "app");
+
+      mockConfig({ "build.derivedDataPath": "dd" });
+      const inside = prepareDerivedDataPath({ workspaceRoot: link });
+      expect(inside).toBe(prepareDerivedDataPath({ workspaceRoot: real }));
+      expect(inside).toMatch(/\/real\/app\/dd$/);
+
+      // `..` leaves the real directory, not the symlink.
+      mockConfig({ "build.args": ["-derivedDataPath", "../dd"] });
+      const beside = prepareDerivedDataPath({ workspaceRoot: link });
+      expect(beside).toBe(prepareDerivedDataPath({ workspaceRoot: real }));
+      expect(beside).toMatch(/\/real\/dd$/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("drops the /private that a root symlink adds", () => {
+    mockConfig({ "build.derivedDataPath": "dd" });
+    expect(prepareDerivedDataPath({ workspaceRoot: "/private/tmp" })).toBe("/tmp/dd");
+    expect(prepareDerivedDataPath({ workspaceRoot: "/tmp" })).toBe("/tmp/dd");
+    // An absolute path is the user's spelling.
+    mockConfig({ "build.derivedDataPath": "/private/tmp/dd" });
+    expect(prepareDerivedDataPath({ workspaceRoot: "/tmp" })).toBe("/private/tmp/dd");
+  });
+});
+
+describe("Xcode container discovery", () => {
+  const mockDiscover = sweetpadLib.discoverContainers as Mock;
+  const mockExists = isFileExists as Mock;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (vscode.workspace as { workspaceFolders?: unknown }).workspaceFolders = [{ uri: { fsPath: "/repo" } }];
+  });
+
+  it("addresses a project through its embedded workspace, and a bare one by itself (issue #339)", async () => {
+    mockDiscover.mockResolvedValue([
+      { path: "/repo/App.xcodeproj", kind: "project", depth: 0 },
+      { path: "/repo/Pkg/Package.swift", kind: "package", depth: 1 },
+      { path: "/repo/Tool/Tool.xcodeproj", kind: "project", depth: 1 },
+    ]);
+    mockExists.mockImplementation(async (p: string) => p === "/repo/App.xcodeproj/project.xcworkspace");
+
+    expect(await detectXcodeWorkspacesPaths()).toEqual([
+      "/repo/App.xcodeproj/project.xcworkspace",
+      "/repo/Pkg/Package.swift",
+      "/repo/Tool/Tool.xcodeproj",
+    ]);
+    // Four levels down, the depth the picker has always searched.
+    expect(mockDiscover).toHaveBeenCalledWith("/repo", 4);
+  });
+
+  it("offers a project reached from two nested folders once", async () => {
+    (vscode.workspace as { workspaceFolders?: unknown }).workspaceFolders = [
+      { uri: { fsPath: "/repo" } },
+      { uri: { fsPath: "/repo/ios" } },
+    ];
+    mockDiscover.mockImplementation(async (root: string) =>
+      root === "/repo"
+        ? [{ path: "/repo/ios/App.xcworkspace", kind: "workspace", depth: 1 }]
+        : [{ path: "/repo/ios/App.xcworkspace", kind: "workspace", depth: 0 }],
     );
-    // The explicit CLI args and the language/region attrs both flow through;
-    // Foundation reads the first match at launch.
-    expect(args).toContain("-WMFVisualTestBatchRecordMode");
-    expect(args.filter((a) => a === "-AppleLanguages")).toHaveLength(2);
-    expect(args.filter((a) => a === "-AppleLocale")).toHaveLength(2);
-    expect(args).toContain("(he)");
-    expect(args).toContain("he_IL");
+    mockExists.mockResolvedValue(false);
+
+    expect(await detectXcodeWorkspacesPaths()).toEqual(["/repo/ios/App.xcworkspace"]);
+  });
+
+  // The walk puts the nearest container first, and a workspace ahead of the project beside it, so a
+  // CocoaPods checkout opens its workspace rather than whichever entry `readdir` listed first.
+  it("opens the first container the walk finds in a directory", async () => {
+    mockDiscover.mockResolvedValue([
+      { path: "/wt/App.xcworkspace", kind: "workspace", depth: 0 },
+      { path: "/wt/App.xcodeproj", kind: "project", depth: 0 },
+    ]);
+    mockExists.mockResolvedValue(true);
+
+    expect(await findXcodeWorkspaceInDirectory("/wt")).toBe("/wt/App.xcworkspace");
+    mockDiscover.mockResolvedValue([]);
+    expect(await findXcodeWorkspaceInDirectory("/wt")).toBeUndefined();
+  });
+
+  it("passes a bare project to xcodebuild as a project", () => {
+    expect(xcodeContainerArgs("/repo/Tool.xcodeproj")).toEqual(["-project", "/repo/Tool.xcodeproj"]);
+    expect(xcodeContainerArgs("/repo/App.xcodeproj/project.xcworkspace")).toEqual([
+      "-workspace",
+      "/repo/App.xcodeproj/project.xcworkspace",
+    ]);
+    expect(xcodeContainerArgs("/repo/App.xcworkspace")).toEqual(["-workspace", "/repo/App.xcworkspace"]);
   });
 });
 
