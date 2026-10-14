@@ -5,10 +5,14 @@ import path from "node:path";
 
 import * as vscode from "vscode";
 
+import { RemoteAuth } from "./auth.js";
+import { type RemoteMacItem, RemoteMacsTree } from "./mac-tree.js";
+import { type Mac, promptMac, saveMacArgs } from "./mac.js";
+
 function execFileAsync(
   file: string,
   args: string[],
-  options: { cwd: string | undefined; maxBuffer: number },
+  options: { cwd: string | undefined; maxBuffer: number; env?: NodeJS.ProcessEnv },
 ): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
     execFile(file, args, options, (error, stdout, stderr) => {
@@ -18,7 +22,6 @@ function execFileAsync(
   });
 }
 
-type Mac = { name: string; host: string; port: number | null };
 type Envelope<T> = { ok: boolean; data?: T; error?: { message?: string } };
 type Scheme = { name: string; selected: boolean };
 type Destination = {
@@ -63,6 +66,19 @@ export class RemoteClient {
     if (directory) rmSync(directory, { recursive: true, force: true });
     this.cancellationDirectories.delete(terminal);
   });
+
+  constructor(
+    private readonly auth?: RemoteAuth,
+    private authEnvironment?: NodeJS.ProcessEnv,
+  ) {}
+
+  private async authenticationEnvironment(): Promise<NodeJS.ProcessEnv | undefined> {
+    return (this.authEnvironment ??= await this.auth?.environment());
+  }
+
+  async forgetPassword(mac: Mac): Promise<void> {
+    await this.auth?.forget(mac.host, mac.port);
+  }
 
   get cli(): string {
     return config().get<string>("remote.cliPath") || "sweetpad";
@@ -117,7 +133,7 @@ export class RemoteClient {
     const child = spawn(this.cli, this.bridgeArgs(service, args), {
       cwd,
       windowsHide: true,
-      env: { ...process.env, SWEETPAD_CANCEL_FILE: path.join(directory, "cancel") },
+      env: { ...process.env, ...this.authEnvironment, SWEETPAD_CANCEL_FILE: path.join(directory, "cancel") },
     });
     this.backgroundDirectories.set(child, directory);
     child.once("close", () => {
@@ -136,13 +152,14 @@ export class RemoteClient {
   async execute(args: string[], cwd = projectRoot(), token?: vscode.CancellationToken) {
     const mac = await this.ensureMac();
     if (!mac) throw new Error("No remote Mac selected.");
+    const authentication = await this.authenticationEnvironment();
     const directory = mkdtempSync(path.join(tmpdir(), "sweetpad-cancel-"));
     const cancelFile = path.join(directory, "cancel");
     const child = spawn(this.cli, ["--non-interactive", "--remote", mac, ...this.commandArgs(args)], {
       cwd,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, SWEETPAD_CANCEL_FILE: cancelFile },
+      env: { ...process.env, ...authentication, SWEETPAD_CANCEL_FILE: cancelFile },
     });
     this.backgroundDirectories.set(child, directory);
     let stdout = "",
@@ -183,6 +200,7 @@ export class RemoteClient {
     try {
       ({ stdout } = await execFileAsync(this.cli, ["-o", "json", "--non-interactive", ...this.commandArgs(args)], {
         cwd,
+        ...(this.auth ? { env: { ...process.env, ...(await this.authenticationEnvironment()) } } : {}),
         maxBuffer: 16 * 1024 * 1024,
       }));
     } catch (error) {
@@ -217,19 +235,83 @@ export class RemoteClient {
     return data.macs;
   }
 
-  async selectMac(): Promise<string | undefined> {
+  async selectMac(name?: string): Promise<string | undefined> {
     const macs = await this.macs();
     if (macs.length === 0) {
       void vscode.window.showInformationMessage("No Macs saved. Run SweetPad: Add Remote Mac first.");
       return undefined;
     }
-    const picked = await vscode.window.showQuickPick(
-      macs.map((mac) => ({ label: mac.name, description: mac.host })),
-      { placeHolder: "Select the Mac used by SweetPad in this workspace" },
-    );
+    if (name !== undefined && !macs.some((mac) => mac.name === name)) {
+      throw new Error(`Mac "${name}" is no longer saved. Refresh the Macs view.`);
+    }
+    const picked =
+      name !== undefined
+        ? { label: name }
+        : await vscode.window.showQuickPick(
+            macs.map((mac) => ({ label: mac.name, description: mac.host })),
+            { placeHolder: "Select the Mac used by SweetPad in this workspace" },
+          );
     if (!picked) return undefined;
     await config().update("remote.mac", picked.label, macSettingTarget());
     return picked.label;
+  }
+
+  async addMac(): Promise<void> {
+    const mac = await promptMac();
+    if (!mac) return;
+    await this.query(saveMacArgs(mac));
+    await config().update("remote.mac", mac.name, macSettingTarget());
+  }
+
+  async editMac(name?: string): Promise<void> {
+    const macs = await this.macs();
+    if (!macs.length) {
+      void vscode.window.showInformationMessage("No Macs saved. Run SweetPad: Add Remote Mac first.");
+      return;
+    }
+    const existing = name !== undefined ? macs.find((mac) => mac.name === name) : undefined;
+    if (name !== undefined && !existing) {
+      throw new Error(`Mac "${name}" is no longer saved. Refresh the Macs view.`);
+    }
+    const picked = existing
+      ? { mac: existing }
+      : await vscode.window.showQuickPick(
+          macs.map((mac) => ({ label: mac.name, description: mac.host, mac })),
+          { placeHolder: "Select the remote Mac to edit" },
+        );
+    if (!picked) return;
+    const original = picked.mac;
+    const updated = await promptMac(original);
+    if (!updated) return;
+    const renamed = updated.name !== original.name;
+    if (renamed && macs.some((mac) => mac.name === updated.name)) {
+      throw new Error(`A Mac named "${updated.name}" already exists. Choose a different name.`);
+    }
+    // A new name is saved without --replace so a concurrent addition cannot be overwritten.
+    await this.query(saveMacArgs(updated, !renamed));
+    if (renamed) {
+      const selection = config().inspect<string>("remote.mac");
+      const targets = [
+        [vscode.ConfigurationTarget.Global, selection?.globalValue],
+        [vscode.ConfigurationTarget.Workspace, selection?.workspaceValue],
+      ] as const;
+      for (const [target, value] of targets) {
+        if (value === original.name) await config().update("remote.mac", updated.name, target);
+      }
+      // Keep the original entry until saving and updating references have succeeded.
+      try {
+        await this.query(["remote", "remove", original.name]);
+      } catch (error) {
+        throw new Error(`Saved "${updated.name}", but could not remove the old entry "${original.name}".`, {
+          cause: error,
+        });
+      }
+    }
+    const endpointChanged = updated.host !== original.host || updated.port !== original.port;
+    const sharedEndpoint = macs.some(
+      (mac) => mac.name !== original.name && mac.host === original.host && mac.port === original.port,
+    );
+    if (endpointChanged && !sharedEndpoint) await this.auth?.forget(original.host, original.port);
   }
 
   async ensureMac(): Promise<string | undefined> {
@@ -239,10 +321,12 @@ export class RemoteClient {
   async run(args: string[], name: string, cwd?: string): Promise<void> {
     const mac = await this.ensureMac();
     if (!mac) return;
+    const authentication = await this.authenticationEnvironment();
     const cancellationDirectory = mkdtempSync(path.join(tmpdir(), "sweetpad-terminal-"));
     // VS Code's terminal host can outlive the extension host and retain its
     // original environment. Forward the CLI's registry and transport settings.
-    const env: Record<string, string> = {
+    const env: NodeJS.ProcessEnv = {
+      ...authentication,
       SWEETPAD_CANCEL_FILE: path.join(cancellationDirectory, "cancel"),
     };
     for (const key of ["APPDATA", "LOCALAPPDATA", "SWEETPAD_REMOTE_EXECUTABLE", "SWEETPAD_REMOTE_ROOT"]) {
@@ -379,37 +463,30 @@ type DestinationItem = vscode.TreeItem & { destination?: string; udid?: string }
 
 /** Register the Mac registry and ad-hoc command actions in either activation mode. */
 export function registerMacCommands(
-  register: (id: string, action: () => Promise<void>) => void,
+  register: (id: string, action: (item?: RemoteMacItem) => Promise<void>) => void,
   client: RemoteClient,
   refresh: () => Promise<void> | void,
 ): void {
-  register("sweetpad.remote.selectMac", async () => {
-    const mac = await client.selectMac();
+  register("sweetpad.remote.selectMac", async (item) => {
+    const mac = await client.selectMac(item?.mac.name);
     if (mac) await refresh();
   });
   register("sweetpad.remote.addMac", async () => {
-    const name = await vscode.window.showInputBox({ prompt: "Name for this Mac" });
-    if (!name) return;
-    const host = await vscode.window.showInputBox({
-      prompt: "SSH target (user@host or SSH config alias)",
-    });
-    if (!host) return;
-    const key = await vscode.window.showInputBox({
-      prompt: "Private key path (leave blank for your normal SSH config/agent)",
-    });
-    if (key === undefined) return;
-    const port = await vscode.window.showInputBox({
-      prompt: "SSH port (leave blank for SSH config/default)",
-    });
-    if (port === undefined) return;
-    if (port && (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535)) {
-      throw new Error("SSH port must be between 1 and 65535.");
-    }
-    const args = ["remote", "add", name, host];
-    if (key) args.push("--identity-file", key);
-    if (port) args.push("--port", port);
-    await client.query(args);
-    await config().update("remote.mac", name, macSettingTarget());
+    await client.addMac();
+    await refresh();
+  });
+  register("sweetpad.remote.editMac", async (item) => {
+    await client.editMac(item?.mac.name);
+    await refresh();
+  });
+  register("sweetpad.remote.forgetPassword", async () => {
+    const macs = await client.macs();
+    const picked = await vscode.window.showQuickPick(
+      macs.map((mac) => ({ label: mac.name, description: mac.host, mac })),
+      { placeHolder: "Forget the saved password for a Mac" },
+    );
+    if (!picked) return;
+    await client.forgetPassword(picked.mac);
     await refresh();
   });
   register("sweetpad.remote.removeMac", async () => {
@@ -420,6 +497,8 @@ export function registerMacCommands(
     );
     if (!picked) return;
     await client.query(["remote", "remove", picked]);
+    const removed = macs.find((mac) => mac.name === picked);
+    if (removed) await client.forgetPassword(removed);
     if (client.mac === picked) {
       if (vscode.workspace.workspaceFolders?.length) {
         await config().update("remote.mac", undefined, vscode.ConfigurationTarget.Workspace);
@@ -442,7 +521,9 @@ export function registerMacCommands(
 }
 
 export async function activateRemote(context: vscode.ExtensionContext) {
-  const client = new RemoteClient();
+  const auth = new RemoteAuth(context.secrets);
+  const client = new RemoteClient(auth, await auth.environment());
+  const macsView = new RemoteMacsTree(client);
   const schemes = new RefreshableTree(client, "scheme");
   const destinations = new RefreshableTree(client, "destination");
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
@@ -453,6 +534,7 @@ export async function activateRemote(context: vscode.ExtensionContext) {
   };
   const refresh = () => {
     updateStatus();
+    macsView.refresh();
     schemes.refresh();
     destinations.refresh();
   };
@@ -470,7 +552,8 @@ export async function activateRemote(context: vscode.ExtensionContext) {
     );
   };
 
-  context.subscriptions.push(client, schemes, destinations, status);
+  context.subscriptions.push(auth, client, macsView, schemes, destinations, status);
+  context.subscriptions.push(vscode.window.registerTreeDataProvider("sweetpad.remote.macs.view", macsView));
   context.subscriptions.push(vscode.window.registerTreeDataProvider("sweetpad.build.view", schemes));
   context.subscriptions.push(vscode.window.registerTreeDataProvider("sweetpad.destinations.view", destinations));
   context.subscriptions.push(
@@ -485,6 +568,7 @@ export async function activateRemote(context: vscode.ExtensionContext) {
   status.show();
 
   registerMacCommands(register, client, refresh);
+  register("sweetpad.remote.refreshMacs", () => macsView.refresh());
 
   const selectionArgs = (item?: SchemeItem, clean = false, testing = false) => {
     const args: string[] = [];

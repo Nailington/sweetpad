@@ -417,6 +417,12 @@
     "views": {
       "speedpad-view": [
         {
+          "id": "sweetpad.remote.macs.view",
+          "name": "Macs",
+          "visibility": "visible",
+          "when": "sweetpad.remoteMode"
+        },
+        {
           "id": "sweetpad.build.view",
           "name": "Build",
           "visibility": "visible"
@@ -442,6 +448,11 @@
     },
     "viewsWelcome": [
       {
+        "view": "sweetpad.remote.macs.view",
+        "contents": "Add a Mac to build and run over SSH.\n[Add Mac](command:sweetpad.remote.addMac)",
+        "when": "sweetpad.remoteMode"
+      },
+      {
         "view": "sweetpad.build.view",
         "contents": "No Xcode scheme was found. Select the workspace that has the Xcode project to use SweetPad.\n[Select Workspace](command:sweetpad.build.selectXcodeWorkspace)\nAlso you can run diagnose to try to detect the root of the problem\n[Run diagnose](command:sweetpad.build.diagnoseSetup)",
         "when": "sweetpad.build.noSchemes"
@@ -458,6 +469,20 @@
       }
     ],
     "commands": [
+      {
+        "command": "sweetpad.remote.forgetPassword",
+        "title": "SweetPad: Forget Remote Mac Password"
+      },
+      {
+        "command": "sweetpad.remote.editMac",
+        "title": "SweetPad: Edit Remote Mac",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "sweetpad.remote.refreshMacs",
+        "title": "SweetPad: Refresh Macs",
+        "icon": "$(refresh)"
+      },
       {
         "command": "sweetpad.remote.selectMac",
         "title": "SweetPad: Select Remote Mac",
@@ -875,6 +900,16 @@
       ],
       "view/title": [
         {
+          "command": "sweetpad.remote.refreshMacs",
+          "when": "sweetpad.remoteMode && view == sweetpad.remote.macs.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "sweetpad.remote.addMac",
+          "when": "sweetpad.remoteMode && view == sweetpad.remote.macs.view",
+          "group": "navigation@0"
+        },
+        {
           "command": "sweetpad.remote.selectMac",
           "when": "sweetpad.remoteMode && view == sweetpad.build.view",
           "group": "navigation@0"
@@ -925,6 +960,11 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "sweetpad.remote.editMac",
+          "when": "sweetpad.remoteMode && view == sweetpad.remote.macs.view && viewItem == remote-mac",
+          "group": "inline@0"
+        },
         {
           "command": "sweetpad.simulators.openSimulator",
           "when": "view == sweetpad.destinations.view && viewItem =~ /destination-group-simulator-.*/",

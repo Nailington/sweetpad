@@ -122,8 +122,10 @@ import { XcodeGenWatcher } from "./xcodegen/watcher.js";
 
 export async function activate(context: vscode.ExtensionContext) {
   const { RemoteClient, registerMacCommands } = await import("./remote/extension.js");
-  const remoteClient = new RemoteClient();
-  context.subscriptions.push(remoteClient);
+  const { RemoteAuth } = await import("./remote/auth.js");
+  const remoteAuth = new RemoteAuth(context.secrets);
+  const remoteClient = new RemoteClient(remoteAuth);
+  context.subscriptions.push(remoteAuth, remoteClient);
   registerMacCommands(
     (id, action) => {
       context.subscriptions.push(

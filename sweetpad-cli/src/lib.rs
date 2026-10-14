@@ -8,5 +8,6 @@
 #[cfg(not(windows))]
 pub mod cli;
 pub mod portable_remote;
+pub mod ssh_auth;
 #[cfg(not(windows))]
 pub mod vscode_cli;

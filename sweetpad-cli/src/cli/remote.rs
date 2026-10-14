@@ -117,6 +117,7 @@ fn run_inner(cli: &Cli, argv: &[String], reference: &str, out: &Output) -> Resul
         host: mac.host.clone(),
         identity_file: mac.identity_file.clone(),
         port: mac.port,
+        auth: mac.auth,
         batch_mode: cli.global.non_interactive,
     };
     let id = portable_remote::id(&root, &transport_mac);

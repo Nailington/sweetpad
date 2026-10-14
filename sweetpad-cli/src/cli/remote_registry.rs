@@ -1,6 +1,6 @@
 //! User-managed Mac names, separate from the hand-authored `config.toml`.
 //! SSH owns credentials and host-key verification; this file stores only
-//! endpoints and optional paths to keys already on disk.
+//! endpoints, authentication preferences, and optional paths to keys already on disk.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -26,6 +26,9 @@ pub enum Action {
         /// Existing private key file to use for this Mac.
         #[arg(long = "identity-file", value_name = "PATH")]
         identity_file: Option<PathBuf>,
+        /// Authentication method (otherwise normal SSH config and agent apply).
+        #[arg(long, value_enum, default_value = "ssh", value_name = "METHOD")]
+        auth: crate::ssh_auth::Auth,
         /// SSH port (otherwise SSH config/default port applies).
         #[arg(long)]
         port: Option<u16>,
@@ -48,6 +51,8 @@ pub struct Mac {
     pub identity_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "crate::ssh_auth::Auth::is_default")]
+    pub auth: crate::ssh_auth::Auth,
 }
 
 impl Mac {
@@ -63,6 +68,7 @@ impl Mac {
         if let Some(port) = self.port {
             command.arg("-p").arg(port.to_string());
         }
+        crate::ssh_auth::configure(&mut command, &self.host, self.port, self.auth);
         command
     }
 }
@@ -145,6 +151,7 @@ pub fn resolve(reference: &str) -> Result<Mac, String> {
             host: reference.to_owned(),
             identity_file: None,
             port: None,
+            auth: crate::ssh_auth::Auth::default(),
         });
     }
     Err(format!(
@@ -169,9 +176,15 @@ pub fn manage(_ctx: &mut Context, action: Option<&Action>) -> CommandResult {
             host,
             identity_file,
             port,
+            auth,
             replace,
         }) => {
             validate_name(name).map_err(CliError::new)?;
+            if *auth == crate::ssh_auth::Auth::Password && identity_file.is_some() {
+                return Err(CliError::new(
+                    "--auth password cannot be combined with --identity-file",
+                ));
+            }
             if !super::remote::valid_host(host) {
                 return Err(CliError::new(
                     "SSH target must be a host, user@host, or SSH config alias",
@@ -196,6 +209,7 @@ pub fn manage(_ctx: &mut Context, action: Option<&Action>) -> CommandResult {
                     host: host.clone(),
                     identity_file,
                     port: *port,
+                    auth: *auth,
                 },
             );
             registry.save().map_err(CliError::new)?;
@@ -276,6 +290,9 @@ impl Render for RegistryReport {
                 if let Some(path) = &mac.identity_file {
                     let _ = write!(details, "  (key {})", path.display());
                 }
+                if mac.auth == crate::ssh_auth::Auth::Password {
+                    details.push_str("  (password)");
+                }
                 out.line(&details);
             }
         }
@@ -291,6 +308,7 @@ impl Render for RegistryReport {
                     "host": mac.host,
                     "identityFile": mac.identity_file.as_ref().map(|p| p.display().to_string()),
                     "port": mac.port,
+                    "auth": mac.auth,
                 })
             })
             .collect();
@@ -328,6 +346,7 @@ mod tests {
             host: "dev@mac.local".into(),
             identity_file: Some(PathBuf::from("/tmp/key's name")),
             port: Some(2222),
+            auth: crate::ssh_auth::Auth::default(),
         };
         assert_eq!(mac.ssh_command().get_args().count(), 6);
     }

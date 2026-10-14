@@ -20,6 +20,8 @@ pub(crate) struct Mac {
     pub(crate) identity_file: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) port: Option<u16>,
+    #[serde(default, skip_serializing_if = "crate::ssh_auth::Auth::is_default")]
+    pub(crate) auth: crate::ssh_auth::Auth,
     #[serde(skip)]
     pub(crate) batch_mode: bool,
 }
@@ -35,7 +37,7 @@ impl Mac {
             "-o",
             "ServerAliveCountMax=2",
         ]);
-        if self.batch_mode {
+        if self.batch_mode && !crate::ssh_auth::has_broker() {
             command.args(["-o", "BatchMode=yes"]);
         }
         if let Some(key) = &self.identity_file {
@@ -47,6 +49,7 @@ impl Mac {
         if let Some(port) = self.port {
             command.arg("-p").arg(port.to_string());
         }
+        crate::ssh_auth::configure(&mut command, &self.host, self.port, self.auth);
         command
     }
 }
@@ -115,6 +118,7 @@ impl Registry {
                 host: name.into(),
                 identity_file: None,
                 port: None,
+                auth: crate::ssh_auth::Auth::default(),
                 batch_mode: false,
             });
         }
@@ -534,6 +538,7 @@ fn manage(argv: &[String], json: bool, ndjson: bool) -> Result<(), String> {
             let mut key = None;
             let mut port = None;
             let mut replace = false;
+            let mut auth = crate::ssh_auth::Auth::default();
             let mut index = 3;
             while index < argv.len() {
                 match argv[index].as_str() {
@@ -567,10 +572,21 @@ fn manage(argv: &[String], json: bool, ndjson: bool) -> Result<(), String> {
                         }
                         port = Some(parsed);
                     }
+                    "--auth" => {
+                        index += 1;
+                        auth = match argv.get(index).map(String::as_str) {
+                            Some("ssh") => crate::ssh_auth::Auth::Ssh,
+                            Some("password") => crate::ssh_auth::Auth::Password,
+                            _ => return Err("--auth must be ssh or password".into()),
+                        };
+                    }
                     "--replace" => replace = true,
                     other => return Err(format!("unknown remote add option {other}")),
                 }
                 index += 1;
+            }
+            if auth == crate::ssh_auth::Auth::Password && key.is_some() {
+                return Err("--auth password cannot be combined with --identity-file".into());
             }
             if registry.macs.contains_key(name) && !replace {
                 return Err(format!("Mac {name:?} already exists (pass --replace)"));
@@ -581,6 +597,7 @@ fn manage(argv: &[String], json: bool, ndjson: bool) -> Result<(), String> {
                     host: host.clone(),
                     identity_file: key,
                     port,
+                    auth,
                     batch_mode: false,
                 },
             );
@@ -617,7 +634,7 @@ fn manage(argv: &[String], json: bool, ndjson: bool) -> Result<(), String> {
         .iter()
         .map(|(name, mac)| {
             serde_json::json!({
-                "name":name,"host":mac.host,"identityFile":mac.identity_file,"port":mac.port
+                "name":name,"host":mac.host,"identityFile":mac.identity_file,"port":mac.port,"auth":mac.auth
             })
         })
         .collect();
@@ -1694,7 +1711,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     }
     if argv.is_empty() || matches!(argv.first().map(String::as_str), Some("--help" | "-h")) {
         println!(
-            "SweetPad native Windows remote client\n\nUsage:\n  sweetpad remote add NAME USER@HOST [--identity-file PATH] [--port PORT]\n  sweetpad remote list|show NAME|remove NAME\n  sweetpad COMMAND [ARGS] --remote NAME\n\nThe receiving Mac needs the updated SweetPad CLI and Xcode."
+            "SweetPad native Windows remote client\n\nUsage:\n  sweetpad remote add NAME USER@HOST [--identity-file PATH] [--port PORT] [--auth ssh|password]\n  sweetpad remote list|show NAME|remove NAME\n  sweetpad COMMAND [ARGS] --remote NAME\n\nThe receiving Mac needs the updated SweetPad CLI and Xcode."
         );
         return ExitCode::SUCCESS;
     }

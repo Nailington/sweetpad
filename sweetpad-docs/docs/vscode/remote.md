@@ -26,6 +26,40 @@ test build.
 If the CLI is not on VS Code's `PATH`, set `sweetpad.remote.cliPath` to its absolute path. On a Mac, set
 `sweetpad.remote.mac` and reload the extension window to switch from local to remote mode.
 
+## Manage saved Macs in the sidebar
+
+The **Macs** section in the SweetPad sidebar lists your saved Macs. Click **+** in its header to
+add a Mac, or use **Add Mac** when the list is empty. Click a Mac to select it for the current
+workspace; the selected Mac has a checkmark. Use the refresh button to pick up registry changes
+made outside VS Code.
+
+Hover over a Mac and click its pencil to edit that Mac directly. **SweetPad: Edit Remote Mac**
+in the Command Palette also lets you choose a Mac to edit. The form opens its current name, SSH
+target, authentication method, key path, and port. Leaving the key path or port blank restores the normal SSH config/default.
+Cancel any prompt to leave the saved entry unchanged.
+
+Renaming a Mac updates matching global and current-workspace selections. A name already used by
+another Mac is rejected. Changing the SSH target or port asks for that endpoint's own credentials
+on the next connection; the old password is not copied to it. To change only a saved password,
+use **SweetPad: Forget Remote Mac Password** and enter the new password on the next connection.
+
+## Password authentication
+
+Choose **Password** when adding the Mac. On the first connection, SweetPad asks for the Mac user's
+password in a masked VS Code input and saves it in VS Code's encrypted secret storage. The same
+credential works for sidebar queries and commands opened in a terminal. Passwords are never written
+to workspace settings, the Mac registry, shell history, or command arguments. SSH host-key
+verification still requires your explicit confirmation for a new Mac.
+
+If a saved password is rejected, SweetPad prompts again. Use **SweetPad: Forget Remote Mac Password**
+to remove a saved password; the next connection prompts for a new one. Removing a saved Mac also
+removes its password. SSH key passphrases and verification codes can be entered when requested,
+but are not saved as account passwords.
+
+Install the updated CLI locally as well as the updated extension. The native CLI itself acts as
+OpenSSH's askpass helper on Windows, Linux, and macOS; no `sshpass`, extra Node runtime, or helper
+script is needed. Standalone CLI sessions outside the extension use SSH's normal terminal prompts.
+
 ## Use the sidebar
 
 The **Build** view lists schemes discovered on the selected Mac. The **Destinations** view lists simulators and phones

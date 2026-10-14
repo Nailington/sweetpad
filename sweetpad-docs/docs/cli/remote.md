@@ -49,6 +49,7 @@ You can save several Macs under names that are easier to remember:
 ```bash
 sweetpad remote add "Studio Mac" dev@studio-mac.local
 sweetpad remote add "Build Mac" build@192.168.1.10 --identity-file ~/.ssh/build_mac_ed25519 --port 2222
+sweetpad remote add "Password Mac" dev@mac.local --auth password
 sweetpad remote list
 sweetpad remote show "Studio Mac"
 sweetpad build --remote "Studio Mac"
@@ -66,6 +67,11 @@ account. On Windows, OpenSSH uses your Windows user profile's `.ssh` directory. 
 permits them, but passwords are not saved. For unattended commands, set up a key or SSH agent. `--non-interactive`
 disables SSH authentication prompts with `BatchMode=yes`, so missing credentials fail promptly instead of waiting for
 input. `--replace` replaces the whole saved entry, including its optional key path and port.
+
+Use `--auth password` for a saved Mac to prefer password/keyboard-interactive authentication and disable
+public-key attempts. This cannot be combined with `--identity-file`; `--auth ssh` preserves normal SSH settings.
+The VS Code extension can prompt for and save account passwords in encrypted secret storage; standalone CLI
+sessions use SSH terminal prompts. See the [password authentication guide](../vscode/remote.md#password-authentication).
 
 Raw SSH hosts and aliases continue to work with `--remote`, even if you never save them.
 

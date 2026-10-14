@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   closeSubscription: { dispose: vi.fn() },
 }));
 vi.mock("node:child_process", () => ({ execFile: mocks.execFile }));
+vi.mock("./mac-tree.js", () => ({ RemoteMacsTree: vi.fn() }));
 vi.mock("vscode", () => ({
   workspace: {
     getConfiguration: () => ({
