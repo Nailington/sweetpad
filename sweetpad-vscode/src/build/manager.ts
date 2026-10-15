@@ -1207,7 +1207,7 @@ export class BuildManager {
     },
   ) {
     const useXcbeautify = isXcbeautifyEnabled() && (await getIsXcbeautifyInstalled());
-    const bundlePath = await prepareBundleDir(this.vscodeContext, options.scheme);
+    const bundlePath = await prepareBundleDir(this.vscodeContext, options.scheme, options.xcworkspace);
     const derivedDataPath = prepareDerivedDataPath({
       workspaceRoot: options.workspaceRoot,
     });
@@ -1314,6 +1314,14 @@ export class BuildManager {
     }
 
     const diagnostics = this.diagnostics.beginBuild({ mode: useXcbeautify ? "xcbeautify" : "xcodebuild" });
+    // Persist before executing: failed builds have the most useful logs, and
+    // the command must still work after the extension host restarts.
+    if (options.shouldBuild || options.shouldTest) {
+      this.workspaceState.update("build.resultBundles", {
+        ...this.workspaceState.get("build.resultBundles"),
+        [options.xcworkspace]: { path: bundlePath, workspaceRoot: options.workspaceRoot },
+      });
+    }
     try {
       await terminal.execute({
         command: commandParts[0],

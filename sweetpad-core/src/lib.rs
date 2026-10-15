@@ -13,6 +13,7 @@
 pub mod app_locator;
 pub mod bsp;
 pub mod build_context;
+pub mod build_log;
 pub mod build_settings;
 pub mod devices;
 pub mod framing;

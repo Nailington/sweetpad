@@ -4,12 +4,14 @@
 //! same build over the scheme's test targets ([`for_testing`]).
 
 use clap::Subcommand;
+use std::path::PathBuf;
 
 use crate::cli::buildlog::{self, DiagKind};
 use crate::cli::output::Output;
 use crate::cli::xcodebuild::BuildAction;
 use crate::cli::{
-    CliError, CommandResult, Context, ErrorKind, Render, Rendered, resolve, swiftpm, xcodebuild,
+    CliError, CommandResult, Context, ErrorKind, Render, Rendered, process, resolve, swiftpm,
+    xcodebuild,
 };
 
 /// The build flags, declared `global` at the `build` resource so they parse on
@@ -49,6 +51,20 @@ pub enum Action {
     Start,
     /// Show the errors/warnings from the last build, without rebuilding.
     Diagnostics(DiagnosticsArgs),
+    /// Extract the last build's full Xcode log, including signing/script output.
+    Logs(LogsArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct LogsArgs {
+    #[command(flatten)]
+    pub read: DiagnosticsArgs,
+    /// Read this .xcresult instead of the project's retained build result.
+    #[arg(long, value_name = "PATH")]
+    pub result_bundle: Option<PathBuf>,
+    /// Save the extracted text to PATH instead of printing it.
+    #[arg(long, value_name = "PATH")]
+    pub output_file: Option<PathBuf>,
 }
 
 /// The start-only flags, redeclared hidden on `build diagnostics` under the
@@ -78,6 +94,14 @@ pub fn run(ctx: &mut Context, args: &StartArgs, action: Option<&Action>) -> Comm
             // ignoring them would silently not do what was asked.
             refuse_build_flags(args, crate::cli::flag_typed)?;
             diagnostics(ctx)
+        }
+        Some(Action::Logs(logs_args)) => {
+            crate::cli::refuse_flags(
+                &diagnostics_refused_flags(args, crate::cli::flag_typed),
+                "a build",
+                ": 'build logs' reads a saved result bundle and builds nothing",
+            )?;
+            logs(ctx, logs_args)
         }
         Some(Action::Start) | None => {
             crate::cli::mac_as_on(&mut ctx.targeting, args.mac)?;
@@ -220,6 +244,86 @@ fn diagnostics(ctx: &mut Context) -> CommandResult {
         )
     })?;
     Ok(Rendered::data(DiagnosticsReport { record }))
+}
+
+struct LogsReport {
+    bundle: PathBuf,
+    text: String,
+    log: serde_json::Value,
+    output_file: Option<PathBuf>,
+}
+
+impl Render for LogsReport {
+    fn human(&self, out: &Output) {
+        if let Some(path) = &self.output_file {
+            out.line(&path.display().to_string());
+        } else {
+            for line in self.text.lines() {
+                out.line(line);
+            }
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "resultBundle": self.bundle,
+            "outputFile": self.output_file,
+            "text": self.text,
+            "log": self.log,
+        })
+    }
+}
+
+fn logs(ctx: &mut Context, args: &LogsArgs) -> CommandResult {
+    let bundle = if let Some(path) = &args.result_bundle {
+        path.clone()
+    } else {
+        let container = resolve::container(ctx)?;
+        if matches!(container, resolve::Container::SwiftPackage(_)) {
+            return Err(CliError::new(
+                "Swift package builds don't produce Xcode result bundles; use 'sweetpad build -v' for their output",
+            ));
+        }
+        xcodebuild::build_result_bundle(&container)
+    };
+    if !bundle.is_dir() {
+        return Err(CliError::new(format!(
+            "no saved Xcode build result at {} — run 'sweetpad build' or 'sweetpad run' first, or pass --result-bundle PATH",
+            bundle.display()
+        )));
+    }
+    let raw = process::capture(
+        "xcrun",
+        &[
+            "xcresulttool",
+            "get",
+            "log",
+            "--path",
+            &bundle.to_string_lossy(),
+            "--type",
+            "build",
+        ],
+        None,
+    )
+    .map_err(|e| e.context("extracting the Xcode build log (requires Xcode 16 or later)"))?;
+    let log: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| CliError::new(format!("invalid Xcode build log: {e}")))?;
+    let text = sweetpad_core::build_log::render(&log).map_err(CliError::new)?;
+    if let Some(path) = &args.output_file {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CliError::new(format!("cannot create {}: {e}", parent.display())))?;
+        }
+        std::fs::write(path, &text).map_err(|e| {
+            CliError::new(format!("cannot save build log to {}: {e}", path.display()))
+        })?;
+    }
+    Ok(Rendered::data(LogsReport {
+        bundle,
+        text,
+        log,
+        output_file: args.output_file.clone(),
+    }))
 }
 
 /// The build result. Human mode already streamed the beautified log, so this

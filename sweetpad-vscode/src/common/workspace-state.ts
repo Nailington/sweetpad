@@ -58,6 +58,7 @@ export type WorkspaceTypes = {
   "build.xcodeDestinationsRecent": SelectedDestination[];
   "build.xcodeSdk": string;
   "build.lastLaunchedApp": LastLaunchedAppContext;
+  "build.resultBundles": Record<string, { path: string; workspaceRoot: string }>;
   "build.xbsAutogenreateInfoShown": boolean;
   "build.missingPinnedSchemeWarned": string;
   "build.xbsMissingNotified": boolean;

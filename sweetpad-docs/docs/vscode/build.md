@@ -38,6 +38,18 @@ integrates with.
 
    ![Context Menu](/images/build-context-menu.png)
 
+## Read or export a build log
+
+Run **SweetPad: Show Build Logs** from the command palette to open the last build's complete Xcode
+log in an editor tab, including code-signing and script output that the formatted terminal may omit.
+**SweetPad: Export Build Logs** saves that text to a file you choose. Both commands read the saved
+result bundle without rebuilding and work after a failed build or an editor restart.
+
+In remote mode, SweetPad extracts the log on the selected Mac and opens or saves it on your local
+machine. In local mode, it reads the current project's last extension build, with a fallback to the
+selected scheme's existing bundle. Xcode 16 or later is required. A subsequent build replaces that
+build's saved result.
+
 ## Stop a running build or app
 
 Long builds, runaway test runs, or apps that won't terminate on their own can all be cancelled in one click. While

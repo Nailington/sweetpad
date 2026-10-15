@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   createTerminal: vi.fn(),
   closeTerminal: undefined as ((terminal: unknown) => void) | undefined,
   closeSubscription: { dispose: vi.fn() },
+  xcodebuildArgs: [] as string[],
 }));
 vi.mock("node:child_process", () => ({ execFile: mocks.execFile }));
 vi.mock("./mac-tree.js", () => ({ RemoteMacsTree: vi.fn() }));
@@ -18,6 +19,7 @@ vi.mock("vscode", () => ({
         ({
           "remote.mac": "Test Mac",
           "remote.cliPath": "C:\\Program Files\\SweetPad\\sweetpad.exe",
+          "remote.xcodebuildArgs": mocks.xcodebuildArgs,
         })[key],
     }),
   },
@@ -36,6 +38,7 @@ describe("remote GUI client", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.createTerminal.mockReturnValue(mocks.terminal);
+    mocks.xcodebuildArgs = [];
   });
   afterEach(() => vi.restoreAllMocks());
 
@@ -88,6 +91,23 @@ describe("remote GUI client", () => {
   it("rejects malformed CLI output", async () => {
     mocks.execFile.mockImplementation((_file, _args, _options, callback) => callback(null, "not JSON", ""));
     await expect(new RemoteClient().query(["devices"])).rejects.toThrow("invalid JSON");
+  });
+
+  it.each(["logs", "diagnostics"])("does not inject build arguments into build %s", async (action) => {
+    mocks.xcodebuildArgs = ["-allowProvisioningUpdates", "DEVELOPMENT_TEAM=ABCDE12345"];
+    mocks.execFile.mockImplementation((_file, _args, _options, callback) =>
+      callback(null, '{"ok":true,"data":{}}', ""),
+    );
+    await new RemoteClient().query(["build", action, "--remote", "Test Mac"], "/project");
+    expect(mocks.execFile.mock.calls[0][1]).toEqual([
+      "-o",
+      "json",
+      "--non-interactive",
+      "build",
+      action,
+      "--remote",
+      "Test Mac",
+    ]);
   });
 
   it("shows the structured Mac error returned on stderr", async () => {

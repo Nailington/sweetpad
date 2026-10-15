@@ -47,6 +47,7 @@ import {
 import type { SimulatorDestination } from "../simulators/types";
 import type { ProgressStatusBar } from "../system/status-bar";
 import { getToolById } from "../tools/constants";
+import { buildResultPath } from "./logs";
 import type { BuildManager } from "./manager";
 
 export type SelectedDestination = {
@@ -296,17 +297,18 @@ export async function prepareStoragePath(vscodeContext: vscode.ExtensionContext)
 /**
  * Prepare bundle directory for the given scheme in the storage path
  */
-export async function prepareBundleDir(vscodeContext: vscode.ExtensionContext, scheme: string): Promise<string> {
+export async function prepareBundleDir(
+  vscodeContext: vscode.ExtensionContext,
+  scheme: string,
+  container: string,
+): Promise<string> {
   const storagePath = await prepareStoragePath(vscodeContext);
 
-  const bundleDir = path.join(storagePath, "bundle", scheme);
+  const bundleDir = buildResultPath(storagePath, container, scheme);
+  await createDirectory(path.dirname(bundleDir));
 
   // Remove old bundle if exists
   await removeDirectory(bundleDir);
-
-  // Remove old .xcresult if exists
-  const xcresult = path.join(storagePath, "bundle", `${scheme}.xcresult`);
-  await removeDirectory(xcresult);
 
   return bundleDir;
 }

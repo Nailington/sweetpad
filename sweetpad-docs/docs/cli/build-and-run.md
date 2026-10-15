@@ -121,6 +121,22 @@ like. `sweetpad test` records its build too, so `build diagnostics` always shows
 its errors if it failed, its warnings if the tests went on to run. There's one record per project,
 so it takes no scheme, configuration, or destination flag.
 
+For signing failures, build scripts, or other output missing from the diagnostics, extract the full
+log from the saved Xcode result bundle without rebuilding:
+
+```bash
+sweetpad build logs
+sweetpad build logs --output-file logs/build.log
+sweetpad --remote "M1 iMac" build logs --output-file logs/build.log
+```
+
+The remote form extracts on the Mac and downloads the saved text file to your local project. You can
+also redirect the printed text, or use `--json` for an envelope whose `data.text` contains the readable
+log and `data.log` contains Xcode's original structured log. To inspect another result bundle, pass
+`--result-bundle path/to/build.xcresult`. This requires Xcode 16 or later and an Xcode result bundle;
+plain `swift build` package builds don't produce one. The retained build slot is replaced by the next
+build, including a rebuild from `sweetpad run`.
+
 :::tip
 
 Want the raw output instead of the summary? `-v` prints everything xcodebuild said. It's the first

@@ -65,6 +65,13 @@ feedback reports.
 | `sweetpad app sample`     | Sample the running app for a few seconds and say whether its main thread is idle, blocked, or busy. The full report is saved too. |
 | `sweetpad app ui`         | Read or drive a macOS app's UI through accessibility: `ui tree`, `ui click`, `ui type`. |
 
+### Saved build logs
+
+`sweetpad build logs` extracts the full log from the retained Xcode build result without rebuilding.
+Use `--output-file PATH` to save text, `--result-bundle PATH` to select another `.xcresult`, or `--json`
+to read both `data.text` and Xcode's structured `data.log`. `--remote MAC` extracts on the Mac; an
+output file inside the project is downloaded locally.
+
 ### Extra xcodebuild arguments
 
 Anything after `--` goes to `xcodebuild` verbatim: its own flags, or `KEY=VALUE` build-setting

@@ -92,6 +92,8 @@ sweetpad                          status view in a project; help outside one
 sweetpad run [--on X] [--hot]     the flagship loop (= app run)
 sweetpad build [--clean|--watch|--show-command] [-- XCODEBUILD_ARGS]
 sweetpad build diagnostics        last build's errors/warnings, no rebuild
+sweetpad build logs               full saved Xcode build log, no rebuild
+sweetpad build logs --output-file logs/build.log
 sweetpad test [--failed|--retry-flaky N|--coverage|--junit P|--watch]
 sweetpad test build               compile the test targets, run none, §9p
 sweetpad test attachments         export the last run's screenshots/dumps, §9l

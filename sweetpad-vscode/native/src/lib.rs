@@ -21,6 +21,13 @@ use sweetpad_core::xcodebuild_args;
 use sweetpad_lib::destination::{RunDestination, parse_destination_arg};
 use sweetpad_lib::{compiler_args, project, scheme, workspace, xcode};
 
+/// Render the complete build log from `xcresulttool get log --type build`.
+/// Includes signing and script output that a diagnostics parser may omit.
+#[napi]
+pub fn render_build_log(json: String) -> napi::Result<String> {
+    sweetpad_core::build_log::render_json(&json).map_err(to_napi_err)
+}
+
 /// Active Xcode toolchain info. Mirrors `xcrun xcodebuild -version` plus the
 /// resolved `DEVELOPER_DIR`.
 #[napi(object)]

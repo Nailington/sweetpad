@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 
+import { presentBuildLog } from "../build/logs";
 import type { PreviewItem } from "../previews/types";
+import { extractRemoteBuildLog } from "./build-logs";
 import { RemoteCodeIntelligence, symbolSearchCommands, targetArgs } from "./code-intelligence";
 import type { RemoteClient } from "./extension";
 import { config, projectRoot } from "./extension";
@@ -27,6 +29,16 @@ export function registerRemoteFeatures(
     intelligence.output.show();
   });
   register("sweetpad.bsp.showLogs", () => intelligence.output.show());
+  for (const [id, save] of [
+    ["showLogs", false],
+    ["exportLogs", true],
+  ] as const) {
+    register(`sweetpad.build.${id}`, async () => {
+      const root = projectRoot();
+      const text = await extractRemoteBuildLog(client, root);
+      await presentBuildLog(text, root, save);
+    });
+  }
   register("sweetpad.debugger.debuggingLaunch", async () => {
     await vscode.debug.startDebugging(vscode.workspace.workspaceFolders?.[0], {
       type: "sweetpad-remote",

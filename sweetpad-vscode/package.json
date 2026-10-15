@@ -532,6 +532,16 @@
         "icon": "$(clear-all)"
       },
       {
+        "command": "sweetpad.build.showLogs",
+        "title": "SweetPad: Show Build Logs",
+        "icon": "$(output)"
+      },
+      {
+        "command": "sweetpad.build.exportLogs",
+        "title": "SweetPad: Export Build Logs",
+        "icon": "$(export)"
+      },
+      {
         "command": "sweetpad.build.test",
         "title": "SweetPad: Test",
         "icon": "$(beaker)"
@@ -899,6 +909,16 @@
         }
       ],
       "view/title": [
+        {
+          "command": "sweetpad.build.showLogs",
+          "when": "view == sweetpad.build.view",
+          "group": "logs@1"
+        },
+        {
+          "command": "sweetpad.build.exportLogs",
+          "when": "view == sweetpad.build.view",
+          "group": "logs@2"
+        },
         {
           "command": "sweetpad.remote.refreshMacs",
           "when": "sweetpad.remoteMode && view == sweetpad.remote.macs.view",

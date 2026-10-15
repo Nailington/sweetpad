@@ -1,5 +1,6 @@
 import path from "node:path";
 
+import * as sweetpadLib from "@sweetpad/native";
 import * as vscode from "vscode";
 
 import { getBuildServerProvider } from "../bsp/commands";
@@ -12,6 +13,7 @@ import { exec } from "../common/exec";
 import { getWorkspaceRelativePath, isFileExists, removeDirectory } from "../common/files";
 import { showInputBox, showQuickPick } from "../common/quick-pick";
 import { runTask } from "../common/tasks/run";
+import { buildResultPath, presentBuildLog } from "./logs";
 import type { BuildTreeItem } from "./tree";
 import {
   askSchemeForBuild,
@@ -84,6 +86,54 @@ export async function cleanCommand(deps: AppDeps, item?: BuildTreeItem) {
 
 export async function testCommand(deps: AppDeps, item?: BuildTreeItem) {
   return deps.buildManager.testCommand(item);
+}
+
+async function extractBuildLog(deps: AppDeps): Promise<{ text: string; root: string }> {
+  const xcworkspace = await askXcodeWorkspacePath({
+    workspaceState: deps.workspaceState,
+    workspaceContext: deps.workspaceContext,
+    buildManager: deps.buildManager,
+  });
+  const recorded = deps.workspaceState.get("build.resultBundles")?.[xcworkspace];
+  const root = recorded?.workspaceRoot ?? getWorkspaceRoot({ xcworkspace, workspaceContext: deps.workspaceContext });
+  // Existing extension builds already retained bundles, before this command
+  // tracked their paths. Read those too without requiring another build.
+  const scheme = deps.buildManager.getDefaultSchemeForBuild();
+  const storage = deps.vscodeContext.storageUri?.fsPath;
+  const candidates = recorded
+    ? [recorded.path, `${recorded.path}.xcresult`]
+    : storage && scheme
+      ? [
+          buildResultPath(storage, xcworkspace, scheme),
+          path.join(storage, "bundle", scheme),
+          path.join(storage, "bundle", `${scheme}.xcresult`),
+        ]
+      : [];
+  let bundle: string | undefined;
+  for (const candidate of candidates) {
+    if (await isFileExists(candidate)) {
+      bundle = candidate;
+      break;
+    }
+  }
+  if (!bundle) throw new ExtensionError("No saved Xcode build result for this project. Build or run it first.");
+  const json = await exec({
+    command: "xcrun",
+    args: ["xcresulttool", "get", "log", "--path", bundle, "--type", "build"],
+    cwd: root,
+    env: getWorkspaceConfig("build.env"),
+  });
+  return { text: sweetpadLib.renderBuildLog(json), root };
+}
+
+export async function showBuildLogsCommand(deps: AppDeps): Promise<void> {
+  const { text, root } = await extractBuildLog(deps);
+  await presentBuildLog(text, root, false);
+}
+
+export async function exportBuildLogsCommand(deps: AppDeps): Promise<void> {
+  const { text, root } = await extractBuildLog(deps);
+  await presentBuildLog(text, root, true);
 }
 
 /**

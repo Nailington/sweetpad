@@ -114,7 +114,8 @@ export class RemoteClient {
     const extra = config().get<string[]>("remote.xcodebuildArgs");
     if (command && ["build", "run", "test", "clean"].includes(command) && extra?.length && !result.includes("--")) {
       const next = args[args.indexOf(command) + 1];
-      if (command !== "test" || !next || next.startsWith("-")) result.push("--", ...extra);
+      const readingBuild = command === "build" && ["logs", "diagnostics"].includes(next);
+      if (!readingBuild && (command !== "test" || !next || next.startsWith("-"))) result.push("--", ...extra);
     }
     return result;
   }

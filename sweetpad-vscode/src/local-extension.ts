@@ -12,6 +12,7 @@ import {
   diagnoseBuildSetupCommand,
   disableLspDiagnosticsCommand,
   enableLspDiagnosticsCommand,
+  exportBuildLogsCommand,
   generateBuildServerConfigCommand,
   launchCommand,
   openXcodeCommand,
@@ -21,6 +22,7 @@ import {
   resolveDependenciesCommand,
   runCommand,
   searchBuildViewCommand,
+  showBuildLogsCommand,
   selectConfigurationForBuildCommand,
   selectXcodeSchemeForBuildCommand,
   selectXcodeWorkspaceCommand,
@@ -350,6 +352,8 @@ export async function activate(context: vscode.ExtensionContext) {
   d(command("sweetpad.build.build", buildCommand));
   d(command("sweetpad.build.clean", cleanCommand));
   d(command("sweetpad.build.test", testCommand));
+  d(command("sweetpad.build.showLogs", showBuildLogsCommand));
+  d(command("sweetpad.build.exportLogs", exportBuildLogsCommand));
   d(command("sweetpad.build.resolveDependencies", resolveDependenciesCommand));
   d(command("sweetpad.build.removeBundleDir", removeBundleDirCommand));
   d(command("sweetpad.build.generateBuildServerConfig", generateBuildServerConfigCommand));
