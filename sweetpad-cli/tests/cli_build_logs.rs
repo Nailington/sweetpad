@@ -195,7 +195,14 @@ fn remote_extraction_downloads_the_log_to_the_local_project() {
     // with SSH executing locally and xcrun returning a saved signing failure.
     fs::write(
         fixture.root.join("bin/ssh"),
-        "#!/bin/sh\nfor arg do command=$arg; done\nexec sh -c \"$command\"\n",
+        r#"#!/bin/sh
+# A real SSH server does not inherit the client's local askpass environment.
+unset SSH_ASKPASS SSH_ASKPASS_REQUIRE SSH_ASKPASS_PROMPT
+unset SWEETPAD_ASKPASS_HELPER SWEETPAD_ASKPASS_ADDR SWEETPAD_ASKPASS_TOKEN
+unset SWEETPAD_ASKPASS_HOST SWEETPAD_ASKPASS_PORT SWEETPAD_ASKPASS_CONNECTION SWEETPAD_AUTH_PROMPT
+for arg do command=$arg; done
+exec sh -c "$command"
+"#,
     )
     .unwrap();
     fs::set_permissions(
@@ -207,7 +214,7 @@ fn remote_extraction_downloads_the_log_to_the_local_project() {
     fs::write(
         &receiver,
         format!(
-            "#!/bin/sh\nmkdir -p saved.xcresult\nexec '{}' \"$@\"\n",
+            "#!/bin/sh\ntest -z \"${{SSH_ASKPASS+x}}${{SSH_ASKPASS_REQUIRE+x}}${{SSH_ASKPASS_PROMPT+x}}${{SWEETPAD_ASKPASS_HELPER+x}}${{SWEETPAD_ASKPASS_ADDR+x}}${{SWEETPAD_ASKPASS_TOKEN+x}}${{SWEETPAD_ASKPASS_HOST+x}}${{SWEETPAD_ASKPASS_PORT+x}}${{SWEETPAD_ASKPASS_CONNECTION+x}}${{SWEETPAD_AUTH_PROMPT+x}}\" || exit 98\nmkdir -p saved.xcresult\nexec '{}' \"$@\"\n",
             env!("CARGO_BIN_EXE_sweetpad")
         ),
     )
@@ -226,6 +233,11 @@ fn remote_extraction_downloads_the_log_to_the_local_project() {
         ])
         .env("SWEETPAD_REMOTE_ROOT", fixture.root.join("remote"))
         .env("SWEETPAD_REMOTE_EXECUTABLE", &receiver)
+        // Force askpass setup even when the test environment cannot bind a
+        // native broker. The fake SSH never needs an actual broker connection.
+        .env("SWEETPAD_ASKPASS_ADDR", "127.0.0.1:0")
+        .env("SWEETPAD_ASKPASS_TOKEN", "client-only-test-token")
+        .env("SSH_ASKPASS_PROMPT", "confirm")
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
