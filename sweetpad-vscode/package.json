@@ -470,6 +470,18 @@
     ],
     "commands": [
       {
+        "command": "sweetpad.remote.savePassword",
+        "title": "SweetPad: Save Remote Mac Password"
+      },
+      {
+        "command": "sweetpad.remote.saveKeychainPassword",
+        "title": "SweetPad: Save Remote Mac Keychain Password"
+      },
+      {
+        "command": "sweetpad.remote.forgetKeychainPassword",
+        "title": "SweetPad: Forget Remote Mac Keychain Password"
+      },
+      {
         "command": "sweetpad.remote.forgetPassword",
         "title": "SweetPad: Forget Remote Mac Password"
       },

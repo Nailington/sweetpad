@@ -37,9 +37,7 @@ impl Mac {
             "-o",
             "ServerAliveCountMax=2",
         ]);
-        if self.batch_mode && !crate::ssh_auth::has_broker() {
-            command.args(["-o", "BatchMode=yes"]);
-        }
+
         if let Some(key) = &self.identity_file {
             command
                 .arg("-i")
@@ -49,7 +47,13 @@ impl Mac {
         if let Some(port) = self.port {
             command.arg("-p").arg(port.to_string());
         }
-        crate::ssh_auth::configure(&mut command, &self.host, self.port, self.auth);
+        crate::ssh_auth::configure(
+            &mut command,
+            &self.host,
+            self.port,
+            self.auth,
+            self.batch_mode,
+        );
         command
     }
 }
@@ -251,7 +255,27 @@ pub(crate) fn run_session(
     command: &str,
     interactive: bool,
 ) -> Result<std::process::ExitStatus, String> {
-    run_session_options(mac, command, interactive, &[])
+    run_session_options(mac, command, interactive, &[], None)
+}
+
+pub(crate) fn run_build_session(
+    mac: &Mac,
+    command: &str,
+    interactive: bool,
+) -> Result<std::process::ExitStatus, String> {
+    let unlock = crate::ssh_auth::saved_keychain_password(&mac.host, mac.port)?
+        .map(crate::keychain::Unlock::new)
+        .transpose()?;
+    run_session_options(mac, command, interactive, &[], unlock)
+}
+
+pub(crate) fn needs_keychain(args: &[String]) -> bool {
+    match resource(args) {
+        Some(("run" | "archive", _) | ("app", None | Some("run"))) => true,
+        Some(("build", action)) => !matches!(action, Some("logs" | "diagnostics")),
+        Some(("test", action)) => !matches!(action, Some("list" | "results" | "logs" | "coverage")),
+        _ => false,
+    }
 }
 
 fn interrupt_session(mac: &Mac, pid_file: &str) -> Result<bool, String> {
@@ -263,11 +287,13 @@ fn interrupt_session(mac: &Mac, pid_file: &str) -> Result<bool, String> {
     ssh_status(mac, &signal)
 }
 
+#[allow(clippy::too_many_lines)] // One lifecycle owns SSH, unlock handoff, cancellation and terminal restoration.
 fn run_session_options(
     mac: &Mac,
     command: &str,
     interactive: bool,
     ssh_options: &[String],
+    mut unlock: Option<crate::keychain::Unlock>,
 ) -> Result<std::process::ExitStatus, String> {
     let token = format!(
         "/tmp/sweetpad-session-{}-{}",
@@ -278,6 +304,9 @@ fn run_session_options(
             .as_nanos()
     );
     let pid_file = format!("{token}/pid");
+    let command = unlock
+        .as_ref()
+        .map_or_else(|| command.to_string(), |u| u.command(command, interactive));
     let inner = format!(
         "trap - INT; echo $$ > {}; {command}",
         shell_quote(&pid_file)
@@ -292,12 +321,18 @@ fn run_session_options(
     let mut ssh = mac.ssh();
     ssh.args(ssh_options);
     ssh.args([if interactive { "-tt" } else { "-T" }, &mac.host, &wrapper])
-        .stdin(if interactive {
+        .stdin(if unlock.is_some() {
+            Stdio::piped()
+        } else if interactive {
             Stdio::inherit()
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::inherit())
+        .stdout(if unlock.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
         .stderr(Stdio::inherit());
     #[cfg(unix)]
     if !interactive {
@@ -318,44 +353,58 @@ fn run_session_options(
     crate::cli::signals::defer_interrupt(true);
     let result = (|| {
         let mut child = ssh.spawn().map_err(|e| format!("cannot start ssh: {e}"))?;
-        let mut pending_interrupt = false;
-        loop {
-            // Background editor tasks have piped stdio, so a Ctrl-C byte is
-            // not a console event. A per-process cancellation file lets them
-            // request the same graceful remote signal/finalization path.
-            if std::env::var_os("SWEETPAD_CANCEL_FILE")
-                .is_some_and(|path| Path::new(&path).exists())
-            {
-                pending_interrupt = true;
-                if let Some(path) = std::env::var_os("SWEETPAD_CANCEL_FILE") {
-                    let _ = std::fs::remove_file(path);
+        let result = (|| {
+            if let Some(unlock) = unlock.as_mut() {
+                unlock.attach(&mut child)?;
+            }
+            let mut pending_interrupt = false;
+            loop {
+                // Background editor tasks have piped stdio, so a Ctrl-C byte is
+                // not a console event. A per-process cancellation file lets them
+                // request the same graceful remote signal/finalization path.
+                if std::env::var_os("SWEETPAD_CANCEL_FILE")
+                    .is_some_and(|path| Path::new(&path).exists())
+                {
+                    pending_interrupt = true;
+                    if let Some(path) = std::env::var_os("SWEETPAD_CANCEL_FILE") {
+                        let _ = std::fs::remove_file(path);
+                    }
                 }
-            }
-            #[cfg(unix)]
-            {
-                pending_interrupt |= crate::cli::signals::take_forwarded();
-            }
-            #[cfg(windows)]
-            {
-                pending_interrupt |= REMOTE_INTERRUPTED.swap(false, Ordering::AcqRel);
-            }
-            if pending_interrupt {
-                // The SSH stream remains open while simctl/xcodebuild handles INT.
-                if interrupt_session(mac, &pid_file)? {
-                    pending_interrupt = false;
+                #[cfg(unix)]
+                {
+                    pending_interrupt |= crate::cli::signals::take_forwarded();
                 }
-            }
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                // A killed/disconnected SSH client may leave its remote command
-                // running. Try a separate connection to cancel only this session;
-                // preserve the original exit code if the network is still down.
-                if !status.success() {
-                    let _ = interrupt_session(mac, &pid_file);
+                #[cfg(windows)]
+                {
+                    pending_interrupt |= REMOTE_INTERRUPTED.swap(false, Ordering::AcqRel);
                 }
-                return Ok(status);
+                if pending_interrupt {
+                    // The SSH stream remains open while simctl/xcodebuild handles INT.
+                    if interrupt_session(mac, &pid_file)? {
+                        pending_interrupt = false;
+                    }
+                }
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    // A killed/disconnected SSH client may leave its remote command
+                    // running. Try a separate connection to cancel only this session;
+                    // preserve the original exit code if the network is still down.
+                    if !status.success() {
+                        let _ = interrupt_session(mac, &pid_file);
+                    }
+                    return Ok(status);
+                }
+                if let Some(unlock) = unlock.as_mut() {
+                    unlock.tick(&mut child, interactive)?;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            std::thread::sleep(Duration::from_millis(100));
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
+        drop(unlock.take());
+        result
     })();
     #[cfg(unix)]
     crate::cli::signals::defer_interrupt(false);
@@ -608,10 +657,18 @@ fn manage(argv: &[String], json: bool, ndjson: bool) -> Result<(), String> {
         }
         "remove" => {
             let name = name.ok_or("remote remove needs a name")?;
-            if registry.macs.remove(name).is_none() {
-                return Err(format!("no saved Mac named {name:?}"));
-            }
+            let removed = registry
+                .macs
+                .remove(name)
+                .ok_or_else(|| format!("no saved Mac named {name:?}"))?;
             registry.save()?;
+            if !registry
+                .macs
+                .values()
+                .any(|mac| mac.host == removed.host && mac.port == removed.port)
+            {
+                crate::credentials::forget_endpoint(&removed.host, removed.port);
+            }
             if !json && !ndjson {
                 eprintln!("removed Mac {name:?}");
             }
@@ -627,6 +684,25 @@ fn manage(argv: &[String], json: bool, ndjson: bool) -> Result<(), String> {
             registry.macs.insert(name.clone(), mac);
         }
         "list" => {}
+        "password" => {
+            let name = name.ok_or("remote password needs a Mac name or SSH target")?;
+            let mac = registry.resolve(name)?;
+            for arg in &argv[2..] {
+                if !matches!(arg.as_str(), "--keychain" | "--forget" | "--stdin") {
+                    return Err(format!("unknown password option {arg}"));
+                }
+            }
+            let has = |flag: &str| argv[2..].iter().any(|a| a == flag);
+            if has("--forget") && has("--stdin") {
+                return Err("--forget cannot be combined with --stdin".into());
+            }
+            let kind = if has("--keychain") {
+                crate::credentials::Kind::Keychain
+            } else {
+                crate::credentials::Kind::Ssh
+            };
+            crate::credentials::manage(&mac.host, mac.port, kind, has("--forget"), has("--stdin"))?;
+        }
         _ => return Err(format!("unknown remote action {action}")),
     }
     let macs: Vec<_> = registry
@@ -1523,7 +1599,11 @@ fn execute(args: &[String], parsed: &Parsed) -> Result<u8, String> {
         && std::io::stdout().is_terminal()
         && !parsed.json
         && !parsed.ndjson;
-    let result = run_session(&mac, &invocation, interactive);
+    let result = if needs_keychain(&forwarded) {
+        run_build_session(&mac, &invocation, interactive)
+    } else {
+        run_session(&mac, &invocation, interactive)
+    };
     stop.store(true, Ordering::Relaxed);
     if let Some(worker) = worker {
         let _ = worker.join();
@@ -1691,7 +1771,7 @@ fn bridge(parsed: &Parsed) -> Result<u8, String> {
     let status = if matches!(action, "exec" | "stream") {
         #[cfg(unix)]
         crate::cli::signals::install();
-        run_session_options(&mac, &command, false, &ssh_options)?
+        run_session_options(&mac, &command, false, &ssh_options, None)?
     } else {
         mac.ssh()
             .args(["-T", &mac.host, &command])
@@ -1711,7 +1791,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     }
     if argv.is_empty() || matches!(argv.first().map(String::as_str), Some("--help" | "-h")) {
         println!(
-            "SweetPad native Windows remote client\n\nUsage:\n  sweetpad remote add NAME USER@HOST [--identity-file PATH] [--port PORT] [--auth ssh|password]\n  sweetpad remote list|show NAME|remove NAME\n  sweetpad COMMAND [ARGS] --remote NAME\n\nThe receiving Mac needs the updated SweetPad CLI and Xcode."
+            "SweetPad native Windows remote client\n\nUsage:\n  sweetpad remote add NAME USER@HOST [--identity-file PATH] [--port PORT] [--auth ssh|password]\n  sweetpad remote list|show NAME|remove NAME\n  sweetpad remote password NAME [--keychain] [--forget | --stdin]\n  sweetpad COMMAND [ARGS] --remote NAME\n\nThe receiving Mac needs the updated SweetPad CLI and Xcode."
         );
         return ExitCode::SUCCESS;
     }
@@ -1934,7 +2014,7 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_disables_ssh_prompts_without_persisting_it() {
+    fn non_interactive_uses_saved_credentials_without_terminal_prompts_or_persisting_the_mode() {
         let args = ["doctor", "--non-interactive", "--remote", "Test Mac"].map(str::to_string);
         let parsed = parse(&args).unwrap();
         assert!(parsed.non_interactive);
@@ -1951,7 +2031,13 @@ mod tests {
         assert!(!mac.batch_mode);
         assert!(!mac.ssh().get_args().any(|arg| arg == "BatchMode=yes"));
         mac.batch_mode = parsed.non_interactive;
-        assert!(mac.ssh().get_args().any(|arg| arg == "BatchMode=yes"));
+        let ssh = mac.ssh();
+        assert!(ssh.get_args().any(|arg| arg == "BatchMode=no"));
+        assert!(
+            ssh.get_envs()
+                .any(|(key, value)| key == "SWEETPAD_AUTH_PROMPT"
+                    && value == Some(std::ffi::OsStr::new("0")))
+        );
         assert!(!toml::to_string(&mac).unwrap().contains("batch_mode"));
     }
 

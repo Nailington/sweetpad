@@ -3,10 +3,12 @@ import { createConnection } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as vscode from "vscode";
 
-const ui = vi.hoisted(() => ({ password: vi.fn(), confirm: vi.fn() }));
-vi.mock("vscode", () => ({ window: { showInputBox: ui.password, showWarningMessage: ui.confirm } }));
+const ui = vi.hoisted(() => ({ password: vi.fn(), confirm: vi.fn(), error: vi.fn() }));
+vi.mock("vscode", () => ({
+  window: { showInputBox: ui.password, showWarningMessage: ui.confirm, showErrorMessage: ui.error },
+}));
 
-import { passwordKey, RemoteAuth } from "./auth";
+import { keychainKey, passwordKey, RemoteAuth } from "./auth";
 
 describe("remote SSH authentication", () => {
   let auth: RemoteAuth;
@@ -121,6 +123,7 @@ describe("remote SSH authentication", () => {
     expect(await request({ token: "ü".repeat(64) })).toBeNull();
     expect(secrets.get).not.toHaveBeenCalled();
     expect(ui.password).not.toHaveBeenCalled();
+    expect(ui.error).not.toHaveBeenCalled();
   });
 
   it("keeps ports separate and forgets only the chosen endpoint", async () => {
@@ -138,5 +141,37 @@ describe("remote SSH authentication", () => {
     expect(await request({ prompt: "Verification code: " })).toBe("one time secret");
     expect(secrets.store).not.toHaveBeenCalled();
     expect(secrets.get).not.toHaveBeenCalled();
+  });
+
+  it("defaults automatic keychain unlock to the saved SSH password without prompting", async () => {
+    stored.set(passwordKey("dev@mac.local", null), "login secret");
+    expect(await request({ kind: "keychain", savedOnly: true })).toBe("login secret");
+    expect(ui.password).not.toHaveBeenCalled();
+    expect(stored.has(keychainKey("dev@mac.local", null))).toBe(false);
+  });
+
+  it("prefers a separate keychain password and restores the SSH default when forgotten", async () => {
+    stored.set(passwordKey("dev@mac.local", null), "login secret");
+    stored.set(keychainKey("dev@mac.local", null), "keychain secret");
+    expect(await request({ kind: "keychain", savedOnly: true })).toBe("keychain secret");
+    await auth.forgetKeychain("dev@mac.local", null);
+    expect(await request({ kind: "keychain", savedOnly: true })).toBe("login secret");
+    expect(ui.password).not.toHaveBeenCalled();
+  });
+
+  it("does not ask for a keychain password when none is saved", async () => {
+    expect(await request({ kind: "keychain", savedOnly: true })).toBeNull();
+    expect(ui.password).not.toHaveBeenCalled();
+  });
+
+  it("saves a separate keychain password without changing the SSH credential", async () => {
+    stored.set(passwordKey("dev@mac.local", null), "login");
+    ui.password.mockResolvedValueOnce("separate");
+    await auth.save("dev@mac.local", null, true);
+    expect(stored.get(keychainKey("dev@mac.local", null))).toBe("separate");
+    expect(stored.get(passwordKey("dev@mac.local", null))).toBe("login");
+    ui.password.mockResolvedValueOnce("");
+    await auth.save("dev@mac.local", null, true);
+    expect(stored.has(keychainKey("dev@mac.local", null))).toBe(false);
   });
 });

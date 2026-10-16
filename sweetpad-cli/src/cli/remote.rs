@@ -192,8 +192,12 @@ fn run_inner(cli: &Cli, argv: &[String], reference: &str, out: &Output) -> Resul
         && unsafe {
             libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1
         };
-    let result =
-        portable_remote::run_session(&transport_mac, &remote_command, interactive).map(exit_status);
+    let result = if portable_remote::needs_keychain(&forwarded) {
+        portable_remote::run_build_session(&transport_mac, &remote_command, interactive)
+    } else {
+        portable_remote::run_session(&transport_mac, &remote_command, interactive)
+    }
+    .map(exit_status);
     stop.store(true, Ordering::Relaxed);
     if let Some(worker) = worker {
         let _ = worker.join();

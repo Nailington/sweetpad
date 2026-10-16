@@ -22,8 +22,9 @@ simulators, and the iPhone connection stay on the Mac.
 
 Physical-device builds also need access to the signing identity from the SSH session. A certificate that works in an
 interactive Mac login can still be unavailable to `codesign` over SSH, for example when its keychain is locked or its
-access policy excludes that session. Resolve signing access on the Mac before unattended phone builds; SweetPad does not
-change keychain access settings.
+access policy excludes that session. SweetPad can unlock the login keychain automatically in the build's SSH session
+using a saved password (see below). Private-key access permissions and certificate trust must still be configured on
+the Mac; SweetPad does not change them.
 
 Build this SweetPad CLI on your development machine with the Rust toolchain in `rust-toolchain.toml`:
 
@@ -63,15 +64,40 @@ sweetpad remote remove "Studio Mac"
 `%APPDATA%\sweetpad\remotes.toml`. It stores SSH targets and optional key **paths**, not passwords or private key
 contents. The key file stays in its original location. Without `--identity-file`, SweetPad uses your normal SSH config,
 identities, and agent. Your `~/.ssh/known_hosts` verifies the Mac's host key; it does not authenticate your user
-account. On Windows, OpenSSH uses your Windows user profile's `.ssh` directory. Password prompts still work when SSH
-permits them, but passwords are not saved. For unattended commands, set up a key or SSH agent. `--non-interactive`
-disables SSH authentication prompts with `BatchMode=yes`, so missing credentials fail promptly instead of waiting for
-input. `--replace` replaces the whole saved entry, including its optional key path and port.
+account. On Windows, OpenSSH uses your Windows user profile's `.ssh` directory. Login passwords entered through
+SweetPad's masked prompt are saved in the OS credential store and shared with the extension. `--non-interactive`
+can use saved passwords but never opens a standalone terminal prompt; the extension may still provide its masked UI.
+`--replace` replaces the whole saved entry, including its optional key path and port.
 
 Use `--auth password` for a saved Mac to prefer password/keyboard-interactive authentication and disable
 public-key attempts. This cannot be combined with `--identity-file`; `--auth ssh` preserves normal SSH settings.
-The VS Code extension can prompt for and save account passwords in encrypted secret storage; standalone CLI
-sessions use SSH terminal prompts. See the [password authentication guide](../vscode/remote.md#password-authentication).
+Both frontends use the CLI's credential store: macOS Keychain, Windows Credential Manager, or a running Secret Service
+on Linux (for example GNOME Keyring or KWallet). There is no plaintext-file fallback. An unavailable store produces an
+error when explicitly saving a password; terminal authentication can still use a password once without saving it.
+See the [password authentication guide](../vscode/remote.md#password-authentication).
+
+### Saved login and keychain passwords
+
+```bash
+sweetpad remote password "Studio Mac"                   # masked SSH-password prompt
+sweetpad remote password "Studio Mac" --keychain        # save a different login-keychain password
+sweetpad remote password "Studio Mac" --keychain --forget  # restore the saved SSH-password default
+sweetpad remote password "Studio Mac" --forget          # forget the SSH password
+```
+
+The password commands also accept raw SSH targets. `--stdin` reads a single password from a private pipe for password
+manager integration; passwords are never accepted as command arguments. Credentials are scoped to the SSH target and
+port, so renaming a saved Mac preserves them and a different target or port uses separate credentials.
+
+Before `build`, `run`, `test`, or `archive`, SweetPad uses a saved keychain password, or defaults to the saved SSH login
+password when no separate keychain password exists. It unlocks `~/Library/Keychains/login.keychain-db` in the same SSH
+session as the command. No password is sent if neither credential is saved. A rejected keychain password stops the build
+and explains how to save an override; it never falls back to printing or storing the password in a file. This does not
+copy the keychain database or change its timeout, private-key access permissions, signing team, or certificates.
+
+Install the updated CLI on **both** machines. The Mac helper reads the credential through the encrypted SSH stream and
+uses native Keychain APIs, keeping it out of process arguments. The local client waits for terminal echo to be disabled
+before sending it. Existing extension-only passwords migrate to the shared store when the extension next reads them.
 
 Raw SSH hosts and aliases continue to work with `--remote`, even if you never save them.
 

@@ -7,6 +7,8 @@
 
 #[cfg(not(windows))]
 pub mod cli;
+pub mod credentials;
+pub mod keychain;
 pub mod portable_remote;
 pub mod ssh_auth;
 #[cfg(not(windows))]

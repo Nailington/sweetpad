@@ -46,8 +46,8 @@ use **SweetPad: Forget Remote Mac Password** and enter the new password on the n
 ## Password authentication
 
 Choose **Password** when adding the Mac. On the first connection, SweetPad asks for the Mac user's
-password in a masked VS Code input and saves it in VS Code's encrypted secret storage. The same
-credential works for sidebar queries and commands opened in a terminal. Passwords are never written
+password in a masked VS Code input and saves it through the CLI in the OS credential store. The same
+credential works for sidebar queries, editor tasks, and standalone terminal commands. Passwords are never written
 to workspace settings, the Mac registry, shell history, or command arguments. SSH host-key
 verification still requires your explicit confirmation for a new Mac.
 
@@ -58,7 +58,21 @@ but are not saved as account passwords.
 
 Install the updated CLI locally as well as the updated extension. The native CLI itself acts as
 OpenSSH's askpass helper on Windows, Linux, and macOS; no `sshpass`, extra Node runtime, or helper
-script is needed. Standalone CLI sessions outside the extension use SSH's normal terminal prompts.
+script is needed. Standalone CLI sessions also prompt and remember login passwords. The OS store is
+macOS Keychain, Windows Credential Manager, or a running Secret Service on Linux (GNOME Keyring or KWallet).
+Existing passwords saved only in VS Code migrate on access; their old entries are removed only after the shared
+store write succeeds. Update the local CLI before installing this extension.
+
+Use **SweetPad: Save Remote Mac Password** to save a login password before connecting, or
+`sweetpad remote password "Studio Mac"` in a terminal. Both update the same credential.
+
+### Automatic signing-keychain unlock
+
+Remote builds unlock the Mac's login keychain within the build's SSH session. By default they use the saved SSH login
+password. If the keychain password differs, choose **SweetPad: Save Remote Mac Keychain Password**, or run
+`sweetpad remote password "Studio Mac" --keychain`. Leaving the editor prompt blank, or choosing
+**SweetPad: Forget Remote Mac Keychain Password**, restores the saved SSH-password default. Install the updated CLI
+on the receiving Mac as well. Unlocking does not change signing-key access permissions or select a signing team.
 
 ## Use the sidebar
 

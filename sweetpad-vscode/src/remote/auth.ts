@@ -3,6 +3,8 @@ import { createServer, type Server, type Socket } from "node:net";
 
 import * as vscode from "vscode";
 
+import type { CredentialStorage } from "./credentials.js";
+
 type Request = {
   token: string;
   host: string;
@@ -10,10 +12,16 @@ type Request = {
   connection: string;
   prompt: string;
   confirm: boolean;
+  kind?: "keychain";
+  savedOnly?: boolean;
 };
 
 export function passwordKey(host: string, port: string | number | null): string {
   return `sweetpad.remote.password:${JSON.stringify([host, String(port ?? "")])}`;
+}
+
+export function keychainKey(host: string, port: string | number | null): string {
+  return `sweetpad.remote.keychain:${JSON.stringify([host, String(port ?? "")])}`;
 }
 
 /** Local askpass broker shared by background CLI calls and build terminals. */
@@ -26,7 +34,7 @@ export class RemoteAuth implements vscode.Disposable {
   private readonly pending = new Map<string, Promise<string | undefined>>();
   private disposed = false;
 
-  constructor(private readonly secrets: vscode.SecretStorage) {}
+  constructor(private readonly secrets: CredentialStorage) {}
 
   environment(): Promise<NodeJS.ProcessEnv> {
     return (this.starting ??= this.listen().catch((error) => {
@@ -69,7 +77,12 @@ export class RemoteAuth implements vscode.Disposable {
       socket.off("data", receive);
       void this.respond(data.slice(0, data.indexOf("\n")))
         .then((answer) => socket.end(`${JSON.stringify({ answer: answer ?? null })}\n`))
-        .catch(() => socket.end('{"answer":null}\n'));
+        .catch(() => {
+          void vscode.window.showErrorMessage(
+            "SweetPad could not access saved credentials. Check the local CLI and OS credential store.",
+          );
+          socket.end('{"answer":null}\n');
+        });
     };
     socket.on("data", receive);
   }
@@ -78,7 +91,7 @@ export class RemoteAuth implements vscode.Disposable {
     const request = JSON.parse(line) as Request;
     if (
       typeof request.token !== "string" ||
-      request.token.length !== this.token.length ||
+      Buffer.byteLength(request.token) !== Buffer.byteLength(this.token) ||
       !timingSafeEqual(Buffer.from(request.token), Buffer.from(this.token)) ||
       typeof request.host !== "string" ||
       typeof request.port !== "string" ||
@@ -96,6 +109,13 @@ export class RemoteAuth implements vscode.Disposable {
         "Connect",
       );
       return choice === "Connect" ? "yes" : undefined;
+    }
+    if (request.kind === "keychain") {
+      if (request.savedOnly !== true) return undefined;
+      return (
+        (await this.secrets.get(keychainKey(request.host, request.port))) ??
+        (await this.secrets.get(passwordKey(request.host, request.port)))
+      );
     }
     const key = passwordKey(request.host, request.port);
     const connectionKey = JSON.stringify([key, request.connection, request.prompt]);
@@ -127,7 +147,7 @@ export class RemoteAuth implements vscode.Disposable {
   private async prompt(request: Request, key: string, remember: boolean): Promise<string | undefined> {
     const answer = await vscode.window.showInputBox({
       title: `SSH authentication · ${request.host}`,
-      prompt: remember ? "Mac account password (saved securely in VS Code)" : request.prompt,
+      prompt: remember ? "Mac account password (saved in the OS credential store for CLI and editor)" : request.prompt,
       password: true,
       ignoreFocusOut: true,
       validateInput: (value) =>
@@ -143,6 +163,26 @@ export class RemoteAuth implements vscode.Disposable {
 
   async forget(host: string, port: number | null): Promise<void> {
     await this.secrets.delete(passwordKey(host, port));
+  }
+
+  async save(host: string, port: number | null, keychain: boolean): Promise<void> {
+    const key = keychain ? keychainKey(host, port) : passwordKey(host, port);
+    const answer = await vscode.window.showInputBox({
+      title: `${keychain ? "Login keychain" : "SSH login"} password · ${host}`,
+      prompt: keychain
+        ? "Saved for CLI and editor. Leave blank to use the saved SSH password."
+        : "Saved in the OS credential store for CLI and editor.",
+      password: true,
+      ignoreFocusOut: true,
+      validateInput: (value) => (/[\r\n\0]/.test(value) ? "Enter a single line." : undefined),
+    });
+    if (answer === undefined) return;
+    if (keychain && answer === "") await this.secrets.delete(key);
+    else await this.secrets.store(key, answer);
+  }
+
+  async forgetKeychain(host: string, port: number | null): Promise<void> {
+    await this.secrets.delete(keychainKey(host, port));
   }
 
   dispose(): void {

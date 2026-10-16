@@ -23,6 +23,12 @@ fn main() -> ExitCode {
     if let Some(status) = sweetpad_cli::ssh_auth::run_askpass() {
         return status;
     }
+    let helper_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(status) = sweetpad_cli::credentials::run_helper(&helper_args)
+        .or_else(|| sweetpad_cli::keychain::run_helper(&helper_args))
+    {
+        return status;
+    }
     // The Rust runtime ignores SIGPIPE, so a consumer closing the pipe early
     // (`sweetpad … | head`) surfaces as a "failed printing to stdout: Broken
     // pipe" panic (exit 101, backtrace on stderr). Restore the default
@@ -54,6 +60,12 @@ fn main() -> ExitCode {
 #[cfg(windows)]
 fn main() -> ExitCode {
     if let Some(status) = sweetpad_cli::ssh_auth::run_askpass() {
+        return status;
+    }
+    let helper_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(status) = sweetpad_cli::credentials::run_helper(&helper_args)
+        .or_else(|| sweetpad_cli::keychain::run_helper(&helper_args))
+    {
         return status;
     }
     sweetpad_cli::portable_remote::run(&std::env::args().skip(1).collect::<Vec<_>>())

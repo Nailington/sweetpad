@@ -42,6 +42,19 @@ pub enum Action {
     Show { name: String },
     /// Remove a saved Mac without touching SSH keys or known_hosts.
     Remove { name: String },
+    /// Save or forget an SSH login or login-keychain password in the OS credential store.
+    Password {
+        name: String,
+        /// Manage the separate keychain password (otherwise manage SSH login).
+        #[arg(long)]
+        keychain: bool,
+        /// Delete this password. For keychain passwords, restores the SSH-password default.
+        #[arg(long, conflicts_with = "stdin")]
+        forget: bool,
+        /// Read one password from a private stdin pipe instead of prompting.
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +81,7 @@ impl Mac {
         if let Some(port) = self.port {
             command.arg("-p").arg(port.to_string());
         }
-        crate::ssh_auth::configure(&mut command, &self.host, self.port, self.auth);
+        crate::ssh_auth::configure(&mut command, &self.host, self.port, self.auth, false);
         command
     }
 }
@@ -227,11 +240,39 @@ pub fn manage(_ctx: &mut Context, action: Option<&Action>) -> CommandResult {
             }));
         }
         Some(Action::Remove { name }) => {
-            if registry.macs.remove(name).is_none() {
-                return Err(CliError::new(format!("no saved Mac named {name:?}")));
-            }
+            let removed = registry
+                .macs
+                .remove(name)
+                .ok_or_else(|| CliError::new(format!("no saved Mac named {name:?}")))?;
             registry.save().map_err(CliError::new)?;
+            if !registry
+                .macs
+                .values()
+                .any(|mac| mac.host == removed.host && mac.port == removed.port)
+            {
+                crate::credentials::forget_endpoint(&removed.host, removed.port);
+            }
             Some(format!("removed Mac {name:?}"))
+        }
+        Some(Action::Password {
+            name,
+            keychain,
+            forget,
+            stdin,
+        }) => {
+            let mac = resolve(name).map_err(CliError::new)?;
+            let kind = if *keychain {
+                crate::credentials::Kind::Keychain
+            } else {
+                crate::credentials::Kind::Ssh
+            };
+            crate::credentials::manage(&mac.host, mac.port, kind, *forget, *stdin)
+                .map_err(CliError::new)?;
+            Some(format!(
+                "{} {} password for {name:?}",
+                if *forget { "forgot" } else { "saved" },
+                if *keychain { "keychain" } else { "SSH" }
+            ))
         }
     };
     Ok(Rendered::data(RegistryReport {
@@ -348,6 +389,12 @@ mod tests {
             port: Some(2222),
             auth: crate::ssh_auth::Auth::default(),
         };
-        assert_eq!(mac.ssh_command().get_args().count(), 6);
+        let command = mac.ssh_command();
+        let args: Vec<_> = command.get_args().collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-i", "/tmp/key's name"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-p", "2222"]));
     }
 }

@@ -6,6 +6,7 @@ import path from "node:path";
 import * as vscode from "vscode";
 
 import { RemoteAuth } from "./auth.js";
+import { RemoteCredentials } from "./credentials.js";
 import { type RemoteMacItem, RemoteMacsTree } from "./mac-tree.js";
 import { type Mac, promptMac, saveMacArgs } from "./mac.js";
 
@@ -78,6 +79,14 @@ export class RemoteClient {
 
   async forgetPassword(mac: Mac): Promise<void> {
     await this.auth?.forget(mac.host, mac.port);
+  }
+
+  async savePassword(mac: Mac, keychain: boolean): Promise<void> {
+    await this.auth?.save(mac.host, mac.port, keychain);
+  }
+
+  async forgetKeychainPassword(mac: Mac): Promise<void> {
+    await this.auth?.forgetKeychain(mac.host, mac.port);
   }
 
   get cli(): string {
@@ -490,6 +499,29 @@ export function registerMacCommands(
     await client.forgetPassword(picked.mac);
     await refresh();
   });
+  for (const [id, keychain] of [
+    ["sweetpad.remote.savePassword", false],
+    ["sweetpad.remote.saveKeychainPassword", true],
+  ] as const) {
+    register(id, async (item) => {
+      const picked = item
+        ? { mac: item.mac }
+        : await vscode.window.showQuickPick(
+            (await client.macs()).map((mac) => ({ label: mac.name, description: mac.host, mac })),
+            { placeHolder: `Save ${keychain ? "login keychain" : "SSH login"} password for a Mac` },
+          );
+      if (picked) await client.savePassword(picked.mac, keychain);
+    });
+  }
+  register("sweetpad.remote.forgetKeychainPassword", async (item) => {
+    const picked = item
+      ? { mac: item.mac }
+      : await vscode.window.showQuickPick(
+          (await client.macs()).map((mac) => ({ label: mac.name, description: mac.host, mac })),
+          { placeHolder: "Forget the separate keychain password and use the saved SSH password" },
+        );
+    if (picked) await client.forgetKeychainPassword(picked.mac);
+  });
   register("sweetpad.remote.removeMac", async () => {
     const macs = await client.macs();
     const picked = await vscode.window.showQuickPick(
@@ -499,7 +531,10 @@ export function registerMacCommands(
     if (!picked) return;
     await client.query(["remote", "remove", picked]);
     const removed = macs.find((mac) => mac.name === picked);
-    if (removed) await client.forgetPassword(removed);
+    if (removed && !macs.some((mac) => mac.name !== picked && mac.host === removed.host && mac.port === removed.port)) {
+      await client.forgetPassword(removed);
+      await client.forgetKeychainPassword(removed);
+    }
     if (client.mac === picked) {
       if (vscode.workspace.workspaceFolders?.length) {
         await config().update("remote.mac", undefined, vscode.ConfigurationTarget.Workspace);
@@ -522,7 +557,9 @@ export function registerMacCommands(
 }
 
 export async function activateRemote(context: vscode.ExtensionContext) {
-  const auth = new RemoteAuth(context.secrets);
+  const auth = new RemoteAuth(
+    new RemoteCredentials(context.secrets, () => config().get<string>("remote.cliPath") || "sweetpad"),
+  );
   const client = new RemoteClient(auth, await auth.environment());
   const macsView = new RemoteMacsTree(client);
   const schemes = new RefreshableTree(client, "scheme");
