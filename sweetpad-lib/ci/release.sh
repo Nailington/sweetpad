@@ -2,7 +2,7 @@
 #
 # Cut a sweetpad CLI release: bump the workspace version, tag, and push.
 #
-#   sweetpad-lib/ci/release.sh 0.1.12-nailington.2
+#   sweetpad-lib/ci/release.sh 0.1.12-nailington.3
 #
 # A cli-vX.Y.Z-nailington.N tag publishes macOS, Windows and Linux binaries,
 # agent skills and checksums to this fork, then updates its Homebrew formula.
@@ -29,7 +29,7 @@ for arg in "$@"; do
 done
 
 if [ -z "$VERSION" ]; then
-  echo "usage: sweetpad-lib/ci/release.sh <version> [--yes]   e.g. 0.1.12-nailington.2" >&2
+  echo "usage: sweetpad-lib/ci/release.sh <version> [--yes]   e.g. 0.1.12-nailington.3" >&2
   exit 2
 fi
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-nailington\.[0-9]+$ ]]; then

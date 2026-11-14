@@ -20,6 +20,8 @@ jobs:
   native-windows:
     runs-on: windows-latest
     steps:
+      - name: Enable Windows long paths
+        run: git config --global core.longpaths true
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
         run: rustup show

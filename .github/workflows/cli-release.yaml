@@ -57,6 +57,9 @@ jobs:
       ASSET_VERSION: ${{ needs.prepare.outputs.asset_version }}
       PUBLISH: ${{ needs.prepare.outputs.publish }}
     steps:
+      - name: Enable Windows long paths
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0

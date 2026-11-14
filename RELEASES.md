@@ -6,7 +6,7 @@ release schedules, as upstream does.
 
 ## Release identities
 
-- CLI workspace version: `0.1.12-nailington.1`; tag: `cli-v0.1.12-nailington.1`.
+- CLI workspace version: `0.1.12-nailington.2`; tag: `cli-v0.1.12-nailington.2`.
   Increment the final fork number for another release of the same upstream version.
   `sweetpad --version` includes `-nailington`; untagged builds also include `-dev+<commit>`.
 - VS Code: **SweetPad (Nailington)**, ID `nailington.sweetpad-nailington`.
@@ -62,8 +62,8 @@ Commit and push the release configuration and application changes to your fork
 first. From that exact commit on `codex/windows-remote-testing`:
 
 ```bash
-git tag -a cli-v0.1.12-nailington.1 -m "SweetPad CLI 0.1.12-nailington.1"
-git push origin cli-v0.1.12-nailington.1
+git tag -a cli-v0.1.12-nailington.2 -m "SweetPad CLI 0.1.12-nailington.2"
+git push origin cli-v0.1.12-nailington.2
 
 git tag -a v0.2.18-nailington -m "SweetPad VS Code 0.2.18 (Nailington)"
 git push origin v0.2.18-nailington
@@ -77,7 +77,7 @@ For later releases, the existing helpers now target this fork's branch and tags:
 
 ```bash
 # macOS with Xcode and Rust; bumps Cargo.toml/Cargo.lock, checks, commits and tags.
-sweetpad-lib/ci/release.sh 0.1.12-nailington.2
+sweetpad-lib/ci/release.sh 0.1.12-nailington.3
 
 # Add the next numeric version's CHANGELOG entry first; then bump, check and tag.
 npm run publish-patch --workspace sweetpad-nailington
