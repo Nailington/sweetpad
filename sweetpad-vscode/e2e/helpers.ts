@@ -9,7 +9,7 @@ import * as path from "node:path";
 
 import * as vscode from "vscode";
 
-export const EXTENSION_ID = "sweetpad.sweetpad";
+export const EXTENSION_ID = "nailington.sweetpad-nailington";
 
 /** The scheme and container the fixture workspace provides. */
 export const FIXTURE_SCHEME = "ObjCHeaders";

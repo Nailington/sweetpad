@@ -1786,7 +1786,7 @@ fn bridge(parsed: &Parsed) -> Result<u8, String> {
 
 pub fn run(argv: &[String]) -> ExitCode {
     if matches!(argv.first().map(String::as_str), Some("--version" | "-V")) {
-        println!("sweetpad {}", env!("CARGO_PKG_VERSION"));
+        println!("sweetpad {}", env!("SWEETPAD_VERSION"));
         return ExitCode::SUCCESS;
     }
     if argv.is_empty() || matches!(argv.first().map(String::as_str), Some("--help" | "-h")) {

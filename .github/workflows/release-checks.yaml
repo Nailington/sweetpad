@@ -1,0 +1,46 @@
+name: Release configuration checks
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/cli-release.yaml
+      - .github/workflows/ci.yaml
+      - .github/workflows/release-checks.yaml
+      - .github/actions/**
+      - .github/scripts/**
+      - .github/homebrew/**
+      - skills/**
+      - Cargo.toml
+      - sweetpad-vscode/package.json
+  push:
+    branches: [main, codex/windows-remote-testing]
+    paths:
+      - .github/workflows/cli-release.yaml
+      - .github/workflows/ci.yaml
+      - .github/workflows/release-checks.yaml
+      - .github/actions/**
+      - .github/scripts/**
+      - .github/homebrew/**
+      - skills/**
+      - Cargo.toml
+      - sweetpad-vscode/package.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test release metadata, archives, skills and formula generation
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Validate fork manifests
+        run: |
+          python3 .github/scripts/release.py metadata cli
+          python3 .github/scripts/release.py metadata extension
+      - name: Lint release workflows
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: .github/workflows/cli-release.yaml .github/workflows/ci.yaml .github/workflows/release-checks.yaml

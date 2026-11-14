@@ -12,12 +12,17 @@ projects. This skill covers the everyday flows and how to discover the rest.
 ## Before you start
 
 - Confirm it's installed: `sweetpad --version`. If it's missing, install with
-  `brew install sweetpad-dev/tap/sweetpad`.
+  `brew tap Nailington/sweetpad https://github.com/Nailington/sweetpad` followed by
+  `brew install Nailington/sweetpad/sweetpad-nailington`. Windows/Linux binaries are at
+  `https://github.com/Nailington/sweetpad/releases`; fork versions contain `-nailington`.
 - Run from inside the project directory, or pass `-C <dir>` to point at it.
   sweetpad auto-discovers the `.xcworkspace` / `.xcodeproj`.
 - Add `-o json` to any command for a structured `{schema, ok, data}` envelope,
   and `--non-interactive` so it never prompts or waits on a terminal. Both are
   the right default when you're an agent.
+
+For Windows/Linux or a remote Mac, use the companion `sweetpad-remote` skill in this
+release. Apple builds require a Mac running Xcode and this fork's CLI.
 
 ## Read results correctly
 

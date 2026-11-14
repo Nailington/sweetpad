@@ -1,0 +1,28 @@
+class SweetpadNailington < Formula
+  desc "Nailington's SweetPad fork for local and remote Apple development"
+  homepage "https://github.com/Nailington/sweetpad"
+  version "{{VERSION}}"
+  license "MIT"
+
+  on_macos do
+    url "{{MACOS_URL}}"
+    sha256 "{{MACOS_SHA256}}"
+  end
+
+  on_linux do
+    depends_on arch: :x86_64
+    url "{{LINUX_URL}}"
+    sha256 "{{LINUX_SHA256}}"
+  end
+
+  conflicts_with "sweetpad", because: "both install the sweetpad command"
+
+  def install
+    bin.install "sweetpad"
+    bin.install_symlink bin/"sweetpad" => "sweetpad-nailington"
+  end
+
+  test do
+    assert_match "sweetpad #{version}", shell_output("#{bin}/sweetpad --version")
+  end
+end

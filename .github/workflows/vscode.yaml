@@ -2,7 +2,7 @@ name: vscode-extension
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex/windows-remote-testing]
     paths:
       - "sweetpad-vscode/**"
       - "sweetpad-lib/fixtures/**"

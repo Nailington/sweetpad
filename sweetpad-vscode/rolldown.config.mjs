@@ -45,11 +45,11 @@ const sweetpadNativePlugin = {
 
 const extensionPlugins = [sweetpadNativePlugin];
 
-if (isProduction) {
+if (isProduction && process.env.SENTRY_AUTH_TOKEN && process.env.SENTRY_ORG && process.env.SENTRY_PROJECT) {
   extensionPlugins.push(
     sentryRollupPlugin({
-      org: "yevhenii-hyzyla",
-      project: "sweetpad",
+      org: process.env.SENTRY_ORG,
+      project: process.env.SENTRY_PROJECT,
       release: { name: pkg.version },
       authToken: process.env.SENTRY_AUTH_TOKEN,
     }),

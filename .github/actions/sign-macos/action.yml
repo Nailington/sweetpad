@@ -1,0 +1,75 @@
+name: Sign and notarize macOS binaries
+description: Optional Developer ID signing shared by fork CLI and VSIX releases
+inputs:
+  paths:
+    description: Glob selecting the binaries to sign
+    required: true
+  certificate:
+    description: Base64 Developer ID Application certificate (.p12)
+    required: true
+  certificate-password:
+    description: Certificate password
+    required: true
+  notary-key:
+    description: Base64 App Store Connect API key (.p8)
+    required: true
+  notary-key-id:
+    description: App Store Connect key ID
+    required: true
+  notary-issuer-id:
+    description: App Store Connect issuer ID
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Sign and notarize
+      shell: bash
+      env:
+        SIGN_PATHS: ${{ inputs.paths }}
+        CERTIFICATE: ${{ inputs.certificate }}
+        CERTIFICATE_PASSWORD: ${{ inputs.certificate-password }}
+        NOTARY_KEY: ${{ inputs.notary-key }}
+        NOTARY_KEY_ID: ${{ inputs.notary-key-id }}
+        NOTARY_ISSUER_ID: ${{ inputs.notary-issuer-id }}
+      run: |
+        set -euo pipefail
+        : "${CERTIFICATE:?MACOS_CERTIFICATE_P12 is required when signing is enabled}"
+        : "${NOTARY_KEY:?MACOS_NOTARY_KEY_P8 is required when signing is enabled}"
+        : "${NOTARY_KEY_ID:?MACOS_NOTARY_KEY_ID is required}"
+        : "${NOTARY_ISSUER_ID:?MACOS_NOTARY_ISSUER_ID is required}"
+        SIGN_DIR="$(mktemp -d "$RUNNER_TEMP/sign.XXXXXX")"
+        KEYCHAIN="$SIGN_DIR/build.keychain-db"
+        cleanup() {
+          security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+          rm -rf "$SIGN_DIR"
+        }
+        trap cleanup EXIT
+        printf '%s' "$CERTIFICATE" | base64 --decode > "$SIGN_DIR/certificate.p12"
+        printf '%s' "$NOTARY_KEY" | base64 --decode > "$SIGN_DIR/notary.p8"
+        KEYCHAIN_PASSWORD="$(uuidgen)"
+        security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+        security set-keychain-settings -lut 21600 "$KEYCHAIN"
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+        security import "$SIGN_DIR/certificate.p12" -k "$KEYCHAIN" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+        security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+        keychains=("$KEYCHAIN")
+        while IFS= read -r existing; do
+          keychains+=("$existing")
+        done < <(security list-keychains -d user | sed -E 's/^[[:space:]]*"//;s/"[[:space:]]*$//')
+        security list-keychains -d user -s "${keychains[@]}"
+        IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
+        test -n "$IDENTITY"
+        export SIGN_DIR IDENTITY
+        python3 - <<'PY'
+        import glob, os, subprocess, zipfile
+        paths = glob.glob(os.environ['SIGN_PATHS'])
+        if not paths:
+            raise SystemExit('No binaries matched the signing glob')
+        with zipfile.ZipFile(os.path.join(os.environ['SIGN_DIR'], 'notarize.zip'), 'w', zipfile.ZIP_DEFLATED) as archive:
+            for path in paths:
+                subprocess.run(['codesign', '--force', '--options', 'runtime', '--timestamp', '--sign', os.environ['IDENTITY'], path], check=True)
+                subprocess.run(['codesign', '--verify', '--strict', '--verbose=2', path], check=True)
+                archive.write(path, os.path.basename(path))
+        PY
+        xcrun notarytool submit "$SIGN_DIR/notarize.zip" \
+          --key "$SIGN_DIR/notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait

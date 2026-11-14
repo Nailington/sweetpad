@@ -1,196 +1,153 @@
+name: Release VS Code extension (Nailington)
+
 on:
   push:
-    tags:
-      # Extension releases only — the CLI uses cli-v* tags (see cli-release.yaml).
-      - "v*"
-  # Manual runs (Actions tab) exercise build + sign + notarize without publishing,
-  # since the deploy jobs below are gated on a tag ref.
+    tags: ["v*-nailington"]
+  # Manual runs only upload a VSIX artifact; they never publish to a registry.
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
-name: Deploy Extension
+concurrency:
+  group: extension-release-nailington
+  cancel-in-progress: false
+
 jobs:
   build:
-    name: Build VSIX (macOS)
+    name: Build universal fork VSIX
     runs-on: macos-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      asset_version: ${{ steps.metadata.outputs.asset_version }}
+      publish: ${{ steps.metadata.outputs.publish }}
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v7
-      - name: Install NodeJS
-        uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - name: Install Rust toolchain
-        # Installs the channel + Apple targets pinned in rust-toolchain.toml
+          cache: npm
+      - name: Validate fork identity, version and tag
+        id: metadata
+        run: python3 .github/scripts/release.py metadata extension
+      - name: Prepare release notes from the extension changelog
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          mkdir -p dist
+          cat > dist/notes.md <<'EOF'
+          Nailington's SweetPad fork, separate from upstream SweetPad.
+          Download the VSIX and use **Extensions → … → Install from VSIX** in VS Code or Cursor.
+          Extension ID: `nailington.sweetpad-nailington`. Disable upstream SweetPad when using this fork; both expose SweetPad commands.
+          Windows/Linux remote mode also requires the fork CLI locally, OpenSSH, and the fork CLI + Xcode on a Mac.
+          The agent-skills ZIP contains this release's complete `skills/` tree and installation instructions.
+
+          ## Changes
+
+          EOF
+          python3 .github/scripts/release.py extension-notes --version "$VERSION" >> dist/notes.md
+      - name: Install pinned Rust toolchain
         run: rustup show
-      - name: Install Dependencies
-        run: npm ci
-
-      - name: Build extension bundle
+      - run: npm ci
+      - name: Build release bundle
         working-directory: sweetpad-vscode
-        # Builds the universal .node addon into out/ so it exists for signing;
-        # the packaging step below reuses out/ without rebuilding. The bundle
-        # embeds the Sentry DSN, which is public, so it's a repository variable.
-        env:
-          SENTRY_DSN: ${{ vars.SENTRY_DSN }}
         run: npm run vscode:prepublish
-
-      - name: Import Developer ID certificate
-        env:
-          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
-          KEYCHAIN_PASSWORD="$(uuidgen)"
-          CERT_PATH="$RUNNER_TEMP/certificate.p12"
-          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
-          rm -f "$CERT_PATH"
-          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
-
-      - name: Codesign the addon
+      - name: Check extension types and tests
         working-directory: sweetpad-vscode
-        # Developer ID + hardened runtime + secure timestamp, required for notarization.
         run: |
-          set -euo pipefail
-          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
-          test -n "$IDENTITY"
-          for f in out/lib/*.node; do
-            codesign --force --options runtime --timestamp --sign "$IDENTITY" "$f"
-            codesign --verify --strict --verbose=2 "$f"
-          done
-
-      - name: Notarize the addon
-        working-directory: sweetpad-vscode
-        env:
-          MACOS_NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-        run: |
-          set -euo pipefail
-          KEY_PATH="$RUNNER_TEMP/notary_key.p8"
-          ZIP="$RUNNER_TEMP/notarize.zip"
-          echo "$MACOS_NOTARY_KEY_P8" | base64 --decode > "$KEY_PATH"
-          # A loose Mach-O can't be stapled, so notarytool only registers each binary's
-          # hash with Apple; Gatekeeper verifies online when the file is quarantined.
-          /usr/bin/zip -j "$ZIP" out/lib/*.node
-          xcrun notarytool submit "$ZIP" --key "$KEY_PATH" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" --wait
-          rm -f "$KEY_PATH"
-
-      - name: Package VSIX
-        working-directory: sweetpad-vscode
-        # Drop the prepublish hook so vsce zips the signed out/ instead of rebuilding it,
-        # then move the .vsix to the repo root for the upload/deploy steps.
-        #
-        # The base URLs rewrite README.md's relative links for the Marketplace,
-        # which renders the file outside the repository. vsce infers them from
-        # 'repository', landing on the repo root — but the extension lives in
-        # sweetpad-vscode/, so './images/logo.png' resolved to a path that does
-        # not exist and './LICENSE.md' to the workspace's licence instead of
-        # this package's. Both point at the subdirectory here.
-        run: |
-          set -euo pipefail
-          npm pkg delete 'scripts.vscode:prepublish'
-          npx --yes @vscode/vsce package --no-dependencies \
-            --baseContentUrl https://github.com/sweetpad-dev/sweetpad/blob/HEAD/sweetpad-vscode \
-            --baseImagesUrl https://github.com/sweetpad-dev/sweetpad/raw/HEAD/sweetpad-vscode
-          mv ./*.vsix ..
-
-      - name: Upload VSIX
-        uses: actions/upload-artifact@v7
+          npm run check:types
+          npm test
+      - name: Sign and notarize native addon (optional)
+        if: vars.MACOS_SIGNING_ENABLED == 'true'
+        uses: ./.github/actions/sign-macos
         with:
-          name: vsix
-          path: "*.vsix"
+          paths: sweetpad-vscode/out/lib/*.node
+          certificate: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          certificate-password: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          notary-key: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          notary-key-id: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          notary-issuer-id: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+      - name: Package fork VSIX
+        working-directory: sweetpad-vscode
+        env:
+          ASSET_VERSION: ${{ steps.metadata.outputs.asset_version }}
+        run: |
+          set -euo pipefail
+          # Reuse the signed bundle rather than rebuilding it from vsce's hook.
+          npm pkg delete 'scripts.vscode:prepublish'
+          mkdir -p ../dist
+          npx --yes @vscode/vsce@3.6.2 package --no-dependencies \
+            --baseContentUrl "https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/sweetpad-vscode" \
+            --baseImagesUrl "https://github.com/$GITHUB_REPOSITORY/raw/$GITHUB_SHA/sweetpad-vscode" \
+            --out "../dist/sweetpad-$ASSET_VERSION.vsix"
+      - name: Package agent skills and add checksums
+        env:
+          ASSET_VERSION: ${{ steps.metadata.outputs.asset_version }}
+        run: |
+          python3 .github/scripts/release.py skills --version "$ASSET_VERSION"
+          python3 .github/scripts/release.py checksums
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vsix-nailington
+          path: dist/*
           if-no-files-found: error
 
-  deploy-ovsx:
-    name: Deploy to Open VSX
+  publish-github:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: needs.build.outputs.publish == 'true' && github.repository == 'Nailington/sweetpad'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - name: Download VSIX
-        uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8
         with:
-          name: vsix
-      - name: Resolve VSIX path
-        id: vsix
-        run: echo "path=$(ls *.vsix)" >> "$GITHUB_OUTPUT"
-      - name: Publish to Open VSX Registry
-        uses: HaaLeo/publish-vscode-extension@v2
+          name: vsix-nailington
+          path: dist
+      - uses: softprops/action-gh-release@v3
         with:
-          skipDuplicate: true
-          pat: ${{ secrets.OPEN_VSX_TOKEN }}
-          registryUrl: https://open-vsx.org
-          extensionFile: ${{ steps.vsix.outputs.path }}
+          name: SweetPad VS Code ${{ needs.build.outputs.asset_version }}
+          body_path: dist/notes.md
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.vsix
+            dist/*.zip
+            dist/SHA256SUMS
 
-  deploy-vsmarketplace:
-    name: Deploy to Visual Studio Marketplace
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+  publish-marketplace:
+    needs: [build, publish-github]
+    if: vars.PUBLISH_VS_MARKETPLACE == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Download VSIX
-        uses: actions/download-artifact@v8
+      - uses: actions/setup-node@v6
         with:
-          name: vsix
-      - name: Resolve VSIX path
-        id: vsix
-        run: echo "path=$(ls *.vsix)" >> "$GITHUB_OUTPUT"
-      - name: Publish to Visual Studio Marketplace
-        uses: HaaLeo/publish-vscode-extension@v2
+          node-version: 24
+      - uses: actions/download-artifact@v8
         with:
-          skipDuplicate: true
-          pat: ${{ secrets.VS_MARKETPLACE_TOKEN }}
-          registryUrl: https://marketplace.visualstudio.com
-          extensionFile: ${{ steps.vsix.outputs.path }}
-
-  publish-github-release:
-    name: Publish GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v7
-      - name: Download VSIX
-        uses: actions/download-artifact@v8
-        with:
-          name: vsix
-      - name: Build release notes
-        # The extension and the CLI ship from one repo on separate cadences, so
-        # auto-generated notes list every CLI and docs PR merged in between. The
-        # CHANGELOG entry for this version is what the release should say.
+          name: vsix-nailington
+          path: dist
+      - name: Publish under the nailington publisher
+        env:
+          VSCE_PAT: ${{ secrets.VS_MARKETPLACE_TOKEN }}
         run: |
-          set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          NOTES="$RUNNER_TEMP/notes.md"
-          awk -v version="$VERSION" '
-            $0 ~ "^## \\[" version "\\]" { capture = 1; next }
-            capture && /^## \[/ { exit }
-            capture { print }
-          ' sweetpad-vscode/CHANGELOG.md > "$NOTES"
-          if ! grep -q '[^[:space:]]' "$NOTES"; then
-            echo "::error::sweetpad-vscode/CHANGELOG.md has no '## [$VERSION]' entry"
-            exit 1
-          fi
-          echo "[Full changelog](https://github.com/$GITHUB_REPOSITORY/blob/main/sweetpad-vscode/CHANGELOG.md)" >> "$NOTES"
-          cat "$NOTES"
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3
+          test -n "$VSCE_PAT" || { echo '::error::VS_MARKETPLACE_TOKEN is required'; exit 1; }
+          npx --yes @vscode/vsce@3.6.2 publish --packagePath dist/*.vsix --skip-duplicate
+
+  publish-openvsx:
+    needs: [build, publish-github]
+    if: vars.PUBLISH_OPEN_VSX == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v6
         with:
-          name: ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
-          body_path: ${{ runner.temp }}/notes.md
-          files: "*.vsix"
-          # The repo page's Releases box shows whichever release is "Latest";
-          # keep that the CLI, which is what the page is about.
-          make_latest: false
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          name: vsix-nailington
+          path: dist
+      - name: Publish under the nailington namespace
+        env:
+          OVSX_PAT: ${{ secrets.OPEN_VSX_TOKEN }}
+        run: |
+          test -n "$OVSX_PAT" || { echo '::error::OPEN_VSX_TOKEN is required'; exit 1; }
+          npx --yes ovsx@0.10.4 publish dist/*.vsix --skip-duplicate

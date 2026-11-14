@@ -5,9 +5,8 @@
 #   sweetpad-vscode/scripts/publish-patch.sh [--yes]
 #   npm run publish-patch          (from sweetpad-vscode/)
 #
-# Pushing the v* tag is what publishes: '.github/workflows/ci.yaml' builds the
-# VSIX and deploys it to the marketplace, which reaches everyone on their next
-# extension update and cannot be cleanly retracted, so the push is confirmed
+# Pushing the v*-nailington tag is what publishes: '.github/workflows/ci.yaml' builds the
+# fork VSIX and publishes it to GitHub and any opted-in registries, so the push is confirmed
 # interactively unless --yes is passed.
 #
 # The CHANGELOG entry is written by hand before running this — the script
@@ -30,8 +29,9 @@ for arg in "$@"; do
   esac
 done
 
+RELEASE_BRANCH="${SWEETPAD_RELEASE_BRANCH:-codex/windows-remote-testing}"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-[ "$BRANCH" = "main" ] || { echo "releases are cut from main, on: $BRANCH" >&2; exit 1; }
+[ "$BRANCH" = "$RELEASE_BRANCH" ] || { echo "releases are cut from $RELEASE_BRANCH, on: $BRANCH" >&2; exit 1; }
 
 # A dirty tree would leave uncommitted work out of the tagged commit while the
 # deploy silently succeeds from whatever is committed. The changelog is the one
@@ -45,11 +45,11 @@ while read -r changed; do
     exit 1; }
 done <<<"$(git status --porcelain --untracked-files=no | awk '{print $NF}')"
 
-git fetch --quiet origin main --tags
-# Tagging an unpushed commit deploys from a commit that is not on main, and the
+git fetch --quiet origin "$RELEASE_BRANCH" --tags
+# Tagging an unpushed commit deploys from outside the release branch, and the
 # tag would outlive a later rebase.
-[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || {
-  echo "main is not in sync with origin/main; pull or push first" >&2; exit 1; }
+[ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$RELEASE_BRANCH")" ] || {
+  echo "$RELEASE_BRANCH is not in sync with origin/$RELEASE_BRANCH; pull or push first" >&2; exit 1; }
 
 CURRENT="$(node -p "require('./$PKG').version")"
 # Derive the next patch ourselves so the changelog can be checked before
@@ -59,7 +59,7 @@ IFS='.' read -r MAJOR MINOR PATCH <<<"$CURRENT"
 [[ "$MAJOR" =~ ^[0-9]+$ && "$MINOR" =~ ^[0-9]+$ && "$PATCH" =~ ^[0-9]+$ ]] || {
   echo "cannot parse current version: $CURRENT" >&2; exit 1; }
 VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
-TAG="v$VERSION"
+TAG="v$VERSION-nailington"
 
 git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && {
   echo "tag $TAG already exists locally" >&2; exit 1; }
@@ -74,13 +74,13 @@ grep -qF "## [$VERSION]" "$CHANGELOG" || {
 echo "Releasing SweetPad extension $CURRENT -> $VERSION"
 
 echo "==> Fonts"
-npm run --silent verify-font --workspace sweetpad
+npm run --silent verify-font --workspace sweetpad-nailington
 
 echo "==> Types"
-npm run --silent check:types --workspace sweetpad
+npm run --silent check:types --workspace sweetpad-nailington
 
 echo "==> Tests"
-npm run --silent test --workspace sweetpad
+npm run --silent test --workspace sweetpad-nailington
 
 echo "==> Bumping version"
 # Writes the extension's package.json and the root lockfile, with no git side
@@ -100,7 +100,7 @@ git tag -a "$TAG" -m "SweetPad $VERSION"
 
 echo
 echo "Ready to publish $TAG ($(git rev-parse --short HEAD))."
-echo "Pushing builds the VSIX and deploys it to the marketplace."
+echo "Pushing publishes the fork VSIX to GitHub and any opted-in registries."
 if [ "$ASSUME_YES" -ne 1 ]; then
   # Without a terminal (CI, a pipeline, an agent) 'read' fails on EOF, which
   # under 'set -e' would abort here — after the commit and tag exist, and
@@ -112,6 +112,6 @@ if [ "$ASSUME_YES" -ne 1 ]; then
   esac
 fi
 
-git push origin main
+git push origin "$RELEASE_BRANCH"
 git push origin "$TAG"
 echo "Pushed. Watch: gh run watch \$(gh run list --workflow=ci.yaml --limit 1 --json databaseId -q '.[0].databaseId')"

@@ -1,8 +1,12 @@
-# SweetPad (iOS/Swift development) <img valign="middle" alt="SweetPad logo" width="40" src="./images/logo.png" />
+# SweetPad (Nailington) <img valign="middle" alt="SweetPad logo" width="40" src="./images/logo.png" />
 
 📚 [Documentation](https://sweetpad.hyzyla.dev/docs/vscode/getting-started) | 📦
-[VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=sweetpad.sweetpad) | 🐞
-[Github Issues](https://github.com/sweetpad-dev/sweetpad/issues)
+[Fork releases (VSIX)](https://github.com/Nailington/sweetpad/releases) | 🐞
+[Github Issues](https://github.com/Nailington/sweetpad/issues)
+
+Install the fork VSIX through **Extensions → … → Install from VSIX**. Its ID is
+`nailington.sweetpad-nailington`; disable upstream SweetPad while using this fork.
+Agent skills are available as a separate ZIP on the same release.
 
 <!-- [![Discord](https://img.shields.io/badge/SweetPad-Discord-blue?logo=discord&logoColor=white&link=https%3A%2F%2Fdiscord.gg%2FXZwRtQ5dew)](https://discord.gg/XZwRtQ5dew) -->
 
@@ -55,7 +59,7 @@ tools such as **swift-format**, **swiftlint**, **xcodebuild**, **xcrun**, **xcod
 
 There is also a **[SweetPad CLI](https://sweetpad.hyzyla.dev/docs/cli/getting-started)** — a separate
 `sweetpad` binary that builds, runs, and tests the same projects from any terminal, with no editor
-involved. It is a different product with its own install (`brew install sweetpad-dev/tap/sweetpad`);
+involved. It is a different product with its own install (`brew install Nailington/sweetpad/sweetpad-nailington`);
 this extension does not require it, and it does not require this extension.
 
 ## Requirements

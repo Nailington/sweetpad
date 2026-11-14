@@ -1,8 +1,8 @@
 {
-  "name": "sweetpad",
-  "displayName": "SweetPad (iOS/Swift development)",
+  "name": "sweetpad-nailington",
+  "displayName": "SweetPad (Nailington)",
   "version": "0.2.18",
-  "description": "Develop Swift/iOS projects in VS Code",
+  "description": "Nailington's SweetPad fork: develop Swift/iOS projects locally or on a remote Mac",
   "categories": [
     "Extension Packs",
     "Formatters",
@@ -13,9 +13,9 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sweetpad-dev/sweetpad.git"
+    "url": "https://github.com/Nailington/sweetpad.git"
   },
-  "publisher": "sweetpad",
+  "publisher": "nailington",
   "type": "commonjs",
   "main": "./out/extension.js",
   "icon": "images/logo.png",

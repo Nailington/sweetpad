@@ -1,182 +1,239 @@
+name: Release CLI (Nailington)
+
 on:
   push:
-    tags:
-      - "cli-v*"
-  # Manual runs build + sign + notarize without publishing, since the release and
-  # tap-bump steps below are gated on a tag ref.
+    tags: ["cli-v*-nailington.*"]
+  # Manual runs build downloadable artifacts without publishing or updating Homebrew.
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
-name: Release CLI
+concurrency:
+  group: cli-release-nailington
+  cancel-in-progress: false
+
 jobs:
-  release:
-    name: Build, sign, notarize CLI (macOS)
-    runs-on: macos-latest
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      asset_version: ${{ steps.metadata.outputs.asset_version }}
+      publish: ${{ steps.metadata.outputs.publish }}
     steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+      - name: Validate fork version and tag
+        id: metadata
+        run: python3 .github/scripts/release.py metadata cli
+      - name: Package agent skills from this commit
+        env:
+          ASSET_VERSION: ${{ steps.metadata.outputs.asset_version }}
+        run: python3 .github/scripts/release.py skills --version "$ASSET_VERSION"
+      - uses: actions/upload-artifact@v7
         with:
-          # Release notes diff against the previous cli-v* tag, which a shallow
-          # checkout has no history for.
+          name: agent-skills-nailington
+          path: dist/*.zip
+          if-no-files-found: error
+
+  build:
+    name: CLI · ${{ matrix.platform }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos-universal
+          - os: ubuntu-22.04
+            platform: linux-x64
+          - os: windows-latest
+            platform: windows-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ASSET_VERSION: ${{ needs.prepare.outputs.asset_version }}
+      PUBLISH: ${{ needs.prepare.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
           fetch-depth: 0
-      - name: Install NodeJS
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-      - name: Install Rust toolchain
-        # Installs the channel + Apple targets pinned in rust-toolchain.toml
+      - name: Install pinned Rust toolchain
         run: rustup show
-
-      - name: Resolve version
-        # On a cli-v* tag the version is the tag; manual runs get a -dryrun suffix
-        # off the crate version and skip publishing.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
-          set -euo pipefail
-          if [[ "${GITHUB_REF:-}" == refs/tags/cli-v* ]]; then
-            VERSION="${GITHUB_REF_NAME#cli-v}"
-            # The tag names the release; the binary stamps its version from
-            # Cargo.toml. Disagreement would ship a signed, notarized binary
-            # that contradicts its own formula, so fail before the expensive
-            # signing and notarization legs.
-            CRATE="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-            if [ "$VERSION" != "$CRATE" ]; then
-              echo "::error::tag cli-v$VERSION does not match workspace version $CRATE; bump Cargo.toml before tagging"
-              exit 1
-            fi
-          else
-            VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)-dryrun"
-          fi
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "TARBALL=sweetpad-cli-$VERSION-macos-universal.tar.gz" >> "$GITHUB_ENV"
-          echo "Building sweetpad CLI $VERSION"
-
-      - name: Build universal CLI
-        # Build the bundled injection client, then the universal `sweetpad` binary.
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+      - name: Build universal macOS CLI
+        if: runner.os == 'macOS'
         run: |
           set -euo pipefail
           bash sweetpad-cli/vendor/injection-client/build.sh
-          cargo build --release --bin sweetpad --target aarch64-apple-darwin
-          cargo build --release --bin sweetpad --target x86_64-apple-darwin
-          mkdir -p dist
-          lipo -create -output dist/sweetpad \
+          cargo build --locked --release -p sweetpad-cli --target aarch64-apple-darwin
+          cargo build --locked --release -p sweetpad-cli --target x86_64-apple-darwin
+          mkdir -p dist/bin
+          lipo -create -output dist/bin/sweetpad \
             target/aarch64-apple-darwin/release/sweetpad \
             target/x86_64-apple-darwin/release/sweetpad
-          chmod +x dist/sweetpad
-
-      - name: Import Developer ID certificate
-        env:
-          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          chmod +x dist/bin/sweetpad
+      - name: Build Windows or Linux CLI
+        if: runner.os != 'macOS'
         run: |
           set -euo pipefail
-          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
-          KEYCHAIN_PASSWORD="$(uuidgen)"
-          CERT_PATH="$RUNNER_TEMP/certificate.p12"
-          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
-          rm -f "$CERT_PATH"
-          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
-
-      - name: Codesign the CLI
-        # Developer ID + hardened runtime + secure timestamp, required for notarization.
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            # Bundle OpenSSL so the download does not depend on the host's libssl ABI.
+            OPENSSL_STATIC=1 OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr/include \
+              cargo build --locked --release -p sweetpad-cli
+          else
+            cargo build --locked --release -p sweetpad-cli
+          fi
+          mkdir -p dist/bin
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            cp target/release/sweetpad.exe dist/bin/sweetpad.exe
+          else
+            cp target/release/sweetpad dist/bin/sweetpad
+          fi
+      - name: Test SSH authentication
+        run: cargo test --locked -p sweetpad-cli --test ssh_auth
+      - name: Verify executable version and help
         run: |
           set -euo pipefail
-          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Developer ID Application/ { print $2; exit }')"
-          test -n "$IDENTITY"
-          codesign --force --options runtime --timestamp --sign "$IDENTITY" dist/sweetpad
-          codesign --verify --strict --verbose=2 dist/sweetpad
-
-      - name: Notarize the CLI
-        env:
-          MACOS_NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          BINARY=dist/bin/sweetpad
+          if [[ "$RUNNER_OS" == Windows ]]; then BINARY="$BINARY.exe"; fi
+          ACTUAL="$("$BINARY" --version | tr -d '\r')"
+          if [[ "$PUBLISH" == true ]]; then
+            test "$ACTUAL" = "sweetpad $VERSION"
+          else
+            [[ "$ACTUAL" == "sweetpad $VERSION"* ]]
+          fi
+          "$BINARY" --help
+      - name: Verify Linux TLS libraries are bundled
+        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          KEY_PATH="$RUNNER_TEMP/notary_key.p8"
-          echo "$MACOS_NOTARY_KEY_P8" | base64 --decode > "$KEY_PATH"
-          /usr/bin/zip -j "$RUNNER_TEMP/notarize.zip" dist/sweetpad
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --key "$KEY_PATH" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" --wait
-          rm -f "$KEY_PATH"
-
-      - name: Package tarball
-        run: |
-          set -euo pipefail
-          tar -C dist -czf "$TARBALL" sweetpad
-          echo "SHA256=$(shasum -a 256 "$TARBALL" | cut -d' ' -f1)" >> "$GITHUB_ENV"
-          shasum -a 256 "$TARBALL"
-
-      - name: Upload tarball artifact
-        uses: actions/upload-artifact@v7
+          ldd dist/bin/sweetpad > "$RUNNER_TEMP/cli-libraries.txt"
+          cat "$RUNNER_TEMP/cli-libraries.txt"
+          if grep -E 'lib(ssl|crypto)\.' "$RUNNER_TEMP/cli-libraries.txt"; then
+            echo '::error::Linux release must bundle OpenSSL'
+            exit 1
+          fi
+      - name: Sign and notarize macOS CLI (optional)
+        if: runner.os == 'macOS' && vars.MACOS_SIGNING_ENABLED == 'true'
+        uses: ./.github/actions/sign-macos
         with:
-          name: cli-tarball
-          path: "*.tar.gz"
+          paths: dist/bin/sweetpad
+          certificate: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          certificate-password: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          notary-key: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          notary-key-id: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          notary-issuer-id: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+      - name: Package CLI
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          BINARY=dist/bin/sweetpad
+          if [[ "$RUNNER_OS" == Windows ]]; then BINARY="$BINARY.exe"; fi
+          python3 .github/scripts/release.py package --binary "$BINARY" --platform "$PLATFORM" --version "$ASSET_VERSION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.platform }}-nailington
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
           if-no-files-found: error
 
-      - name: Build release notes
-        # Commit subjects over the tag range, scoped to the paths the CLI ships
-        # from so unrelated monorepo work (docs site, extension) stays out.
-        if: startsWith(github.ref, 'refs/tags/')
+  publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true' && github.repository == 'Nailington/sweetpad'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cli-*-nailington
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: agent-skills-nailington
+          path: dist
+      - name: Generate Homebrew formula and checksums
         run: |
-          set -euo pipefail
-          PREV="$(git tag -l 'cli-v*' --sort=-v:refname | grep -vFx "$GITHUB_REF_NAME" | head -1)"
-          NOTES="$RUNNER_TEMP/notes.md"
-          {
-            echo '## Install'
-            echo
-            echo '    brew install sweetpad-dev/tap/sweetpad'
-            echo
-            echo '## Changes'
-            echo
-          } > "$NOTES"
-          if [ -n "$PREV" ]; then
-            CHANGES="$(git log --no-merges --pretty='- %s' "$PREV..$GITHUB_REF_NAME" \
-              -- sweetpad-cli sweetpad-lib sweetpad-core Cargo.toml | grep -v '^- Release CLI ' || true)"
-            printf '%s\n\n' "${CHANGES:-- Packaging and maintenance only.}" >> "$NOTES"
-            echo "**Full diff:** https://github.com/$GITHUB_REPOSITORY/compare/$PREV...$GITHUB_REF_NAME" >> "$NOTES"
-          else
-            echo '- Initial release.' >> "$NOTES"
-          fi
-          cat "$NOTES"
+          python3 .github/scripts/release.py formula --version "$VERSION" --repository "$GITHUB_REPOSITORY"
+          python3 .github/scripts/release.py checksums
+      - name: Write release notes
+        env:
+          SIGNED: ${{ vars.MACOS_SIGNING_ENABLED == 'true' }}
+        run: |
+          cat > dist/notes.md <<EOF
+          Nailington's SweetPad fork, version $VERSION. These builds are separate from upstream SweetPad.
 
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+          **Homebrew (macOS universal or Linux x86_64):**
+          \`brew tap Nailington/sweetpad https://github.com/Nailington/sweetpad\`
+          \`brew install Nailington/sweetpad/sweetpad-nailington\`
+
+          **Binaries:** extract the archive for your platform and put \`sweetpad\` / \`sweetpad.exe\` on PATH.
+          Linux requires glibc 2.35 or newer. Windows and Linux use OpenSSH and a Mac with this fork's CLI and Xcode for Apple builds.
+          Verify downloads against \`SHA256SUMS\`.
+
+          **Agent skills:** extract \`sweetpad-agent-skills-$VERSION.zip\` and follow its \`INSTALL.md\`.
+          The archive includes the complete \`skills/\` tree from this release's commit.
+
+          macOS Developer ID signing and notarization enabled: **$SIGNED**.
+          EOF
+      - name: Publish fork binaries
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          body_path: ${{ runner.temp }}/notes.md
-          files: "*.tar.gz"
+          name: SweetPad CLI ${{ needs.prepare.outputs.version }} (Nailington)
+          body_path: dist/notes.md
+          generate_release_notes: true
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.rb
+            dist/SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: homebrew-formula-nailington
+          path: dist/sweetpad-nailington.rb
+          if-no-files-found: error
 
-      - name: Update Homebrew tap formula
-        if: startsWith(github.ref, 'refs/tags/')
+  homebrew:
+    name: Update this repository's Homebrew tap
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: homebrew-formula-nailington
+          path: generated-formula
+      - name: Commit released formula
         env:
-          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${TARBALL}"
-          sed -e "s|{{VERSION}}|${VERSION}|g" -e "s|{{URL}}|${URL}|g" -e "s|{{SHA256}}|${SHA256}|g" \
-            .github/homebrew/sweetpad.rb.tmpl > "$RUNNER_TEMP/sweetpad.rb"
-
-          mkdir -p ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/tap_key
-          chmod 600 ~/.ssh/tap_key
-          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
-
-          git clone --depth 1 git@github.com:sweetpad-dev/homebrew-tap.git "$RUNNER_TEMP/tap"
-          mkdir -p "$RUNNER_TEMP/tap/Formula"
-          cp "$RUNNER_TEMP/sweetpad.rb" "$RUNNER_TEMP/tap/Formula/sweetpad.rb"
-          git -C "$RUNNER_TEMP/tap" config user.name "sweetpad-ci"
-          git -C "$RUNNER_TEMP/tap" config user.email "ci@sweetpad.dev"
-          git -C "$RUNNER_TEMP/tap" add Formula/sweetpad.rb
-          git -C "$RUNNER_TEMP/tap" commit -m "sweetpad ${VERSION}"
-          git -C "$RUNNER_TEMP/tap" push
-          rm -f ~/.ssh/tap_key
+          mkdir -p Formula
+          cp generated-formula/sweetpad-nailington.rb Formula/sweetpad-nailington.rb
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/sweetpad-nailington.rb
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Homebrew: $RELEASE_TAG"
+          git pull --rebase origin "$DEFAULT_BRANCH"
+          git push origin "HEAD:$DEFAULT_BRANCH"

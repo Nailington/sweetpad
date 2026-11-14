@@ -2,7 +2,7 @@ name: windows-remote-cli
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex/windows-remote-testing]
     paths:
       - "sweetpad-cli/**"
       - "Cargo.toml"
