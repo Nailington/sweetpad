@@ -34,7 +34,7 @@ function HeroBanner() {
 					<div className={styles.terminal}>
 						<div className={styles.terminalLine}>
 							<span className={styles.prompt}>$</span> brew install
-							sweetpad-dev/tap/sweetpad
+							nailington/tap/sweetpad-nailington
 						</div>
 						<div className={styles.terminalLine}>
 							<span className={styles.prompt}>$</span> sweetpad run --on
@@ -429,7 +429,7 @@ function Closer() {
 				<div className={styles.terminal}>
 					<div className={styles.terminalLine}>
 						<span className={styles.prompt}>$</span> brew install
-						sweetpad-dev/tap/sweetpad
+						nailington/tap/sweetpad-nailington
 					</div>
 					<div className={styles.terminalLine}>
 						<span className={styles.prompt}>$</span> cd MyApp &amp;&amp; sweetpad

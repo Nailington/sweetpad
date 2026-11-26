@@ -6,7 +6,7 @@ release schedules, as upstream does.
 
 ## Release identities
 
-- CLI workspace version: `0.1.12-nailington.3`; tag: `cli-v0.1.12-nailington.3`.
+- CLI workspace version: `0.1.12-nailington.4`; tag: `cli-v0.1.12-nailington.4`.
   Increment the final fork number for another release of the same upstream version.
   `sweetpad --version` includes `-nailington`; untagged builds also include `-dev+<commit>`.
 - VS Code: **SweetPad (Nailington)**, ID `nailington.sweetpad-nailington`.
@@ -62,8 +62,8 @@ Commit and push the release configuration and application changes to your fork
 first. From that exact commit on `codex/windows-remote-testing`:
 
 ```bash
-git tag -a cli-v0.1.12-nailington.3 -m "SweetPad CLI 0.1.12-nailington.3"
-git push origin cli-v0.1.12-nailington.3
+git tag -a cli-v0.1.12-nailington.4 -m "SweetPad CLI 0.1.12-nailington.4"
+git push origin cli-v0.1.12-nailington.4
 
 git tag -a v0.2.18-nailington -m "SweetPad VS Code 0.2.18 (Nailington)"
 git push origin v0.2.18-nailington
@@ -77,7 +77,7 @@ For later releases, the existing helpers now target this fork's branch and tags:
 
 ```bash
 # macOS with Xcode and Rust; bumps Cargo.toml/Cargo.lock, checks, commits and tags.
-sweetpad-lib/ci/release.sh 0.1.12-nailington.4
+sweetpad-lib/ci/release.sh 0.1.12-nailington.5
 
 # Add the next numeric version's CHANGELOG entry first; then bump, check and tag.
 npm run publish-patch --workspace sweetpad-nailington
@@ -88,26 +88,15 @@ release branch changes. Do not reuse published tags; bump the relevant version.
 
 ## Homebrew setup
 
-No second tap repository or deploy key is required. After a successful CLI release,
-CI commits `Formula/sweetpad-nailington.rb` to this repository's **GitHub default
-branch**, using `GITHUB_TOKEN` with `contents: write`. The release itself comes
-from the tagged commit, which may be on `codex/windows-remote-testing`.
-Ensure branch rules allow the GitHub Actions bot to push this formula commit.
-If that push is blocked, the binary release remains available, including its
-formula; fix the branch rule and rerun the Homebrew job.
-
-After the first successful release:
+The [Nailington tap](https://github.com/Nailington/homebrew-tap) is the install
+source for this fork. The CLI workflow publishes the generated formula with the
+release assets and commits a compatibility copy to this repository's GitHub
+default branch for existing installs.
 
 ```bash
-brew tap Nailington/sweetpad https://github.com/Nailington/sweetpad
-brew install Nailington/sweetpad/sweetpad-nailington
-# Later:
-brew update
-brew upgrade sweetpad-nailington
+brew install nailington/tap/sweetpad-nailington
+brew upgrade nailington/tap/sweetpad-nailington
 ```
-
-The explicit tap URL is needed because the repository is named `sweetpad`,
-instead of Homebrew's conventional `homebrew-sweetpad`.
 
 ## Optional signing and registries
 

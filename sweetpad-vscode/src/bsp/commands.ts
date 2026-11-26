@@ -196,7 +196,7 @@ async function cliVersionCheck(): Promise<DoctorCheck> {
     ok: version !== undefined && isVersionAtLeast(version, MINIMUM_SWEETPAD_CLI_VERSION),
     label: "sweetpad CLI version",
     detail: version ?? "could not be read",
-    hint: `The extension needs ${MINIMUM_SWEETPAD_CLI_VERSION} or newer — upgrade with 'brew upgrade sweetpad-dev/tap/sweetpad'.`,
+    hint: `The extension needs ${MINIMUM_SWEETPAD_CLI_VERSION} or newer — upgrade with 'brew upgrade nailington/tap/sweetpad-nailington'.`,
   };
 }
 
@@ -307,7 +307,7 @@ async function collectCliDrivenChecks(config: Record<string, unknown>, workspace
       ok: launcher !== undefined && (await isFileExists(launcher)),
       label: "sweetpad CLI present",
       detail: launcher,
-      hint: "Reinstall it with 'brew install sweetpad-dev/tap/sweetpad', or run 'SweetPad: Set up Swift code intelligence (BSP)' to have the extension manage this instead.",
+      hint: "Reinstall it with 'brew install nailington/tap/sweetpad-nailington', or run 'SweetPad: Set up Swift code intelligence (BSP)' to have the extension manage this instead.",
     },
     await cliVersionCheck(),
     {

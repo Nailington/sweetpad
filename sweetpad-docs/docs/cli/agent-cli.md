@@ -31,10 +31,10 @@ is in [Get started with the CLI](./getting-started.md).
 The `sweetpad` CLI is distributed via Homebrew:
 
 ```bash
-brew install sweetpad-dev/tap/sweetpad
+brew install nailington/tap/sweetpad-nailington
 ```
 
-Verify it, and upgrade later with `brew upgrade sweetpad`:
+Verify it, and upgrade later with `brew upgrade nailington/tap/sweetpad-nailington`:
 
 ```bash
 sweetpad --version

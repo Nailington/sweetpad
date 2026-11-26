@@ -188,7 +188,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install SweetPad
-        run: brew install sweetpad-dev/tap/sweetpad
+        run: brew install nailington/tap/sweetpad-nailington
 
       - name: Build
         run: sweetpad build --gh-annotations

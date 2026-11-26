@@ -18,7 +18,7 @@ A single native binary named `sweetpad`, or "xcodebuild for humans". You install
 it from any terminal:
 
 ```bash
-brew install sweetpad-dev/tap/sweetpad
+brew install nailington/tap/sweetpad-nailington
 ```
 
 It does not need VS Code, and it does not care what editor you use. It works the same from a terminal

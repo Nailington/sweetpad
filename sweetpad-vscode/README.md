@@ -59,7 +59,7 @@ tools such as **swift-format**, **swiftlint**, **xcodebuild**, **xcrun**, **xcod
 
 There is also a **[SweetPad CLI](https://sweetpad.hyzyla.dev/docs/cli/getting-started)** — a separate
 `sweetpad` binary that builds, runs, and tests the same projects from any terminal, with no editor
-involved. It is a different product with its own install (`brew install Nailington/sweetpad/sweetpad-nailington`);
+involved. It is a different product with its own install (`brew install nailington/tap/sweetpad-nailington`);
 this extension does not require it, and it does not require this extension.
 
 ## Requirements

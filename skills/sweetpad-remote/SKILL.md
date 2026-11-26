@@ -14,8 +14,7 @@ project directory or use `-C <directory>`; project commands discover the nearest
 
 Remote workflows require this fork's CLI on both the client and the receiving Mac (`sweetpad --version` contains
 `-nailington`). Get binaries from `https://github.com/Nailington/sweetpad/releases`, or install via
-`brew tap Nailington/sweetpad https://github.com/Nailington/sweetpad` and
-`brew install Nailington/sweetpad/sweetpad-nailington`. Do not replace a
+`brew install nailington/tap/sweetpad-nailington`. Do not replace a
 tested checkout's CLI with a Homebrew release that lacks these commands. Confirm support with `sweetpad remote --help`
 and `sweetpad bridge --help`. Windows runs the native `sweetpad.exe`; Linux and macOS run `sweetpad`. Each uses the
 system OpenSSH client, without WSL, rsync, or rclone. The Mac needs Xcode, Remote Login, and its built-in `tar`.

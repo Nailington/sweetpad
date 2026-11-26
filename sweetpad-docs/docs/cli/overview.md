@@ -23,13 +23,13 @@ run your app in a few minutes. This page is the fuller tour.
 Install with [Homebrew](https://brew.sh/):
 
 ```bash
-brew install sweetpad-dev/tap/sweetpad
+brew install nailington/tap/sweetpad-nailington
 ```
 
 Update it later the same way you update anything else with Homebrew:
 
 ```bash
-brew upgrade sweetpad
+brew upgrade nailington/tap/sweetpad-nailington
 ```
 
 You'll need Xcode installed too, since SweetPad uses Xcode's own tools to do the actual building.

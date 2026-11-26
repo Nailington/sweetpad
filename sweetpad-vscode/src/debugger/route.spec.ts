@@ -135,7 +135,7 @@ function labels(error: ReturnType<typeof unavailableRouteError>): string[] {
 describe("unavailableRouteError", () => {
   it("names both the CLI and CodeLLDB when neither is installed", () => {
     const error = unavailableRouteError({ why: "nothing-installed", cli: MISSING });
-    expect(error.message).toContain("brew install sweetpad-dev/tap/sweetpad");
+    expect(error.message).toContain("brew install nailington/tap/sweetpad-nailington");
     expect(error.message).toContain("CodeLLDB");
     expect(labels(error)).toEqual(["Install SweetPad CLI", "Install CodeLLDB"]);
   });
@@ -143,7 +143,7 @@ describe("unavailableRouteError", () => {
   it("offers an update when the CLI is too old", () => {
     const error = unavailableRouteError({ why: "nothing-installed", cli: NO_DAP });
     expect(error.message).toContain("/usr/local/bin/sweetpad");
-    expect(error.message).toContain("brew upgrade sweetpad-dev/tap/sweetpad");
+    expect(error.message).toContain("brew upgrade nailington/tap/sweetpad-nailington");
     expect(labels(error)).toEqual(["Update SweetPad CLI", "Install CodeLLDB"]);
   });
 

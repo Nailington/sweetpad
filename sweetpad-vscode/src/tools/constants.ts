@@ -36,7 +36,7 @@ export const TOOLS: Tool[] = [
     install: {
       type: "shell",
       command: "brew",
-      args: ["install", "sweetpad-dev/tap/sweetpad"],
+      args: ["install", "nailington/tap/sweetpad-nailington"],
     },
     documentation: "https://sweetpad.hyzyla.dev/docs/cli/getting-started",
   },

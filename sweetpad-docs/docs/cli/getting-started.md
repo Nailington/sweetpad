@@ -14,7 +14,7 @@ installed.
 Install with [Homebrew](https://brew.sh/):
 
 ```bash
-brew install sweetpad-dev/tap/sweetpad
+brew install nailington/tap/sweetpad-nailington
 ```
 
 Check that it worked:

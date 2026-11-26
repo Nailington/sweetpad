@@ -694,7 +694,7 @@ export async function generateBuildServerConfig(options: {
  * One string so the wording is the same in an error, a warning and the doctor.
  */
 export const SWEETPAD_CLI_MISSING_MESSAGE =
-  "SweetPad's build server runs through the sweetpad CLI, which isn't on your PATH. Install it with 'brew install sweetpad-dev/tap/sweetpad', or run 'SweetPad: Install tool'.";
+  "SweetPad's build server runs through the sweetpad CLI, which isn't on your PATH. Install it with 'brew install nailington/tap/sweetpad-nailington', or run 'SweetPad: Install tool'.";
 
 /**
  * Oldest CLI the extension will drive without complaint.

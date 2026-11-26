@@ -1,7 +1,7 @@
 //! `sweetpad` — the SweetPad command-line interface.
 //!
 //! A pure native binary (no Node runtime needed), distributed via Homebrew
-//! (`brew install sweetpad-dev/tap/sweetpad`).
+//! (`brew install nailington/tap/sweetpad-nailington`).
 //!
 //! Two halves share this one binary:
 //!

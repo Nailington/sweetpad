@@ -39,7 +39,7 @@ The skills teach an agent to run `sweetpad`, so the CLI has to be installed and
 on your `PATH` first:
 
 ```bash
-brew install sweetpad-dev/tap/sweetpad
+brew install nailington/tap/sweetpad-nailington
 ```
 
 See [Get started with the CLI](./getting-started.md) if you haven't set it

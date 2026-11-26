@@ -1,5 +1,5 @@
 //! `sweetpad self-update` — upgrade the binary. Homebrew installs run
-//! `brew upgrade sweetpad`; anything else gets pointed at the tap.
+//! `brew upgrade sweetpad-nailington`; anything else gets pointed at the tap.
 
 use crate::cli::output::Output;
 use crate::cli::{CommandResult, Context, ErrorContext, Render, Rendered, process};
@@ -36,28 +36,28 @@ pub fn run(ctx: &mut Context) -> CommandResult {
         // brew always writes `==> …` progress to stdout — captured under the
         // machine modes so it can't interleave with the envelope.
         if ctx.out.is_json() || ctx.out.is_ndjson() {
-            let run = process::run_captured("brew", &["upgrade", "sweetpad"], None)?;
+            let run = process::run_captured("brew", &["upgrade", "sweetpad-nailington"], None)?;
             if !run.success {
                 return Err(crate::cli::CliError::new(format!(
-                    "brew upgrade sweetpad exited with a non-zero status:\n{}",
+                    "brew upgrade sweetpad-nailington exited with a non-zero status:\n{}",
                     run.tail
                 ))
-                .context("running 'brew upgrade sweetpad'"));
+                .context("running 'brew upgrade sweetpad-nailington'"));
             }
         } else {
-            process::stream("brew", &["upgrade", "sweetpad"], None)
-                .context("running 'brew upgrade sweetpad'")?;
+            process::stream("brew", &["upgrade", "sweetpad-nailington"], None)
+                .context("running 'brew upgrade sweetpad-nailington'")?;
         }
         return Ok(Rendered::data(UpdateReport {
             method: "homebrew",
-            note: "brew upgrade sweetpad completed".to_string(),
+            note: "brew upgrade sweetpad-nailington completed".to_string(),
         }));
     }
     Ok(Rendered::data(UpdateReport {
         method: "manual",
         note: format!(
             "this sweetpad ({path}) wasn't installed via Homebrew; install/upgrade with \
-             'brew install sweetpad-dev/tap/sweetpad', or replace the binary from the \
+             'brew install nailington/tap/sweetpad-nailington', or replace the binary from the \
              latest cli-v* release"
         ),
     }))

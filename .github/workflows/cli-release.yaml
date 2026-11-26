@@ -189,8 +189,7 @@ jobs:
           Nailington's SweetPad fork, version $VERSION. These builds are separate from upstream SweetPad.
 
           **Homebrew (macOS universal or Linux x86_64):**
-          \`brew tap Nailington/sweetpad https://github.com/Nailington/sweetpad\`
-          \`brew install Nailington/sweetpad/sweetpad-nailington\`
+          \`brew install nailington/tap/sweetpad-nailington\`
 
           **Binaries:** extract the archive for your platform and put \`sweetpad\` / \`sweetpad.exe\` on PATH.
           Linux requires glibc 2.35 or newer. Windows and Linux use OpenSSH and a Mac with this fork's CLI and Xcode for Apple builds.
@@ -221,7 +220,7 @@ jobs:
           if-no-files-found: error
 
   homebrew:
-    name: Update this repository's Homebrew tap
+    name: Update the compatibility Homebrew formula
     needs: publish
     runs-on: ubuntu-latest
     permissions:

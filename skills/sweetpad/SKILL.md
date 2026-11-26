@@ -12,8 +12,7 @@ projects. This skill covers the everyday flows and how to discover the rest.
 ## Before you start
 
 - Confirm it's installed: `sweetpad --version`. If it's missing, install with
-  `brew tap Nailington/sweetpad https://github.com/Nailington/sweetpad` followed by
-  `brew install Nailington/sweetpad/sweetpad-nailington`. Windows/Linux binaries are at
+  `brew install nailington/tap/sweetpad-nailington`. Windows/Linux binaries are at
   `https://github.com/Nailington/sweetpad/releases`; fork versions contain `-nailington`.
 - Run from inside the project directory, or pass `-C <dir>` to point at it.
   sweetpad auto-discovers the `.xcworkspace` / `.xcodeproj`.

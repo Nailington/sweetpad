@@ -31,7 +31,7 @@ is installed.
    Marketplace, and the `sweetpad` CLI that runs the build server:
 
    ```bash
-   brew install sweetpad-dev/tap/sweetpad
+   brew install nailington/tap/sweetpad-nailington
    ```
 
 2. From the command palette, run `> SweetPad: Generate Build Server Config`. This writes a `buildServer.json` at the
@@ -53,7 +53,7 @@ another tool keeps that tool, so an existing setup is never swapped out undernea
 A few things to know:
 
 - The server runs through the [`sweetpad` CLI](../cli/getting-started.md), so it needs to be installed:
-  `brew install sweetpad-dev/tap/sweetpad`, or the Tools panel. SweetPad tells you once per workspace if it's
+  `brew install nailington/tap/sweetpad-nailington`, or the Tools panel. SweetPad tells you once per workspace if it's
   missing, and `> SweetPad: Diagnose BSP (Doctor)` reports it too.
 - An `.xcworkspace` resolves each file against whichever member project declares its target, so a CocoaPods or
   multi-project workspace works the same as a single `.xcodeproj`.
