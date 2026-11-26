@@ -1,18 +1,18 @@
 class SweetpadNailington < Formula
   desc "Nailington's SweetPad fork for local and remote Apple development"
   homepage "https://github.com/Nailington/sweetpad"
-  version "0.1.12-nailington.3"
+  version "0.1.12-nailington.4"
   license "MIT"
 
   on_macos do
-    url "https://github.com/Nailington/sweetpad/releases/download/cli-v0.1.12-nailington.3/sweetpad-cli-0.1.12-nailington.3-macos-universal.tar.gz"
-    sha256 "1ee8c4b068acf38400ebaddf526fa0bbd82285e74bbae6183c09c460d1a7b274"
+    url "https://github.com/Nailington/sweetpad/releases/download/cli-v0.1.12-nailington.4/sweetpad-cli-0.1.12-nailington.4-macos-universal.tar.gz"
+    sha256 "58428df00e536249c7a10231221ec17b780cd45f14ba3e5a4f57c81b718c1c39"
   end
 
   on_linux do
     depends_on arch: :x86_64
-    url "https://github.com/Nailington/sweetpad/releases/download/cli-v0.1.12-nailington.3/sweetpad-cli-0.1.12-nailington.3-linux-x64.tar.gz"
-    sha256 "d66260dabc45b279e899c3499c7b100e6bf8f452aa0602f30d0ef31d7e0d6273"
+    url "https://github.com/Nailington/sweetpad/releases/download/cli-v0.1.12-nailington.4/sweetpad-cli-0.1.12-nailington.4-linux-x64.tar.gz"
+    sha256 "edf26a9cbcffbcb2da871f8adfab8e796fe8dbdcfcf3ecd7d13f058ad4f180ae"
   end
 
   conflicts_with "sweetpad", because: "both install the sweetpad command"
