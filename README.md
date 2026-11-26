@@ -1,5 +1,8 @@
 # SweetPad <img valign="middle" alt="SweetPad logo" width="38" src="./sweetpad-docs/static/images/logo.png" />
 
+This is Nailington's SweetPad fork. Download the CLI, VSIX, and agent skills from
+[the fork's GitHub Releases](https://github.com/Nailington/sweetpad/releases).
+
 **xcodebuild for humans and agents.**
 
 A command-line tool that builds, runs, debugs, and tests apps for iOS, macOS, etc. without opening
@@ -9,7 +12,7 @@ packages.
 [![Demo: sweetpad run builds an app and launches it in the iOS Simulator, then rebuilds it after a code change](./sweetpad-docs/static/videos/sweetpad-demo-readme.jpg)](./sweetpad-docs/static/videos/sweetpad-demo-readme.mp4)
 
 ```bash
-brew install sweetpad-dev/tap/sweetpad
+brew install nailington/tap/sweetpad-nailington
 
 cd MyApp
 sweetpad run                        # build, install, launch, and stream logs

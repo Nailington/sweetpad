@@ -12,7 +12,7 @@ projects. This skill covers the everyday flows and how to discover the rest.
 ## Before you start
 
 - Confirm it's installed: `sweetpad --version`. If it's missing, install with
-  `brew install sweetpad-dev/tap/sweetpad`.
+  `brew install nailington/tap/sweetpad-nailington`.
 - Run from inside the project directory, or pass `-C <dir>` to point at it.
   sweetpad auto-discovers the `.xcworkspace` / `.xcodeproj`.
 - Add `-o json` to any command for a structured `{schema, ok, data}` envelope,
